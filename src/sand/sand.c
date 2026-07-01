@@ -40,19 +40,11 @@ static bool in_bounds(int col, int row)
 	return col >= 0 && col < LED_COLS && row >= 0 && row < LED_ROWS;
 }
 
-/* A cell is passable if it's in bounds, empty, and not a digit obstacle. */
+/* A cell is passable if it's in bounds and not already occupied by a particle.
+ * Digit cells are NOT obstacles — sand flows over them and reveals them beneath. */
 static bool passable(int col, int row)
 {
-	if (!in_bounds(col, row)) {
-		return false;
-	}
-	if (grid[row][col]) {
-		return false;
-	}
-	if (led_mask[LED_LAYER_DIGITS][row][col]) {
-		return false;
-	}
-	return true;
+	return in_bounds(col, row) && !grid[row][col];
 }
 
 /* Convert Q8 gravity to primary step direction (±1 or 0 per axis). */

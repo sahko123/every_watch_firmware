@@ -91,6 +91,7 @@ static struct k_sem done1, done2, done3;
 
 /* Public state */
 struct led_rgb led_color[LED_ROWS][LED_COLS];
+struct led_rgb led_layer_color[LED_LAYER_COUNT]; /* zero = use led_color per cell */
 uint8_t        led_mask[LED_LAYER_COUNT][LED_ROWS][LED_COLS];
 
 /* --------------------------------------------------------------------------
@@ -170,9 +171,12 @@ static void pixel_to_physical(int col, int row, int *strip, int *pixel)
 static struct led_rgb composite(int col, int row)
 {
 	for (int layer = 0; layer < LED_LAYER_COUNT; layer++) {
-		if (led_mask[layer][row][col]) {
-			return led_color[row][col];
+		if (!led_mask[layer][row][col]) {
+			continue;
 		}
+		struct led_rgb lc = led_layer_color[layer];
+
+		return (lc.r || lc.g || lc.b) ? lc : led_color[row][col];
 	}
 	return (struct led_rgb){0, 0, 0};
 }

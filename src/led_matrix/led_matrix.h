@@ -7,10 +7,12 @@
 #define LED_COLS 20
 #define LED_ROWS  7
 
-/* Compositor layer IDs — lower index = higher priority (drawn on top) */
+/* Compositor layer IDs — lower index = higher priority (drawn on top).
+ * Sand sits above digits so it covers them; as particles clear a cell
+ * the digit underneath is revealed. */
 #define LED_LAYER_NOTIFICATION 0
-#define LED_LAYER_DIGITS       1
-#define LED_LAYER_SAND         2
+#define LED_LAYER_SAND         1
+#define LED_LAYER_DIGITS       2
 #define LED_LAYER_BG           3
 #define LED_LAYER_COUNT        4
 
@@ -18,12 +20,15 @@ struct led_rgb {
 	uint8_t r, g, b;
 };
 
-/* Color layer: one RGB value per grid cell, shared across all mask layers.
- * Animated independently of the masks (e.g. sweeping hue shifts). */
+/* Per-cell color, used by layers that don't have a layer_color override (e.g. sand). */
 extern struct led_rgb led_color[LED_ROWS][LED_COLS];
 
-/* Mask layers: non-zero = particle present at this cell.
- * Compositor picks the highest-priority non-zero mask and reads led_color. */
+/* Per-layer solid color override. When non-zero, all lit pixels in that layer
+ * use this color instead of led_color[row][col]. Set to {0,0,0} to disable. */
+extern struct led_rgb led_layer_color[LED_LAYER_COUNT];
+
+/* Mask layers: non-zero = pixel active at this cell.
+ * Compositor walks layers highest-to-lowest priority, returns first active hit. */
 extern uint8_t led_mask[LED_LAYER_COUNT][LED_ROWS][LED_COLS];
 
 /* Initialise SPI devices. Call once before first led_commit(). */

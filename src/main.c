@@ -18,8 +18,11 @@ int main(void)
 
 	led_matrix_init();
 
-	/* Sand colour: warm amber */
+	/* Sand: warm amber (per-cell, no layer_color override) */
 	led_color_fill(255, 160, 20);
+
+	/* Digits: cool white — revealed beneath sand as particles clear */
+	led_layer_color[LED_LAYER_DIGITS] = (struct led_rgb){220, 220, 255};
 
 	sand_init();
 	sand_add_particles(60);
