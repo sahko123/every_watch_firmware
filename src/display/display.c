@@ -79,16 +79,19 @@ void display_off(void)
 	is_on = false;
 	k_timer_stop(&display_timer);
 
-	/*
-	 * Suspend the sand thread first (work queue is priority -1, sand is
-	 * priority 5, so sand cannot be actively running right now — it is
-	 * either sleeping or blocked on a semaphore, both safe to suspend).
-	 */
+	/* Acquire the commit mutex before suspending the sand thread. Zephyr's
+	 * k_mutex has priority inheritance: if the sand thread holds the mutex
+	 * mid-DMA, it gets elevated to our priority and completes before we
+	 * proceed. Once we hold it, sand cannot start a new commit. */
+	k_mutex_lock(&led_commit_mutex, K_FOREVER);
 	sand_suspend();
 	imu_suspend();
+	k_mutex_unlock(&led_commit_mutex);
 
-	/* Push one all-black frame to blank the LEDs */
+	/* Sand is suspended; push one blank frame to clear the LEDs */
+	k_mutex_lock(&led_mask_mutex, K_FOREVER);
 	memset(led_mask, 0, sizeof(led_mask));
+	k_mutex_unlock(&led_mask_mutex);
 	led_commit();
 
 	LOG_INF("Display off");
@@ -132,7 +135,9 @@ void display_init(void)
 	gpio_add_callback(btn_l.port, &btn_l_cb);
 	gpio_add_callback(btn_r.port, &btn_r_cb);
 
-	/* Start with display on */
+	/* Set is_on directly: sand and IMU threads already start running from
+	 * sand_init()/imu_init() in main(), so imu_resume()/sand_resume() are
+	 * not needed here. */
 	is_on = true;
 	k_timer_start(&display_timer, K_SECONDS(DISPLAY_TIMEOUT_S), K_NO_WAIT);
 

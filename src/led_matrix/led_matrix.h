@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <zephyr/kernel.h>
 
 /* Grid dimensions */
 #define LED_COLS 20
@@ -28,8 +29,21 @@ extern struct led_rgb led_color[LED_ROWS][LED_COLS];
 extern struct led_rgb led_layer_color[LED_LAYER_COUNT];
 
 /* Mask layers: non-zero = pixel active at this cell.
- * Compositor walks layers highest-to-lowest priority, returns first active hit. */
+ * Compositor walks layers highest-to-lowest priority, returns first active hit.
+ *
+ * LOCKING: all writes to led_mask[] from any context must hold led_mask_mutex.
+ * This includes: render_time(), display_off(), show_notification() in ble.c,
+ * and any future writers. build_buffers() acquires the mutex for its reads. */
 extern uint8_t led_mask[LED_LAYER_COUNT][LED_ROWS][LED_COLS];
+
+/* Mutex protecting all led_mask[] accesses (writes from workqueue/BT thread,
+ * reads from sand thread via build_buffers()). */
+extern struct k_mutex led_mask_mutex;
+
+/* Mutex protecting the full led_commit() sequence (DMA transfers + bitbang).
+ * display_off() acquires this before suspending the sand thread to ensure the
+ * thread cannot be suspended mid-DMA leaving semaphores stuck at zero. */
+extern struct k_mutex led_commit_mutex;
 
 /* Ambient brightness scaler 0-255 set by the light sensor (default 255 = full).
  * Only updated while the display is off to avoid LED-to-sensor feedback. */
@@ -55,10 +69,12 @@ extern uint32_t led_current_budget;
 void led_matrix_init(void);
 
 /* Composite all layers + color layer → SPI DMA buffers → parallel DMA to strips.
- * Blocks until all transfers complete (~2–3 ms). Safe to call from any thread. */
+ * Blocks until all transfers complete (~2–3 ms). Safe to call from any thread.
+ * Acquires led_commit_mutex internally. */
 void led_commit(void);
 
-/* Convenience helpers */
+/* Convenience helpers — callers must hold led_mask_mutex around calls that
+ * modify led_mask[] if concurrent access from other threads is possible. */
 static inline void led_mask_clear(int layer)
 {
 	memset(led_mask[layer], 0, sizeof(led_mask[layer]));

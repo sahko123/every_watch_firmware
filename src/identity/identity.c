@@ -4,6 +4,7 @@
 #include <zephyr/fs/nvs.h>
 #include <zephyr/storage/flash_map.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/util.h>
 #include <hal/nrf_ficr.h>
 #include <string.h>
 
@@ -18,11 +19,17 @@ LOG_MODULE_REGISTER(identity, LOG_LEVEL_INF);
 #define DEV_DIST_NONE       0xFF   /* not connected to the dev chain */
 #define RSSI_CLOSE_DBM      (-70)  /* minimum RSSI to count as an encounter */
 
+/* Batch NVS hash writes: flush every N encounters or when the table is full.
+ * NVS on nRF52 flash has ~10 000 erase cycles; batching reduces wear at busy
+ * events where many unique devices are encountered rapidly. */
+#define NVS_WRITE_BATCH     4
+
 static uint32_t own_hash;
 static uint8_t  dev_dist   = DEV_DIST_NONE;
 static uint16_t enc_count;
 static uint32_t seen_hashes[MAX_SEEN_HASHES];
 static uint8_t  seen_count;
+static uint8_t  unsaved_encounters;
 
 static struct nvs_fs nvs;
 static bool nvs_ready;
@@ -62,9 +69,13 @@ static void add_seen(uint32_t hash)
                 (MAX_SEEN_HASHES - 1) * sizeof(uint32_t));
         seen_hashes[MAX_SEEN_HASHES - 1] = hash;
     }
-    if (nvs_ready) {
+
+    unsaved_encounters++;
+    if (nvs_ready && (unsaved_encounters >= NVS_WRITE_BATCH ||
+                      seen_count == MAX_SEEN_HASHES)) {
         nvs_write(&nvs, NVS_KEY_ENC_HASHES,
                   seen_hashes, seen_count * sizeof(uint32_t));
+        unsaved_encounters = 0;
     }
 }
 
@@ -103,12 +114,16 @@ void identity_init(void)
         dev_dist = saved_dist;
     }
 
-    nvs_read(&nvs, NVS_KEY_ENC_COUNT, &enc_count, sizeof(enc_count));
+    if (nvs_read(&nvs, NVS_KEY_ENC_COUNT, &enc_count, sizeof(enc_count)) < 0) {
+        LOG_WRN("enc_count read failed — starting from 0");
+        enc_count = 0;
+    }
 
     ssize_t n = nvs_read(&nvs, NVS_KEY_ENC_HASHES,
                          seen_hashes, sizeof(seen_hashes));
     if (n > 0) {
-        seen_count = (uint8_t)(n / sizeof(uint32_t));
+        uint32_t loaded = (uint32_t)(n / sizeof(uint32_t));
+        seen_count = (uint8_t)MIN(loaded, (uint32_t)MAX_SEEN_HASHES);
     }
 
     LOG_INF("Identity: hash=0x%08X dist=%u encounters=%u",

@@ -16,7 +16,8 @@
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
-static const struct device *const rtc = DEVICE_DT_GET(DT_ALIAS(rtc0));
+/* Non-const pointer so we can NULL it out on RTC failure for degraded boot. */
+static const struct device *rtc = DEVICE_DT_GET(DT_ALIAS(rtc0));
 
 /* Hold left button for 3 seconds while USB is plugged in to enter DFU mode.
  * sys_reboot() hands control back to MCUboot, which opens a 5-second USB DFU
@@ -26,8 +27,11 @@ static const struct gpio_dt_spec btn_dfu = GPIO_DT_SPEC_GET(DT_ALIAS(btn_left), 
 int main(void)
 {
 	if (!device_is_ready(rtc)) {
-		LOG_ERR("RTC device not ready");
-		return -ENODEV;
+		LOG_ERR("RTC device not ready — continuing in degraded mode");
+		/* Do NOT return: the DFU button loop below is the only recovery
+		 * path. Returning here would prevent reflashing a device with a
+		 * bad RTC. */
+		rtc = NULL;
 	}
 
 	led_matrix_init();
@@ -38,7 +42,9 @@ int main(void)
 	/* Digits: cool white — revealed beneath sand as particles clear */
 	led_layer_color[LED_LAYER_DIGITS] = (struct led_rgb){220, 220, 255};
 
-	time_display_init(rtc);
+	if (rtc) {
+		time_display_init(rtc);
+	}
 
 	sand_init();
 	sand_add_particles(60);
@@ -50,9 +56,16 @@ int main(void)
 	battery_init();
 	light_init();
 
-	gpio_pin_configure_dt(&btn_dfu, GPIO_INPUT);
+	if (!gpio_is_ready_dt(&btn_dfu)) {
+		LOG_ERR("DFU button GPIO not ready");
+	} else {
+		gpio_pin_configure_dt(&btn_dfu, GPIO_INPUT);
+	}
 
 	LOG_INF("Every Watch starting");
+
+	/* With CONFIG_SINGLE_APPLICATION_SLOT=y, MCUboot has no secondary slot
+	 * and no revert mechanism. boot_write_img_confirmed() is not needed. */
 
 	int32_t held_ms = 0;
 
@@ -60,7 +73,7 @@ int main(void)
 		k_sleep(K_MSEC(50));
 
 		if (gpio_pin_get_dt(&btn_dfu)) {
-			held_ms += 50;
+			held_ms = MIN(held_ms + 50, 5000);
 			if (held_ms >= 3000) {
 				LOG_INF("DFU: rebooting into bootloader");
 				sys_reboot(SYS_REBOOT_COLD);
