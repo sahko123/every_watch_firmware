@@ -9,6 +9,8 @@
 #include "imu/imu.h"
 #include "identity/identity.h"
 #include "ble/ble.h"
+#include "battery/battery.h"
+#include "light/light.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -38,6 +40,8 @@ int main(void)
 	imu_init();
 	identity_init();
 	ble_init();
+	battery_init();
+	light_init();
 
 	LOG_INF("Every Watch starting");
 	return 0;

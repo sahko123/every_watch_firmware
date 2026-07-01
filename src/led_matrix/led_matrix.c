@@ -93,6 +93,7 @@ static struct k_sem done1, done2, done3;
 struct led_rgb led_color[LED_ROWS][LED_COLS];
 struct led_rgb led_layer_color[LED_LAYER_COUNT]; /* zero = use led_color per cell */
 uint8_t        led_mask[LED_LAYER_COUNT][LED_ROWS][LED_COLS];
+uint8_t        led_brightness = 255;             /* 0=off, 255=full; set by light sensor */
 
 /* --------------------------------------------------------------------------
  * WS2812B encoding
@@ -185,12 +186,19 @@ static struct led_rgb composite(int col, int row)
 static void build_buffers(void)
 {
 	uint8_t *strips[4] = {buf01, buf23, buf45, buf6};
+	uint8_t br = led_brightness;
 
 	for (int row = 0; row < LED_ROWS; row++) {
 		for (int col = 0; col < LED_COLS; col++) {
 			struct led_rgb c = composite(col, row);
-			int strip, pixel;
 
+			if (br < 255) {
+				c.r = (uint8_t)(((uint16_t)c.r * br) >> 8);
+				c.g = (uint8_t)(((uint16_t)c.g * br) >> 8);
+				c.b = (uint8_t)(((uint16_t)c.b * br) >> 8);
+			}
+
+			int strip, pixel;
 			pixel_to_physical(col, row, &strip, &pixel);
 			encode_led(&c, strips[strip] + pixel * BYTES_PER_LED);
 		}

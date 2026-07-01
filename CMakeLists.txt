@@ -16,4 +16,6 @@ target_sources(app PRIVATE
     src/imu/imu.c
     src/identity/identity.c
     src/ble/ble.c
+    src/battery/battery.c
+    src/light/light.c
 )

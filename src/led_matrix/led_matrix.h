@@ -31,6 +31,10 @@ extern struct led_rgb led_layer_color[LED_LAYER_COUNT];
  * Compositor walks layers highest-to-lowest priority, returns first active hit. */
 extern uint8_t led_mask[LED_LAYER_COUNT][LED_ROWS][LED_COLS];
 
+/* Global brightness scaler 0-255 (default 255 = full).
+ * Set by the light sensor to adapt to ambient light. */
+extern uint8_t led_brightness;
+
 /* Initialise SPI devices. Call once before first led_commit(). */
 void led_matrix_init(void);
 

@@ -50,6 +50,8 @@
 		btn-left  = &button_left;
 		btn-right = &button_right;
 		rtc0      = &frtc8900;
+		batt0     = &bq27441;
+		light0    = &bh1750;
 	};
 };
 
@@ -113,23 +115,19 @@
 		            <&gpio0 31 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
 	};
 
-	/* BH1750 ambient light sensor — driver to be added
 	bh1750: bh1750@23 {
 		compatible = "rohm,bh1750";
 		reg = <0x23>;
 	};
-	*/
 
-	/* BQ27441 fuel gauge — driver to be added
 	bq27441: bq27441@55 {
 		compatible = "ti,bq274xx";
 		reg = <0x55>;
-		design-capacity = <300>;
-		design-voltage = <3700>;
-		taper-current = <45>;
-		terminate-voltage = <3000>;
+		design-capacity = <300>;   /* mAh — update to match actual cell */
+		design-voltage = <3700>;   /* mV nominal */
+		taper-current = <45>;      /* mA */
+		terminate-voltage = <3000>; /* mV cutoff */
 	};
-	*/
 };
 
 /* ── SPI peripherals — WS2812B LED matrix ───────────────────────────── */
