@@ -96,6 +96,9 @@ void imu_get_accel(struct imu_accel *out)
 	k_mutex_unlock(&accel_mutex);
 }
 
+void imu_suspend(void) { k_thread_suspend(&imu_thread_data); }
+void imu_resume(void)  { k_thread_resume(&imu_thread_data); }
+
 void imu_init(void)
 {
 	if (!device_is_ready(bmi)) {

@@ -93,7 +93,9 @@ static struct k_sem done1, done2, done3;
 struct led_rgb led_color[LED_ROWS][LED_COLS];
 struct led_rgb led_layer_color[LED_LAYER_COUNT]; /* zero = use led_color per cell */
 uint8_t        led_mask[LED_LAYER_COUNT][LED_ROWS][LED_COLS];
-uint8_t        led_brightness = 255;             /* 0=off, 255=full; set by light sensor */
+uint8_t        led_brightness     = 255;   /* ambient scaling; set by light sensor */
+uint8_t        led_max_brightness = 200;   /* hard cap ~78% — lower for battery saving */
+uint32_t       led_current_budget = 45000; /* auto-dim when total channel sum exceeds this */
 
 /* --------------------------------------------------------------------------
  * WS2812B encoding
@@ -182,11 +184,24 @@ static struct led_rgb composite(int col, int row)
 	return (struct led_rgb){0, 0, 0};
 }
 
-/* Build all four SPI buffers from the current mask + color state. */
+/* Build all four SPI buffers from the current mask + color state.
+ *
+ * Two-pass approach:
+ *   Pass 1 — composite + clamp to effective brightness → accumulate channel sum
+ *   Pass 2 — apply current-limit scale factor → encode to SPI buffers
+ *
+ * Effective brightness = MIN(led_brightness, led_max_brightness).
+ * Current scale        = MIN(1.0, led_current_budget / total_sum).
+ */
 static void build_buffers(void)
 {
-	uint8_t *strips[4] = {buf01, buf23, buf45, buf6};
-	uint8_t br = led_brightness;
+	/* Effective brightness cap (Q8: 0-255) */
+	uint8_t br = (led_brightness < led_max_brightness)
+	             ? led_brightness : led_max_brightness;
+
+	/* Pass 1: composite + brightness → stash + accumulate sum */
+	static struct led_rgb composed[LED_ROWS][LED_COLS];
+	uint32_t total = 0;
 
 	for (int row = 0; row < LED_ROWS; row++) {
 		for (int col = 0; col < LED_COLS; col++) {
@@ -196,6 +211,32 @@ static void build_buffers(void)
 				c.r = (uint8_t)(((uint16_t)c.r * br) >> 8);
 				c.g = (uint8_t)(((uint16_t)c.g * br) >> 8);
 				c.b = (uint8_t)(((uint16_t)c.b * br) >> 8);
+			}
+
+			total += c.r + c.g + c.b;
+			composed[row][col] = c;
+		}
+	}
+
+	/* Current-limit scale in Q8 fixed-point (256 = 1.0, no reduction) */
+	uint32_t scale = 256;
+	uint32_t budget = led_current_budget;
+
+	if (budget > 0 && total > budget) {
+		scale = (budget << 8) / total;
+	}
+
+	/* Pass 2: apply current scale → encode → SPI buffers */
+	uint8_t *strips[4] = {buf01, buf23, buf45, buf6};
+
+	for (int row = 0; row < LED_ROWS; row++) {
+		for (int col = 0; col < LED_COLS; col++) {
+			struct led_rgb c = composed[row][col];
+
+			if (scale < 256) {
+				c.r = (uint8_t)(((uint16_t)c.r * scale) >> 8);
+				c.g = (uint8_t)(((uint16_t)c.g * scale) >> 8);
+				c.b = (uint8_t)(((uint16_t)c.b * scale) >> 8);
 			}
 
 			int strip, pixel;

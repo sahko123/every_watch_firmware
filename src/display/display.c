@@ -1,6 +1,7 @@
 #include "display.h"
 #include "led_matrix/led_matrix.h"
 #include "sand/sand.h"
+#include "imu/imu.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
@@ -64,6 +65,7 @@ void display_on(void)
 	}
 
 	is_on = true;
+	imu_resume();
 	sand_resume();
 	LOG_INF("Display on");
 }
@@ -83,6 +85,7 @@ void display_off(void)
 	 * either sleeping or blocked on a semaphore, both safe to suspend).
 	 */
 	sand_suspend();
+	imu_suspend();
 
 	/* Push one all-black frame to blank the LEDs */
 	memset(led_mask, 0, sizeof(led_mask));

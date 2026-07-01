@@ -31,9 +31,25 @@ extern struct led_rgb led_layer_color[LED_LAYER_COUNT];
  * Compositor walks layers highest-to-lowest priority, returns first active hit. */
 extern uint8_t led_mask[LED_LAYER_COUNT][LED_ROWS][LED_COLS];
 
-/* Global brightness scaler 0-255 (default 255 = full).
- * Set by the light sensor to adapt to ambient light. */
+/* Ambient brightness scaler 0-255 set by the light sensor (default 255 = full).
+ * Only updated while the display is off to avoid LED-to-sensor feedback. */
 extern uint8_t led_brightness;
+
+/* Hard cap applied after ambient scaling (default 200 ≈ 78%).
+ * Lower this to reduce peak power draw. Range 0-255. */
+extern uint8_t led_max_brightness;
+
+/* Sum-of-all-channel-values budget for current limiting.
+ * When the composited frame exceeds this, every pixel is scaled down uniformly
+ * so that the total stays at the budget — "a handful of LEDs at full brightness,
+ * but if all LEDs come on the brightness reduces automatically."
+ *
+ * Default 45000 ≈ 60 LEDs at full-white after max_brightness cap.
+ * Set to 0 to disable current limiting.
+ *
+ * Maths: budget / (total_leds × 3 × max_channel) = avg fraction of max brightness.
+ * e.g. 45000 / (140 × 3 × 199) ≈ 53.7% when all 140 LEDs are at white-max. */
+extern uint32_t led_current_budget;
 
 /* Initialise SPI devices. Call once before first led_commit(). */
 void led_matrix_init(void);

@@ -1,5 +1,6 @@
 #include "light.h"
 #include "led_matrix/led_matrix.h"
+#include "display/display.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/sensor.h>
@@ -46,6 +47,12 @@ static uint8_t lux_to_brightness(uint32_t lux)
 static void light_work_fn(struct k_work *work)
 {
     ARG_UNUSED(work);
+
+    /* Only sample when the LEDs are off — the WS2812B output would
+     * otherwise reach the sensor and create a brightness feedback loop. */
+    if (display_is_on()) {
+        return;
+    }
 
     if (!device_is_ready(bh)) {
         return;
