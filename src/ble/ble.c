@@ -10,14 +10,17 @@
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/gap.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/atomic.h>
+#include <zephyr/sys/reboot.h>
 #include <zephyr/logging/log.h>
 #include <string.h>
 
-LOG_MODULE_REGISTER(ble, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(ble, LOG_LEVEL_ERR);
 
 /* ── Company ID ─────────────────────────────────────────────────────────────
  * 0xFFFF is reserved for internal/test use in the Bluetooth spec.
- * Register a company ID with the Bluetooth SIG before shipping.
+ * TODO: Register a company ID with the Bluetooth SIG before shipping.
+ *       https://www.bluetooth.com/specifications/assigned-numbers/
  */
 #define EW_COMPANY_ID    0xFFFF
 
@@ -53,7 +56,19 @@ static const struct bt_data scan_rsp[] = {
 };
 
 static struct bt_conn *phone_conn;
-static bool adv_running;
+static atomic_t adv_running = ATOMIC_INIT(0);
+
+/* Switch to slow advertising after this many ms of fast advertising */
+#define ADV_FAST_DURATION_MS 30000
+
+static const struct bt_le_adv_param adv_slow_param =
+    BT_LE_ADV_PARAM_INIT(BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_USE_IDENTITY,
+                         BT_GAP_ADV_SLOW_INT_MIN,   /* 1000 ms */
+                         BT_GAP_ADV_SLOW_INT_MAX,   /* 1280 ms */
+                         NULL);
+
+static void adv_slow_fn(struct k_work *w);
+static K_WORK_DELAYABLE_DEFINE(adv_slow_work, adv_slow_fn);
 
 static void start_adv(void)
 {
@@ -65,18 +80,48 @@ static void start_adv(void)
         LOG_ERR("adv_start failed: %d", rc);
         return;
     }
-    adv_running = true;
-    LOG_INF("Advertising started (hash=0x%08X)", identity_hash());
+    atomic_set(&adv_running, 1);
+    k_work_schedule(&adv_slow_work, K_MSEC(ADV_FAST_DURATION_MS));
 }
 
-void ble_update_adv(void)
+static void adv_slow_fn(struct k_work *w)
 {
-    if (!adv_running) {
+    ARG_UNUSED(w);
+    if (!atomic_get(&adv_running)) {
         return;
     }
     bt_le_adv_stop();
-    adv_running = false;
+    build_mfr_data();
+    int rc = bt_le_adv_start(&adv_slow_param,
+                             adv_data, ARRAY_SIZE(adv_data),
+                             scan_rsp, ARRAY_SIZE(scan_rsp));
+    if (rc) {
+        LOG_ERR("slow adv_start failed: %d", rc);
+        atomic_set(&adv_running, 0);
+    }
+}
+
+/* adv_update_work: restart advertising from workqueue context.
+ * Called via k_work_submit from parse_adv (BT scan callback) — never call
+ * bt_le_adv_stop/start directly from the BT RX thread. */
+static void adv_update_work_fn(struct k_work *w)
+{
+    ARG_UNUSED(w);
+    if (!atomic_get(&adv_running)) {
+        return;
+    }
+    bt_le_adv_stop();
+    atomic_set(&adv_running, 0);
     start_adv();
+}
+static K_WORK_DEFINE(adv_update_work, adv_update_work_fn);
+
+void ble_update_adv(void)
+{
+    if (!atomic_get(&adv_running)) {
+        return;
+    }
+    k_work_submit(&adv_update_work);
 }
 
 /* ── Connection callbacks ──────────────────────────────────────────────── */
@@ -84,19 +129,21 @@ void ble_update_adv(void)
 static void on_connected(struct bt_conn *conn, uint8_t err)
 {
     if (err) {
-        LOG_WRN("Connection failed: %d", err);
+        LOG_ERR("Connection failed: %d", err);
         return;
     }
     phone_conn = bt_conn_ref(conn);
-    adv_running = false;
-    LOG_INF("Phone connected");
+    atomic_set(&adv_running, 0);
+    k_work_cancel_delayable(&adv_slow_work);
 }
 
 static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 {
-    bt_conn_unref(phone_conn);
-    phone_conn = NULL;
-    LOG_INF("Phone disconnected (reason=%d)", reason);
+    if (phone_conn) {
+        bt_conn_unref(phone_conn);
+        phone_conn = NULL;
+    }
+    LOG_ERR("Phone disconnected (reason=%d)", reason);
     start_adv();
 }
 
@@ -124,24 +171,18 @@ static bool parse_adv(struct bt_data *data, void *user_data)
     }
 
     /* Another Every Watch found */
-    uint32_t their_hash    = sys_get_le32(data->data + 2);
-    uint8_t  their_dist    = data->data[6];
+    uint32_t their_hash = sys_get_le32(data->data + 2);
+    uint8_t  their_dist = data->data[6];
 
     if (*rssi < EW_ENCOUNTER_RSSI) {
         return false;  /* too far — skip */
     }
 
-    bool was_new = (identity_encounter_count() ==
-                    identity_encounter_count()); /* capture before */
     uint16_t before = identity_encounter_count();
-
     identity_on_encounter(their_hash, their_dist);
-
     if (identity_encounter_count() != before) {
-        ble_update_adv();
+        ble_update_adv();  /* submits adv_update_work — safe from scan callback */
     }
-
-    ARG_UNUSED(was_new);
     return false;
 }
 
@@ -224,7 +265,7 @@ static ssize_t on_notif_write(struct bt_conn *conn,
     uint8_t category = data[0];
 
     if (len > 1) {
-        LOG_INF("Notification cat=%u: %.*s", category, (int)(len - 1), data + 1);
+        LOG_ERR("Notification cat=%u text len=%d", category, (int)(len - 1));
     }
 
     show_notification(category);
@@ -247,11 +288,11 @@ BT_GATT_SERVICE_DEFINE(ew_svc,
     BT_GATT_PRIMARY_SERVICE(BT_UUID_EW_SVC),
     BT_GATT_CHARACTERISTIC(BT_UUID_EW_NOTIF,
         BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
-        BT_GATT_PERM_WRITE,
+        BT_GATT_PERM_WRITE_ENCRYPT,
         NULL, on_notif_write, NULL),
     BT_GATT_CHARACTERISTIC(BT_UUID_EW_INFO,
         BT_GATT_CHRC_READ,
-        BT_GATT_PERM_READ,
+        BT_GATT_PERM_READ_ENCRYPT,
         on_info_read, NULL, NULL),
 );
 
@@ -266,11 +307,13 @@ static void bt_ready(int err)
 
     bt_le_scan_cb_register(&scan_callbacks);
 
+    /* 10% scan duty cycle: 500 ms interval, 50 ms window.
+     * Down from 100% (30/30 ms) — reduces scan current ~6x. */
     static const struct bt_le_scan_param scan_param = {
         .type     = BT_LE_SCAN_TYPE_PASSIVE,
         .options  = BT_LE_SCAN_OPT_NONE,
-        .interval = BT_GAP_SCAN_FAST_INTERVAL,
-        .window   = BT_GAP_SCAN_FAST_WINDOW,
+        .interval = 0x0320,   /* 500 ms */
+        .window   = 0x0050,   /* 50 ms  */
     };
     int rc = bt_le_scan_start(&scan_param, NULL);
     if (rc) {
@@ -284,7 +327,8 @@ void ble_init(void)
 {
     int rc = bt_enable(bt_ready);
     if (rc) {
-        LOG_ERR("bt_enable failed: %d", rc);
+        LOG_ERR("bt_enable failed (%d) — rebooting", rc);
+        sys_reboot(SYS_REBOOT_COLD);
     }
 }
 
