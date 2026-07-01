@@ -238,13 +238,15 @@ static void show_notification(uint8_t category)
         category = 0;
     }
 
-    /* Light the top row on the notification layer */
+    /* Runs on BT RX thread — must hold led_mask_mutex before writing led_mask */
+    k_mutex_lock(&led_mask_mutex, K_FOREVER);
     memset(led_mask[LED_LAYER_NOTIFICATION], 0,
            sizeof(led_mask[LED_LAYER_NOTIFICATION]));
     for (int col = 0; col < LED_COLS; col++) {
         led_mask[LED_LAYER_NOTIFICATION][0][col] = 1;
     }
     led_layer_color[LED_LAYER_NOTIFICATION] = notif_colors[category];
+    k_mutex_unlock(&led_mask_mutex);
 
     display_on();
     led_commit();
