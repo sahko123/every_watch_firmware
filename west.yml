@@ -1,0 +1,19 @@
+manifest:
+  self:
+    path: every_watch_firmware
+
+  remotes:
+    - name: nrfconnect
+      url-base: https://github.com/nrfconnect
+
+  projects:
+    - name: nrf
+      remote: nrfconnect
+      repo-path: sdk-nrf
+      revision: v2.7.0
+      import: true
+
+    - name: frtc8900-zephyr
+      url: https://github.com/sahko123/frtc8900-zephyr
+      revision: master
+      path: modules/rtc/frtc8900

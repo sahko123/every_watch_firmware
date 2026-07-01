@@ -1,0 +1,4 @@
+build/
+.west/
+*.pyc
+__pycache__/

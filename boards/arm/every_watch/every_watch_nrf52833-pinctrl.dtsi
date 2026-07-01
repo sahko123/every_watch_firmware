@@ -1,0 +1,71 @@
+#include <dt-bindings/pinctrl/nrf-pinctrl.h>
+
+&pinctrl {
+	/* I2C0: SDA=P0.01, SCL=P0.04
+	 * Shared by: FRTC8900 (RTC), BMI270 (IMU), BH1750 (ALS), BQ27441 (fuel gauge) */
+	i2c0_default: i2c0_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 1)>,
+				<NRF_PSEL(TWIM_SCL, 0, 4)>;
+		};
+	};
+	i2c0_sleep: i2c0_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 1)>,
+				<NRF_PSEL(TWIM_SCL, 0, 4)>;
+			low-power-enable;
+		};
+	};
+
+	/* SPI0: LED data line 1 (rows 1-2), P0.29 */
+	spi0_default: spi0_default {
+		group1 {
+			psels = <NRF_PSEL(SPIM_MOSI, 0, 29)>;
+		};
+	};
+	spi0_sleep: spi0_sleep {
+		group1 {
+			psels = <NRF_PSEL(SPIM_MOSI, 0, 29)>;
+			low-power-enable;
+		};
+	};
+
+	/* SPI1: LED data line 2 (rows 3-4), P0.28 */
+	spi1_default: spi1_default {
+		group1 {
+			psels = <NRF_PSEL(SPIM_MOSI, 0, 28)>;
+		};
+	};
+	spi1_sleep: spi1_sleep {
+		group1 {
+			psels = <NRF_PSEL(SPIM_MOSI, 0, 28)>;
+			low-power-enable;
+		};
+	};
+
+	/* SPI2: LED data line 3 (rows 5-6), P0.02 */
+	spi2_default: spi2_default {
+		group1 {
+			psels = <NRF_PSEL(SPIM_MOSI, 0, 2)>;
+		};
+	};
+	spi2_sleep: spi2_sleep {
+		group1 {
+			psels = <NRF_PSEL(SPIM_MOSI, 0, 2)>;
+			low-power-enable;
+		};
+	};
+
+	/* SPI3: LED data line 4 (row 7), P0.03 */
+	spi3_default: spi3_default {
+		group1 {
+			psels = <NRF_PSEL(SPIM_MOSI, 0, 3)>;
+		};
+	};
+	spi3_sleep: spi3_sleep {
+		group1 {
+			psels = <NRF_PSEL(SPIM_MOSI, 0, 3)>;
+			low-power-enable;
+		};
+	};
+};

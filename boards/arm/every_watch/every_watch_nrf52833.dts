@@ -1,0 +1,185 @@
+/dts-v1/;
+#include <nordic/nrf52833_qdaa.dtsi>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/i2c/i2c.h>
+#include "every_watch_nrf52833-pinctrl.dtsi"
+
+/ {
+	model = "Every Watch";
+	compatible = "everywatch,every-watch-nrf52833";
+
+	chosen {
+		zephyr,sram    = &sram0;
+		zephyr,flash   = &flash0;
+		zephyr,code-partition = &slot0_partition;
+	};
+
+	/* ── Buttons ─────────────────────────────────────────────────────── */
+	buttons {
+		compatible = "gpio-keys";
+
+		button_left: button_left {
+			gpios = <&gpio0 17 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			label = "Left button";
+		};
+
+		button_right: button_right {
+			gpios = <&gpio0 15 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			label = "Right button";
+		};
+	};
+
+	/* ── Charge / battery GPIOs (input only at this stage) ───────────── */
+	gpio_inputs {
+		compatible = "gpio-keys";
+
+		/* SGM41524 charge indicator — active low */
+		chg_indicator: chg_indicator {
+			gpios = <&gpio0 5 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			label = "Charge indicator";
+		};
+
+		/* BQ27441 GPOUT / battery monitor interrupt */
+		batt_gpout: batt_gpout {
+			gpios = <&gpio1 9 GPIO_ACTIVE_HIGH>;
+			label = "Battery GPOUT";
+		};
+	};
+
+	aliases {
+		btn-left  = &button_left;
+		btn-right = &button_right;
+		rtc0      = &frtc8900;
+	};
+};
+
+/* ── Flash partitions ────────────────────────────────────────────────── */
+/* nRF52833: 512 KB flash (0x00000000 – 0x0007FFFF)
+ *   MCUboot :  32 KB  0x00000000 – 0x00007FFF
+ *   Slot 0  : 224 KB  0x00008000 – 0x00043FFF
+ *   Slot 1  : 224 KB  0x00044000 – 0x0007FFFF  (no NVS here; see storage_partition)
+ *
+ * NVS lives inside Slot 1 tail — adjust offsets if image grows past ~216 KB. */
+&flash0 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		boot_partition: partition@0 {
+			label = "mcuboot";
+			reg = <0x00000000 0x8000>;
+			read-only;
+		};
+
+		slot0_partition: partition@8000 {
+			label = "image-0";
+			reg = <0x00008000 0x38000>;
+		};
+
+		slot1_partition: partition@40000 {
+			label = "image-1";
+			reg = <0x00040000 0x38000>;
+		};
+
+		/* NVS for persistent settings (time format, display duration, etc.) */
+		storage_partition: partition@78000 {
+			label = "storage";
+			reg = <0x00078000 0x8000>;
+		};
+	};
+};
+
+/* ── I2C0 — all on-board sensors ─────────────────────────────────────── */
+&i2c0 {
+	compatible = "nordic,nrf-twim";
+	status = "okay";
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-1 = <&i2c0_sleep>;
+	pinctrl-names = "default", "sleep";
+	clock-frequency = <I2C_BITRATE_FAST>;
+
+	frtc8900: frtc8900@32 {
+		compatible = "nyfea,frtc8900";
+		reg = <0x32>;
+		/* /INT: open-drain, active low — GPIO pull-up required */
+		int-gpios = <&gpio0 0 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+	};
+
+	/* BMI270 IMU — driver to be added
+	bmi270: bmi270@68 {
+		compatible = "bosch,bmi270";
+		reg = <0x68>;
+		int-gpios = <&gpio0 30 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>,
+		            <&gpio0 31 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
+	};
+	*/
+
+	/* BH1750 ambient light sensor — driver to be added
+	bh1750: bh1750@23 {
+		compatible = "rohm,bh1750";
+		reg = <0x23>;
+	};
+	*/
+
+	/* BQ27441 fuel gauge — driver to be added
+	bq27441: bq27441@55 {
+		compatible = "ti,bq274xx";
+		reg = <0x55>;
+		design-capacity = <300>;
+		design-voltage = <3700>;
+		taper-current = <45>;
+		terminate-voltage = <3000>;
+	};
+	*/
+};
+
+/* ── SPI peripherals — WS2812B LED matrix ───────────────────────────── */
+/* Each SPIM drives one data line at ~3.2 MHz (800 kHz WS2812B × 4 SPI bits/bit).
+ * All four are fired simultaneously via spi_write_async() to minimise CPU time.
+ * Enabled when the LED subsystem is implemented; disabled here to save power. */
+
+&spi0 {
+	compatible = "nordic,nrf-spim";
+	status = "disabled";
+	pinctrl-0 = <&spi0_default>;
+	pinctrl-1 = <&spi0_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+&spi1 {
+	compatible = "nordic,nrf-spim";
+	status = "disabled";
+	pinctrl-0 = <&spi1_default>;
+	pinctrl-1 = <&spi1_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+&spi2 {
+	compatible = "nordic,nrf-spim";
+	status = "disabled";
+	pinctrl-0 = <&spi2_default>;
+	pinctrl-1 = <&spi2_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+&spi3 {
+	compatible = "nordic,nrf-spim";
+	status = "disabled";
+	pinctrl-0 = <&spi3_default>;
+	pinctrl-1 = <&spi3_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+/* ── GPIO ports ──────────────────────────────────────────────────────── */
+&gpio0 {
+	status = "okay";
+};
+
+&gpio1 {
+	status = "okay";
+};
+
+&gpiote {
+	status = "okay";
+};

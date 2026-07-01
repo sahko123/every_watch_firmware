@@ -1,0 +1,2 @@
+config BOARD_EVERY_WATCH
+	select SOC_NRF52833_QDAA
