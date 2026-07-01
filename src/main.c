@@ -3,6 +3,7 @@
 #include <zephyr/logging/log.h>
 
 #include "led_matrix/led_matrix.h"
+#include "sand/sand.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -16,6 +17,12 @@ int main(void)
 	}
 
 	led_matrix_init();
+
+	/* Sand colour: warm amber */
+	led_color_fill(255, 160, 20);
+
+	sand_init();
+	sand_add_particles(60);
 
 	LOG_INF("Every Watch starting");
 	return 0;
