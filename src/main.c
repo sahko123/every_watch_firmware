@@ -7,6 +7,8 @@
 #include "time_display/time_display.h"
 #include "display/display.h"
 #include "imu/imu.h"
+#include "identity/identity.h"
+#include "ble/ble.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -34,6 +36,8 @@ int main(void)
 
 	display_init();
 	imu_init();
+	identity_init();
+	ble_init();
 
 	LOG_INF("Every Watch starting");
 	return 0;

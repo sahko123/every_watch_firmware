@@ -3,4 +3,9 @@ if BOARD_EVERY_WATCH
 config HW_STACK_PROTECTION
 	default ARCH_HAS_STACK_PROTECTION
 
+# nRF52833 has a built-in BLE radio — use the Zephyr software LL (same as
+# the official nRF52833DK board) so no external HCI transport is needed.
+config BT_CTLR
+	default BT
+
 endif # BOARD_EVERY_WATCH

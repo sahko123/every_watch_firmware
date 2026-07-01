@@ -14,4 +14,6 @@ target_sources(app PRIVATE
     src/time_display/time_display.c
     src/display/display.c
     src/imu/imu.c
+    src/identity/identity.c
+    src/ble/ble.c
 )
