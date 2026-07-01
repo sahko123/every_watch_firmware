@@ -4,6 +4,8 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/sensor.h>
+#include <zephyr/pm/device.h>
+#include <zephyr/sys/util.h>
 #include <zephyr/logging/log.h>
 
 LOG_MODULE_REGISTER(imu, LOG_LEVEL_INF);
@@ -14,29 +16,27 @@ static struct imu_accel latest;
 static K_MUTEX_DEFINE(accel_mutex);
 
 /*
- * Convert accelerometer axes to a sand gravity vector.
+ * Convert BMI270 sensor_value accelerometer reading to a Q8 sand gravity vector.
+ * Q8 format: 256 = 1g (≈ 9.8 m/s²). Scale factor: 256 / 9.8 ≈ 26.
  *
- * The watch face is in the XY plane. Gravity pulls the real world downward,
- * so the accelerometer reads +1 g on whichever axis points up relative to
- * the chip. We negate to get the direction sand should fall.
+ * sensor_value: val1 = integer m/s², val2 = fractional µm/s² (millionths).
+ * For gravity direction we only need ~4% precision so the val2 term is
+ * approximated (val2 / 38462 ≈ val2 * 256 / 9800000).
  *
  * Axis mapping (verify against PCB orientation at bring-up):
  *   accel.x > 0  → watch tilted right  → sand falls right  (+col)
  *   accel.x < 0  → watch tilted left   → sand falls left   (-col)
  *   accel.y > 0  → watch face up        → sand falls down   (+row)
  *   accel.y < 0  → watch face down      → sand falls up     (-row)
- *
- * The Q8 vector components are clamped to [-256, 256].
  */
-static struct sand_gravity accel_to_gravity(float ax, float ay)
+static struct sand_gravity accel_to_gravity(const struct sensor_value *ax,
+					    const struct sensor_value *ay)
 {
-	/* Scale g (≈9.8 m/s²) to Q8 range: 9.8 → 256 → scale = 26.1 */
-	const float scale = 256.0f / 9.8f;
-	int col = (int)(ax * scale);
-	int row = (int)(ay * scale);
+	int col = ax->val1 * 26 + (int)(ax->val2 / 38462);
+	int row = ay->val1 * 26 + (int)(ay->val2 / 38462);
 
-	col = col >  256 ?  256 : col < -256 ? -256 : col;
-	row = row >  256 ?  256 : row < -256 ? -256 : row;
+	col = CLAMP(col, -256, 256);
+	row = CLAMP(row, -256, 256);
 
 	return (struct sand_gravity){.col = col, .row = row};
 }
@@ -49,7 +49,7 @@ static struct sand_gravity accel_to_gravity(float ax, float ay)
  * a fresh gravity vector.
  */
 
-#define IMU_STACK_SIZE 512
+#define IMU_STACK_SIZE 1024
 #define IMU_PRIORITY   4
 #define IMU_PERIOD_MS  20  /* 50 Hz */
 
@@ -75,15 +75,15 @@ static void imu_thread(void *p1, void *p2, void *p3)
 		sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_Y, &ay);
 		sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_Z, &az);
 
-		float fax = sensor_value_to_float(&ax);
-		float fay = sensor_value_to_float(&ay);
-		float faz = sensor_value_to_float(&az);
+		/* Hot path: integer Q8 gravity for sand — no FPU needed */
+		sand_set_gravity(accel_to_gravity(&ax, &ay));
 
+		/* Float conversion only for external callers of imu_get_accel() */
 		k_mutex_lock(&accel_mutex, K_FOREVER);
-		latest = (struct imu_accel){.x = fax, .y = fay, .z = faz};
+		latest.x = sensor_value_to_float(&ax);
+		latest.y = sensor_value_to_float(&ay);
+		latest.z = sensor_value_to_float(&az);
 		k_mutex_unlock(&accel_mutex);
-
-		sand_set_gravity(accel_to_gravity(fax, fay));
 
 		k_msleep(IMU_PERIOD_MS);
 	}
@@ -96,8 +96,19 @@ void imu_get_accel(struct imu_accel *out)
 	k_mutex_unlock(&accel_mutex);
 }
 
-void imu_suspend(void) { k_thread_suspend(&imu_thread_data); }
-void imu_resume(void)  { k_thread_resume(&imu_thread_data); }
+void imu_suspend(void)
+{
+	k_thread_suspend(&imu_thread_data);
+	/* Put the BMI270 hardware into suspend mode (~3 µA vs ~950 µA normal) */
+	pm_device_action_run(bmi, PM_DEVICE_ACTION_SUSPEND);
+}
+
+void imu_resume(void)
+{
+	/* Restore normal mode before resuming the poll thread */
+	pm_device_action_run(bmi, PM_DEVICE_ACTION_RESUME);
+	k_thread_resume(&imu_thread_data);
+}
 
 void imu_init(void)
 {

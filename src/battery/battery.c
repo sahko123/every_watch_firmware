@@ -36,10 +36,6 @@ static void battery_work_fn(struct k_work *work)
 {
     ARG_UNUSED(work);
 
-    if (!device_is_ready(bq)) {
-        return;
-    }
-
     int err = sensor_sample_fetch(bq);
     if (err) {
         LOG_WRN("BQ27441 fetch failed: %d", err);
@@ -54,7 +50,10 @@ static void battery_work_fn(struct k_work *work)
 
     uint8_t  pct  = (uint8_t)soc.val1;
     uint32_t mv   = (uint32_t)(volt.val1 * 1000 + volt.val2 / 1000);
-    bool     chrg = (current.val1 > 0);
+    /* BQ27441 current: val1 = mA integer part, val2 = µA fractional part.
+     * val1 > 0 alone misses charge currents below 1 mA (val1=0, val2>0). */
+    bool     chrg = (current.val1 > 0) ||
+                    (current.val1 == 0 && current.val2 > 0);
 
     atomic_store(&g_percent,  pct);
     atomic_store(&g_volt_mv,  (int)mv);
