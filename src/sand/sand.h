@@ -32,3 +32,7 @@ void sand_clear(void);
 
 /* Number of live particles currently in the simulation. */
 int sand_count(void);
+
+/* Suspend / resume the simulation thread (called by display state machine). */
+void sand_suspend(void);
+void sand_resume(void);

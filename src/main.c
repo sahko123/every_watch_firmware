@@ -5,6 +5,8 @@
 #include "led_matrix/led_matrix.h"
 #include "sand/sand.h"
 #include "time_display/time_display.h"
+#include "display/display.h"
+#include "imu/imu.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -29,6 +31,9 @@ int main(void)
 
 	sand_init();
 	sand_add_particles(60);
+
+	display_init();
+	imu_init();
 
 	LOG_INF("Every Watch starting");
 	return 0;

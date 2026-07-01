@@ -265,3 +265,13 @@ int sand_count(void)
 	k_mutex_unlock(&sand_mutex);
 	return count;
 }
+
+void sand_suspend(void)
+{
+	k_thread_suspend(&sand_thread_data);
+}
+
+void sand_resume(void)
+{
+	k_thread_resume(&sand_thread_data);
+}

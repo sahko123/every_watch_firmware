@@ -106,14 +106,12 @@
 		int-gpios = <&gpio0 0 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
 	};
 
-	/* BMI270 IMU — driver to be added
 	bmi270: bmi270@68 {
 		compatible = "bosch,bmi270";
 		reg = <0x68>;
-		int-gpios = <&gpio0 30 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>,
+		irq-gpios = <&gpio0 30 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>,
 		            <&gpio0 31 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
 	};
-	*/
 
 	/* BH1750 ambient light sensor — driver to be added
 	bh1750: bh1750@23 {
