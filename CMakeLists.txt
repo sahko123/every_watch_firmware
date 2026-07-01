@@ -5,4 +5,7 @@ list(APPEND BOARD_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(every_watch)
 
-target_sources(app PRIVATE src/main.c)
+target_sources(app PRIVATE
+    src/main.c
+    src/led_matrix/led_matrix.c
+)

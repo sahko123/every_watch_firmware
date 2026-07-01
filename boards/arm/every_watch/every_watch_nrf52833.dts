@@ -135,40 +135,40 @@
 };
 
 /* ── SPI peripherals — WS2812B LED matrix ───────────────────────────── */
-/* Each SPIM drives one data line at ~3.2 MHz (800 kHz WS2812B × 4 SPI bits/bit).
- * All four are fired simultaneously via spi_write_async() to minimise CPU time.
- * Enabled when the LED subsystem is implemented; disabled here to save power. */
+/* WS2812B bit encoding: each bit → 3 SPI bits at 2 MHz → ~1.5 µs/bit.
+ * SPIM1, SPIM2, SPIM3 fire in parallel via async DMA for rows 0-5.
+ * Row 6 (P0.03) is sent sequentially after — see led_matrix.c.
+ * SPI0 is disabled: SPIM0 and TWIM0 share hardware at 0x40003000. */
 
 &spi0 {
-	compatible = "nordic,nrf-spim";
 	status = "disabled";
-	pinctrl-0 = <&spi0_default>;
-	pinctrl-1 = <&spi0_sleep>;
-	pinctrl-names = "default", "sleep";
 };
 
 &spi1 {
 	compatible = "nordic,nrf-spim";
-	status = "disabled";
+	status = "okay";
 	pinctrl-0 = <&spi1_default>;
 	pinctrl-1 = <&spi1_sleep>;
 	pinctrl-names = "default", "sleep";
+	clock-frequency = <DT_FREQ_M(2)>;
 };
 
 &spi2 {
 	compatible = "nordic,nrf-spim";
-	status = "disabled";
+	status = "okay";
 	pinctrl-0 = <&spi2_default>;
 	pinctrl-1 = <&spi2_sleep>;
 	pinctrl-names = "default", "sleep";
+	clock-frequency = <DT_FREQ_M(2)>;
 };
 
 &spi3 {
 	compatible = "nordic,nrf-spim";
-	status = "disabled";
+	status = "okay";
 	pinctrl-0 = <&spi3_default>;
 	pinctrl-1 = <&spi3_sleep>;
 	pinctrl-names = "default", "sleep";
+	clock-frequency = <DT_FREQ_M(2)>;
 };
 
 /* ── GPIO ports ──────────────────────────────────────────────────────── */
