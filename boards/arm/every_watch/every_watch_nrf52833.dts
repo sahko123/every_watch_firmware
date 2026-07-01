@@ -9,9 +9,11 @@
 	compatible = "everywatch,every-watch-nrf52833";
 
 	chosen {
-		zephyr,sram    = &sram0;
-		zephyr,flash   = &flash0;
+		zephyr,sram         = &sram0;
+		zephyr,flash        = &flash0;
 		zephyr,code-partition = &slot0_partition;
+		/* CDC-ACM UART used by MCUmgr SMP for USB firmware update */
+		zephyr,uart-mcumgr  = &cdc_acm_uart0;
 	};
 
 	/* ── Buttons ─────────────────────────────────────────────────────── */
@@ -57,11 +59,14 @@
 
 /* ── Flash partitions ────────────────────────────────────────────────── */
 /* nRF52833: 512 KB flash (0x00000000 – 0x0007FFFF)
- *   MCUboot :  32 KB  0x00000000 – 0x00007FFF
- *   Slot 0  : 224 KB  0x00008000 – 0x00043FFF
- *   Slot 1  : 224 KB  0x00044000 – 0x0007FFFF  (no NVS here; see storage_partition)
  *
- * NVS lives inside Slot 1 tail — adjust offsets if image grows past ~216 KB. */
+ *   MCUboot :  32 KB  0x00000000 – 0x00007FFF  (actual binary ~26 KB; 32 KB reserved)
+ *   Slot 0  : 236 KB  0x00008000 – 0x00042FFF  (image header @ 8000, code @ 8200)
+ *   Slot 1  : 236 KB  0x00043000 – 0x0007DFFF  (DFU upload target, equal to slot 0)
+ *   NVS     :   8 KB  0x0007E000 – 0x0007FFFF  (2 × 4 KB sectors)
+ *
+ * Matches pm_static.yml. NCS Partition Manager uses pm_static.yml as
+ * authoritative; this DTS keeps the MCUboot flash-map API in sync. */
 &flash0 {
 	partitions {
 		compatible = "fixed-partitions";
@@ -76,18 +81,18 @@
 
 		slot0_partition: partition@8000 {
 			label = "image-0";
-			reg = <0x00008000 0x38000>;
+			reg = <0x00008000 0x3B000>;
 		};
 
-		slot1_partition: partition@40000 {
+		slot1_partition: partition@43000 {
 			label = "image-1";
-			reg = <0x00040000 0x38000>;
+			reg = <0x00043000 0x3B000>;
 		};
 
-		/* NVS for persistent settings (time format, display duration, etc.) */
-		storage_partition: partition@78000 {
+		/* NVS for persistent identity / settings; matches pm_static.yml nvs_storage */
+		storage_partition: partition@7E000 {
 			label = "storage";
-			reg = <0x00078000 0x8000>;
+			reg = <0x0007E000 0x2000>;
 		};
 	};
 };
@@ -178,4 +183,14 @@
 
 &gpiote {
 	status = "okay";
+};
+
+/* ── USB — CDC-ACM serial for MCUmgr SMP (firmware update over USB) ──── */
+/* nRF52833 USBD uses dedicated D+/D- pins; VBUS detected via POWER
+ * peripheral events — no GPIO VBUS pin needed. */
+zephyr_udc0: &usbd {
+	status = "okay";
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
 };

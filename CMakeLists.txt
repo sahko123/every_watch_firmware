@@ -18,4 +18,5 @@ target_sources(app PRIVATE
     src/ble/ble.c
     src/battery/battery.c
     src/light/light.c
+    src/dfu/dfu.c
 )

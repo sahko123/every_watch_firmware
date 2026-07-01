@@ -1,0 +1,87 @@
+# Static partition layout for Every Watch / nRF52833 (512 KB flash)
+#
+# MCUboot with our child_image overlay (sensors/USB disabled) is ~26 KB.
+# We reserve 32 KB for the boot partition to give MCUboot headroom.
+# This allows both image slots to be 236 KB each.
+#
+#   0x00000 – 0x07FFF  MCUboot (32 KB)        — bootloader
+#   0x08000 – 0x081FF  mcuboot_pad (512 B)    — MCUboot image header
+#   0x08200 – 0x42FFF  app (235.5 KB)          — firmware binary
+#   0x43000 – 0x7DFFF  mcuboot_secondary       — DFU upload target (236 KB)
+#   0x7E000 – 0x7FFFF  nvs_storage (8 KB)      — NVS: 2 × 4 KB sectors
+
+mcuboot:
+  address: 0x0
+  end_address: 0x8000
+  placement:
+    before:
+    - mcuboot_primary
+  region: flash_primary
+  size: 0x8000
+
+mcuboot_pad:
+  address: 0x8000
+  end_address: 0x8200
+  placement:
+    align:
+      start: 0x1000
+    before:
+    - mcuboot_primary_app
+  region: flash_primary
+  size: 0x200
+
+app:
+  address: 0x8200
+  end_address: 0x43000
+  region: flash_primary
+  size: 0x3ae00
+
+mcuboot_primary:
+  address: 0x8000
+  end_address: 0x43000
+  orig_span: &id001
+  - mcuboot_pad
+  - app
+  region: flash_primary
+  sharers: 0x1
+  size: 0x3b000
+  span: *id001
+
+mcuboot_primary_app:
+  address: 0x8200
+  end_address: 0x43000
+  orig_span: &id002
+  - app
+  region: flash_primary
+  size: 0x3ae00
+  span: *id002
+
+mcuboot_secondary:
+  address: 0x43000
+  end_address: 0x7e000
+  placement:
+    after:
+    - mcuboot_primary
+    align:
+      start: 0x1000
+  region: flash_primary
+  share_size:
+  - mcuboot_primary
+  size: 0x3b000
+
+nvs_storage:
+  address: 0x7e000
+  end_address: 0x80000
+  placement:
+    align:
+      start: 0x1000
+    before:
+    - end
+  region: flash_primary
+  size: 0x2000
+
+sram_primary:
+  address: 0x20000000
+  end_address: 0x20020000
+  region: sram_primary
+  size: 0x20000

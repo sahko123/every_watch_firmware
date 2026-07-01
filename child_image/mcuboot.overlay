@@ -1,0 +1,32 @@
+/*
+ * MCUboot DTS overlay for Every Watch.
+ *
+ * MCUboot only needs flash access + UART (for logging).
+ * Remove all sensor / peripheral nodes that would otherwise trigger
+ * Kconfig symbols MCUboot cannot satisfy (e.g. frtc8900 selects
+ * RTC_ALARM but MCUboot doesn't enable CONFIG_RTC).
+ */
+
+/ {
+	chosen {
+		/delete-property/ zephyr,uart-mcumgr;
+	};
+
+	aliases {
+		/delete-property/ rtc0;
+		/delete-property/ batt0;
+		/delete-property/ light0;
+	};
+};
+
+&i2c0 {
+	/delete-node/ frtc8900@32;
+	/delete-node/ bmi270@68;
+	/delete-node/ bh1750@23;
+	/delete-node/ bq27441@55;
+};
+
+/* Disable USB — MCUboot on Every Watch boots silently, no USB needed */
+&usbd {
+	status = "disabled";
+};

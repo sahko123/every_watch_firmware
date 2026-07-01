@@ -11,6 +11,7 @@
 #include "ble/ble.h"
 #include "battery/battery.h"
 #include "light/light.h"
+#include "dfu/dfu.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -42,6 +43,7 @@ int main(void)
 	ble_init();
 	battery_init();
 	light_init();
+	dfu_init();
 
 	LOG_INF("Every Watch starting");
 	return 0;
