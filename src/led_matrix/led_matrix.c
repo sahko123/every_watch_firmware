@@ -3,6 +3,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/spi.h>
 #include <zephyr/logging/log.h>
+#include <hal/nrf_gpio.h>
 #include <string.h>
 
 LOG_MODULE_REGISTER(led_matrix, LOG_LEVEL_INF);
@@ -25,11 +26,49 @@ LOG_MODULE_REGISTER(led_matrix, LOG_LEVEL_INF);
  * SPIM0 is unavailable: it shares hardware with TWIM0 (I2C0 @ 0x40003000).
  */
 
+/* Row 6 bitbang on P0.03
+ * ---------------------
+ * The nRF52833 has no PIO block. The closest equivalent is PWM + EasyDMA:
+ * preload a buffer of 16-bit duty-cycle values (one per WS2812B bit) and the
+ * PWM peripheral generates the waveform on any GPIO pin without CPU involvement.
+ * PWM0-3 are all free (separate hardware blocks from SPIM/TWIM).
+ *
+ * For now, row 6 uses a simple bit-bang. The CPU disables interrupts and
+ * toggles P0.03 via direct OUTSET/OUTCLR register writes with nop delays.
+ * At 64 MHz: 1 nop ≈ 15.6 ns. Interrupt-off window: 20 LEDs × 24 bits × 1250 ns ≈ 600 µs.
+ *
+ * TODO: migrate row 6 to PWM0 + EasyDMA for zero CPU cost and deterministic
+ *       timing without the interrupt-disable window.
+ */
+#define ROW6_PORT  0
+#define ROW6_PIN   3   /* P0.03 */
+#define ROW6_MASK  BIT(3)
+
+/*
+ * Nop delay macros. Calibrated for 64 MHz with flash cache warm (1 nop ≈ 15.6 ns).
+ * Peripheral register writes (OUTSET/OUTCLR) take ~2 APB cycles ≈ 31 ns each.
+ * Verify high/low pulse widths with an oscilloscope on first board bring-up.
+ *
+ * Target: T1H ≈ 580 ns, T0H ≈ 220 ns, bit period ≈ 1250 ns.
+ *   T1: OUTSET(2) + nop×35(35) + OUTCLR(2) = 39 cycles H ≈ 609 ns
+ *       OUTSET(2) + nop×35(35) + OUTCLR(2) = 39 cycles L ≈ 609 ns  → period ≈ 1218 ns
+ *   T0: OUTSET(2) + nop×12(12) + OUTCLR(2) = 16 cycles H ≈ 250 ns
+ *       OUTSET(2) + nop×58(58) + OUTCLR(2) = 62 cycles L ≈ 969 ns  → period ≈ 1219 ns
+ */
+#define _NOP()  __asm__ volatile ("nop" ::: "memory")
+#define NOP2    _NOP(); _NOP()
+#define NOP4    NOP2; NOP2
+#define NOP8    NOP4; NOP4
+#define NOP12   NOP8; NOP4
+#define NOP16   NOP8; NOP8
+#define NOP35   NOP16; NOP16; NOP2; _NOP()
+#define NOP58   NOP35; NOP16; NOP4; NOP2; _NOP()
+
 #define BYTES_PER_LED 9   /* 24 bits × 3 SPI bits / 8 = 9 bytes */
 #define LEDS_01       40  /* rows 0-1: SPIM1 (P0.29) */
 #define LEDS_23       40  /* rows 2-3: SPIM2 (P0.28) */
 #define LEDS_45       40  /* rows 4-5: SPIM3 (P0.02) */
-#define LEDS_6        20  /* row  6:   SPIM3 sequential, P0.03 (see note) */
+#define LEDS_6        20  /* row 6:    P0.03 bitbang  */
 
 /* DMA buffers — placed in RAM, naturally aligned for EasyDMA */
 static uint8_t buf01[LEDS_01 * BYTES_PER_LED];
@@ -180,6 +219,44 @@ static void cb3(const struct device *dev, int result, void *userdata)
  * Public API
  * -------------------------------------------------------------------------- */
 
+/*
+ * Bitbang WS2812B on P0.03 (row 6, 20 LEDs).
+ *
+ * Sends buf6 with interrupts locked. The nop counts give approximately:
+ *   T1H ≈ 609 ns, T0H ≈ 250 ns, bit period ≈ 1219 ns
+ * WS2812B tolerates ±150 ns on pulse widths, so these land safely in-spec.
+ * Interrupt-off window: 20 × 24 × 1219 ns ≈ 585 µs.
+ */
+static void __attribute__((noinline, optimize("O2"))) ws2812_bitbang_row6(void)
+{
+	NRF_GPIO_Type *port = nrf_gpio_pin_port_decode(
+				&(uint32_t){NRF_GPIO_PIN_MAP(ROW6_PORT, ROW6_PIN)});
+	unsigned int key = irq_lock();
+
+	for (int i = 0; i < (int)sizeof(buf6); i++) {
+		uint8_t byte = buf6[i];
+
+		for (int bit = 7; bit >= 0; bit--) {
+			if (byte & BIT(bit)) {
+				port->OUTSET = ROW6_MASK;
+				NOP35;
+				port->OUTCLR = ROW6_MASK;
+				NOP35;
+			} else {
+				port->OUTSET = ROW6_MASK;
+				NOP12;
+				port->OUTCLR = ROW6_MASK;
+				NOP58;
+			}
+		}
+	}
+
+	irq_unlock(key);
+
+	/* WS2812B reset: hold data line low for >280 µs to latch the frame. */
+	k_busy_wait(300);
+}
+
 void led_matrix_init(void)
 {
 	if (!device_is_ready(spi1) || !device_is_ready(spi2) || !device_is_ready(spi3)) {
@@ -191,10 +268,14 @@ void led_matrix_init(void)
 	k_sem_init(&done2, 0, 1);
 	k_sem_init(&done3, 0, 1);
 
+	/* Configure P0.03 as output low for row 6 bitbang */
+	nrf_gpio_cfg_output(NRF_GPIO_PIN_MAP(ROW6_PORT, ROW6_PIN));
+	nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(ROW6_PORT, ROW6_PIN));
+
 	memset(led_color, 0, sizeof(led_color));
 	memset(led_mask,  0, sizeof(led_mask));
 
-	LOG_INF("LED matrix ready (rows 0-5 parallel, row 6 sequential)");
+	LOG_INF("LED matrix ready (rows 0-5 parallel DMA, row 6 bitbang)");
 }
 
 void led_commit(void)
@@ -217,15 +298,6 @@ void led_commit(void)
 	k_sem_take(&done2, K_FOREVER);
 	k_sem_take(&done3, K_FOREVER);
 
-	/*
-	 * Row 6 (P0.03, 20 LEDs): sent sequentially here.
-	 *
-	 * Hardware note: P0.03 needs a dedicated SPI master. SPIM0 shares
-	 * hardware with TWIM0 (I2C0) so it cannot both be enabled in DTS.
-	 * TODO: use nrfx_spim on SPIM0 under a mutex with the I2C driver,
-	 * OR verify that the PCB routes P0.03 as a continuation of the P0.02
-	 * chain (making row 6 part of strip 2 = 60-LED SPIM3 transfer).
-	 * Until resolved, row 6 is driven by a blocking spi_write on spi3
-	 * with a pinctrl swap — NOT yet implemented; row 6 stays dark.
-	 */
+	/* Row 6 (P0.03, 20 LEDs): bitbang after parallel DMA completes */
+	ws2812_bitbang_row6();
 }
