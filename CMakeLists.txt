@@ -11,4 +11,5 @@ target_sources(app PRIVATE
     src/main.c
     src/led_matrix/led_matrix.c
     src/sand/sand.c
+    src/time_display/time_display.c
 )

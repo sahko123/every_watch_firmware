@@ -4,6 +4,7 @@
 
 #include "led_matrix/led_matrix.h"
 #include "sand/sand.h"
+#include "time_display/time_display.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -23,6 +24,8 @@ int main(void)
 
 	/* Digits: cool white — revealed beneath sand as particles clear */
 	led_layer_color[LED_LAYER_DIGITS] = (struct led_rgb){220, 220, 255};
+
+	time_display_init(rtc);
 
 	sand_init();
 	sand_add_particles(60);
