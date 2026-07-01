@@ -71,12 +71,14 @@ static void stamp_colon(int col)
 
 static void render_time(int hours, int minutes)
 {
+	k_mutex_lock(&led_mask_mutex, K_FOREVER);
 	led_mask_clear(LED_LAYER_DIGITS);
 	stamp_digit(hours   / 10, D0_COL);
 	stamp_digit(hours   % 10, D1_COL);
 	stamp_colon(COLON_COL);
 	stamp_digit(minutes / 10, D2_COL);
 	stamp_digit(minutes % 10, D3_COL);
+	k_mutex_unlock(&led_mask_mutex);
 }
 
 /* --------------------------------------------------------------------------

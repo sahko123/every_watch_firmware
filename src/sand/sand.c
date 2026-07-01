@@ -28,7 +28,10 @@ static uint32_t rand32(void)
  */
 
 static uint8_t grid[LED_ROWS][LED_COLS]; /* 1 = particle, 0 = empty */
-static struct sand_gravity gravity = {.col = 0, .row = 256}; /* default: down */
+
+/* Q8 fixed-point: 256 = 1.0 (one standard gravity). Default is straight down. */
+#define GRAVITY_Q8_1G  256
+static struct sand_gravity gravity = {.col = 0, .row = GRAVITY_Q8_1G};
 static K_MUTEX_DEFINE(sand_mutex);
 
 /* -------------------------------------------------------------------------
