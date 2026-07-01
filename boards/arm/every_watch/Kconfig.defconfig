@@ -3,8 +3,11 @@ if BOARD_EVERY_WATCH
 config HW_STACK_PROTECTION
 	default ARCH_HAS_STACK_PROTECTION
 
-# NCS SoC-level Kconfig selects the SoftDevice Controller (SDC) for nRF52833
-# automatically. Do not set BT_CTLR here — it would be a no-op and the
-# SDC, not Zephyr's software LL, is always used on this SoC in NCS builds.
+# BT_CTLR=y tells the BT stack that the controller is on-chip (not an external
+# UART-connected HCI device). NCS then overrides the implementation to use the
+# SoftDevice Controller (SDC) instead of Zephyr's software LL, but BT_CTLR must
+# still be set here or the stack selects BT_UART as the HCI transport.
+config BT_CTLR
+	default BT
 
 endif # BOARD_EVERY_WATCH
