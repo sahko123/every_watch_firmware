@@ -3,9 +3,8 @@ if BOARD_EVERY_WATCH
 config HW_STACK_PROTECTION
 	default ARCH_HAS_STACK_PROTECTION
 
-# nRF52833 has a built-in BLE radio — use the Zephyr software LL (same as
-# the official nRF52833DK board) so no external HCI transport is needed.
-config BT_CTLR
-	default BT
+# NCS SoC-level Kconfig selects the SoftDevice Controller (SDC) for nRF52833
+# automatically. Do not set BT_CTLR here — it would be a no-op and the
+# SDC, not Zephyr's software LL, is always used on this SoC in NCS builds.
 
 endif # BOARD_EVERY_WATCH
