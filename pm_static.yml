@@ -1,13 +1,10 @@
-# Static partition layout for Every Watch / nRF52833 (512 KB flash)
+# Flash layout — nRF52833 (512 KB internal flash)
+# Single-slot MCUboot: no secondary slot, no swap.
 #
-# Single-slot layout: MCUboot holds USB CDC-ACM serial recovery (triggered
-# by holding left button at boot). No secondary slot — all remaining internal
-# flash goes to the single app image.
+# DFU: hold left button 3 s -> app calls sys_reboot() -> MCUboot opens
+#      5-second USB DFU window -> dfu-util -d 2fe3:0100 -a 0 -D app_update.bin
 #
-# MCUboot USB CDC-ACM recovery is ~48 KB (USB support re-enabled).
-# New image is uploaded directly into slot 0 from MCUboot context via mcumgr.
-#
-#   0x00000 – 0x0BFFF  MCUboot (48 KB)     — bootloader + USB DFU recovery
+#   0x00000 – 0x0BFFF  MCUboot (48 KB)     — bootloader + USB DFU WAIT mode
 #   0x0C000 – 0x0C1FF  mcuboot_pad (512 B)  — MCUboot image header
 #   0x0C200 – 0x7DFFF  app (455.5 KB)       — single firmware image slot
 #   0x7E000 – 0x7FFFF  nvs_storage (8 KB)   — NVS: 2 × 4 KB sectors

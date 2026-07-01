@@ -9,11 +9,12 @@
 	compatible = "everywatch,every-watch-nrf52833";
 
 	chosen {
-		zephyr,sram         = &sram0;
-		zephyr,flash        = &flash0;
+		zephyr,sram           = &sram0;
+		zephyr,flash          = &flash0;
 		zephyr,code-partition = &slot0_partition;
-		/* CDC-ACM UART used by MCUmgr SMP for USB firmware update */
-		zephyr,uart-mcumgr  = &cdc_acm_uart0;
+		/* DFU: MCUboot USB DFU WAIT mode — hold left button 3 s in app to
+		 * reboot into bootloader, then:
+		 *   dfu-util -d 2fe3:0100 -a 0 -D build/zephyr/app_update.bin */
 	};
 
 	/* ── Buttons ─────────────────────────────────────────────────────── */
@@ -41,9 +42,10 @@
 			label = "Charge indicator";
 		};
 
-		/* BQ27441 GPOUT / battery monitor interrupt */
+		/* BQ27441 GPOUT / battery monitor interrupt — open-drain output,
+		 * pull-up required (no PCB resistor assumed). */
 		batt_gpout: batt_gpout {
-			gpios = <&gpio1 9 GPIO_ACTIVE_HIGH>;
+			gpios = <&gpio1 9 (GPIO_ACTIVE_HIGH | GPIO_PULL_UP)>;
 			label = "Battery GPOUT";
 		};
 	};
@@ -60,13 +62,12 @@
 /* ── Flash partitions ────────────────────────────────────────────────── */
 /* nRF52833: 512 KB flash (0x00000000 – 0x0007FFFF)
  *
- *   MCUboot :  48 KB  0x00000000 – 0x0000BFFF  (USB CDC-ACM serial recovery)
+ *   MCUboot :  48 KB  0x00000000 – 0x0000BFFF  (USB DFU WAIT mode)
  *   Slot 0  : 456 KB  0x0000C000 – 0x0007DFFF  (single image slot, no slot 1)
  *   NVS     :   8 KB  0x0007E000 – 0x0007FFFF  (2 × 4 KB sectors)
  *
- * Single-slot layout: new firmware is uploaded directly into slot 0 by
- * MCUboot's USB CDC-ACM serial recovery (hold left button at boot).
- * No secondary slot — all freed space goes to the app.
+ * Single-slot: hold left button 3 s -> app reboots -> MCUboot opens 5 s USB
+ * DFU window -> dfu-util -d 2fe3:0100 -a 0 -D build/zephyr/app_update.bin
  * Matches pm_static.yml. */
 &flash0 {
 	partitions {
@@ -124,7 +125,10 @@
 	bq27441: bq27441@55 {
 		compatible = "ti,bq274xx";
 		reg = <0x55>;
-		design-capacity = <300>;   /* mAh — update to match actual cell */
+		/* IMPORTANT: set design-capacity to match the actual battery cell (mAh).
+		 * Wrong value causes inaccurate state-of-charge readings from BQ27441.
+		 * Check the battery datasheet and update before shipping. */
+		design-capacity = <300>;
 		design-voltage = <3700>;   /* mV nominal */
 		taper-current = <45>;      /* mA */
 		terminate-voltage = <3000>; /* mV cutoff */
@@ -181,9 +185,16 @@
 	status = "okay";
 };
 
-/* ── USB — CDC-ACM serial for MCUmgr SMP (firmware update over USB) ──── */
+/* ── Low-frequency clock ─────────────────────────────────────────────── */
+/* TODO: verify a 32.768 kHz crystal is populated on the PCB, then enable:
+ *   &clock { lf-clk-src = <1>; };   (1 = XTAL, 0 = RC)
+ * Without XTAL, BLE timing uses the internal RC oscillator (±250 ppm vs
+ * ±20–50 ppm for crystal), increasing power consumption on connection retries. */
+
+/* ── USB — MCUboot USB DFU WAIT mode ─────────────────────────────────── */
 /* nRF52833 USBD uses dedicated D+/D- pins; VBUS detected via POWER
- * peripheral events — no GPIO VBUS pin needed. */
+ * peripheral events — no GPIO VBUS pin needed.
+ * cdc_acm_uart0 kept for MCUboot's USB DFU class enumeration. */
 zephyr_udc0: &usbd {
 	status = "okay";
 	cdc_acm_uart0: cdc_acm_uart0 {
