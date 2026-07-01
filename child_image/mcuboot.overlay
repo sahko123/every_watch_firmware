@@ -1,10 +1,10 @@
 /*
  * MCUboot DTS overlay for Every Watch.
  *
- * MCUboot only needs flash access + UART (for logging).
- * Remove all sensor / peripheral nodes that would otherwise trigger
- * Kconfig symbols MCUboot cannot satisfy (e.g. frtc8900 selects
- * RTC_ALARM but MCUboot doesn't enable CONFIG_RTC).
+ * Strip sensor/peripheral nodes that conflict with MCUboot's Kconfig
+ * (frtc8900 selects RTC_ALARM; bmi270 pulls in SPI sensor deps, etc.).
+ * Declare mcuboot-button0 so the serial recovery entrance GPIO driver
+ * can find the left button via DT_ALIAS(mcuboot_button0).
  */
 
 / {
@@ -16,6 +16,8 @@
 		/delete-property/ rtc0;
 		/delete-property/ batt0;
 		/delete-property/ light0;
+		/* Left button (P0.17, active-low) triggers CDC-ACM serial recovery */
+		mcuboot-button0 = &button_left;
 	};
 };
 
@@ -26,7 +28,4 @@
 	/delete-node/ bq27441@55;
 };
 
-/* Disable USB — MCUboot on Every Watch boots silently, no USB needed */
-&usbd {
-	status = "disabled";
-};
+/* USB stays enabled — MCUboot uses it for CDC-ACM serial recovery mode */

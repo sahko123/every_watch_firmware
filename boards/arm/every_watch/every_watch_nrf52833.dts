@@ -60,13 +60,14 @@
 /* ── Flash partitions ────────────────────────────────────────────────── */
 /* nRF52833: 512 KB flash (0x00000000 – 0x0007FFFF)
  *
- *   MCUboot :  32 KB  0x00000000 – 0x00007FFF  (actual binary ~26 KB; 32 KB reserved)
- *   Slot 0  : 236 KB  0x00008000 – 0x00042FFF  (image header @ 8000, code @ 8200)
- *   Slot 1  : 236 KB  0x00043000 – 0x0007DFFF  (DFU upload target, equal to slot 0)
+ *   MCUboot :  48 KB  0x00000000 – 0x0000BFFF  (USB CDC-ACM serial recovery)
+ *   Slot 0  : 456 KB  0x0000C000 – 0x0007DFFF  (single image slot, no slot 1)
  *   NVS     :   8 KB  0x0007E000 – 0x0007FFFF  (2 × 4 KB sectors)
  *
- * Matches pm_static.yml. NCS Partition Manager uses pm_static.yml as
- * authoritative; this DTS keeps the MCUboot flash-map API in sync. */
+ * Single-slot layout: new firmware is uploaded directly into slot 0 by
+ * MCUboot's USB CDC-ACM serial recovery (hold left button at boot).
+ * No secondary slot — all freed space goes to the app.
+ * Matches pm_static.yml. */
 &flash0 {
 	partitions {
 		compatible = "fixed-partitions";
@@ -75,18 +76,13 @@
 
 		boot_partition: partition@0 {
 			label = "mcuboot";
-			reg = <0x00000000 0x8000>;
+			reg = <0x00000000 0xC000>;
 			read-only;
 		};
 
-		slot0_partition: partition@8000 {
+		slot0_partition: partition@C000 {
 			label = "image-0";
-			reg = <0x00008000 0x3B000>;
-		};
-
-		slot1_partition: partition@43000 {
-			label = "image-1";
-			reg = <0x00043000 0x3B000>;
+			reg = <0x0000C000 0x72000>;
 		};
 
 		/* NVS for persistent identity / settings; matches pm_static.yml nvs_storage */
