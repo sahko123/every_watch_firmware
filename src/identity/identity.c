@@ -71,8 +71,7 @@ static void add_seen(uint32_t hash)
     }
 
     unsaved_encounters++;
-    if (nvs_ready && (unsaved_encounters >= NVS_WRITE_BATCH ||
-                      seen_count == MAX_SEEN_HASHES)) {
+    if (nvs_ready && unsaved_encounters >= NVS_WRITE_BATCH) {
         nvs_write(&nvs, NVS_KEY_ENC_HASHES,
                   seen_hashes, seen_count * sizeof(uint32_t));
         unsaved_encounters = 0;

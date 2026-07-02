@@ -81,7 +81,7 @@ static void start_adv(void)
         return;
     }
     atomic_set(&adv_running, 1);
-    k_work_schedule(&adv_slow_work, K_MSEC(ADV_FAST_DURATION_MS));
+    k_work_reschedule(&adv_slow_work, K_MSEC(ADV_FAST_DURATION_MS));
 }
 
 static void adv_slow_fn(struct k_work *w)
@@ -303,7 +303,8 @@ BT_GATT_SERVICE_DEFINE(ew_svc,
 static void bt_ready(int err)
 {
     if (err) {
-        LOG_ERR("bt_enable failed: %d", err);
+        LOG_ERR("bt_enable async failed: %d — rebooting", err);
+        sys_reboot(SYS_REBOOT_COLD);
         return;
     }
 

@@ -56,10 +56,12 @@ int main(void)
 	battery_init();
 	light_init();
 
+	bool dfu_ok = false;
 	if (!gpio_is_ready_dt(&btn_dfu)) {
 		LOG_ERR("DFU button GPIO not ready");
 	} else {
 		gpio_pin_configure_dt(&btn_dfu, GPIO_INPUT);
+		dfu_ok = true;
 	}
 
 	LOG_INF("Every Watch starting");
@@ -72,7 +74,7 @@ int main(void)
 	while (true) {
 		k_sleep(K_MSEC(50));
 
-		if (gpio_pin_get_dt(&btn_dfu)) {
+		if (dfu_ok && gpio_pin_get_dt(&btn_dfu)) {
 			held_ms = MIN(held_ms + 50, 5000);
 			if (held_ms >= 3000) {
 				LOG_INF("DFU: rebooting into bootloader");

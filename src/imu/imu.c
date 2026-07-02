@@ -11,17 +11,15 @@
 LOG_MODULE_REGISTER(imu, LOG_LEVEL_INF);
 
 static const struct device *bmi = DEVICE_DT_GET(DT_NODELABEL(bmi270));
-
-static struct imu_accel latest;
-static K_MUTEX_DEFINE(accel_mutex);
+static bool imu_ready;
 
 /*
  * Convert BMI270 sensor_value accelerometer reading to a Q8 sand gravity vector.
- * Q8 format: 256 = 1g (≈ 9.8 m/s²). Scale factor: 256 / 9.8 ≈ 26.
+ * GRAVITY_Q8_1G (256) = 1g. Scale factor: GRAVITY_Q8_1G / 9.8 ≈ 26.
  *
  * sensor_value: val1 = integer m/s², val2 = fractional µm/s² (millionths).
  * For gravity direction we only need ~4% precision so the val2 term is
- * approximated (val2 / 38462 ≈ val2 * 256 / 9800000).
+ * approximated (val2 / 38462 ≈ val2 * GRAVITY_Q8_1G / 9800000).
  *
  * Axis mapping (verify against PCB orientation at bring-up):
  *   accel.x > 0  → watch tilted right  → sand falls right  (+col)
@@ -35,19 +33,11 @@ static struct sand_gravity accel_to_gravity(const struct sensor_value *ax,
 	int col = ax->val1 * 26 + (int)(ax->val2 / 38462);
 	int row = ay->val1 * 26 + (int)(ay->val2 / 38462);
 
-	col = CLAMP(col, -256, 256);
-	row = CLAMP(row, -256, 256);
+	col = CLAMP(col, -GRAVITY_Q8_1G, GRAVITY_Q8_1G);
+	row = CLAMP(row, -GRAVITY_Q8_1G, GRAVITY_Q8_1G);
 
 	return (struct sand_gravity){.col = col, .row = row};
 }
-
-/* -------------------------------------------------------------------------
- * 50 Hz polling thread
- * -------------------------------------------------------------------------
- * Reads accelerometer at 50 Hz — fast enough for responsive sand physics
- * without hammering I2C. The sand thread runs at 30 Hz so every tick has
- * a fresh gravity vector.
- */
 
 #define IMU_STACK_SIZE 1024
 #define IMU_PRIORITY   4
@@ -75,38 +65,33 @@ static void imu_thread(void *p1, void *p2, void *p3)
 		sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_Y, &ay);
 		sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_Z, &az);
 
-		/* Hot path: integer Q8 gravity for sand — no FPU needed */
 		sand_set_gravity(accel_to_gravity(&ax, &ay));
-
-		/* Float conversion only for external callers of imu_get_accel() */
-		k_mutex_lock(&accel_mutex, K_FOREVER);
-		latest.x = sensor_value_to_float(&ax);
-		latest.y = sensor_value_to_float(&ay);
-		latest.z = sensor_value_to_float(&az);
-		k_mutex_unlock(&accel_mutex);
 
 		k_msleep(IMU_PERIOD_MS);
 	}
 }
 
-void imu_get_accel(struct imu_accel *out)
-{
-	k_mutex_lock(&accel_mutex, K_FOREVER);
-	*out = latest;
-	k_mutex_unlock(&accel_mutex);
-}
-
 void imu_suspend(void)
 {
+	if (!imu_ready) {
+		return;
+	}
 	k_thread_suspend(&imu_thread_data);
-	/* Put the BMI270 hardware into suspend mode (~3 µA vs ~950 µA normal) */
-	pm_device_action_run(bmi, PM_DEVICE_ACTION_SUSPEND);
+	int rc = pm_device_action_run(bmi, PM_DEVICE_ACTION_SUSPEND);
+	if (rc) {
+		LOG_ERR("BMI270 suspend failed: %d", rc);
+	}
 }
 
 void imu_resume(void)
 {
-	/* Restore normal mode before resuming the poll thread */
-	pm_device_action_run(bmi, PM_DEVICE_ACTION_RESUME);
+	if (!imu_ready) {
+		return;
+	}
+	int rc = pm_device_action_run(bmi, PM_DEVICE_ACTION_RESUME);
+	if (rc) {
+		LOG_ERR("BMI270 resume failed: %d", rc);
+	}
 	k_thread_resume(&imu_thread_data);
 }
 
@@ -122,6 +107,7 @@ void imu_init(void)
 			imu_thread, NULL, NULL, NULL,
 			IMU_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&imu_thread_data, "imu");
+	imu_ready = true;
 
 	LOG_INF("IMU started (50 Hz)");
 }

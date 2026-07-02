@@ -3,6 +3,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* Q8 fixed-point scale: GRAVITY_Q8_1G = 1.0 g. Scale factor for sensor_value
+ * (m/s²): GRAVITY_Q8_1G / 9.8 ≈ 26 counts per m/s². */
+#define GRAVITY_Q8_1G  256
+
 /*
  * Gravity vector: unit direction the simulation treats as "down".
  * Components are fixed-point Q8 signed integers (-256 = -1.0, 256 = +1.0).
