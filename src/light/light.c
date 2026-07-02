@@ -54,10 +54,6 @@ static void light_work_fn(struct k_work *work)
         return;
     }
 
-    if (!device_is_ready(bh)) {
-        return;
-    }
-
     int err = sensor_sample_fetch(bh);
     if (err) {
         LOG_WRN("BH1750 fetch failed: %d", err);
@@ -65,7 +61,10 @@ static void light_work_fn(struct k_work *work)
     }
 
     struct sensor_value lux_val;
-    sensor_channel_get(bh, SENSOR_CHAN_LIGHT, &lux_val);
+    if (sensor_channel_get(bh, SENSOR_CHAN_LIGHT, &lux_val)) {
+        LOG_WRN("BH1750 channel read failed");
+        return;
+    }
 
     uint32_t lux = (uint32_t)lux_val.val1;
     uint8_t  br  = lux_to_brightness(lux);

@@ -60,8 +60,11 @@ static void imu_thread(void *p1, void *p2, void *p3)
 
 		struct sensor_value ax, ay;
 
-		sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_X, &ax);
-		sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_Y, &ay);
+		if (sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_X, &ax) ||
+		    sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_Y, &ay)) {
+			k_msleep(IMU_PERIOD_MS);
+			continue;
+		}
 
 		sand_set_gravity(accel_to_gravity(&ax, &ay));
 

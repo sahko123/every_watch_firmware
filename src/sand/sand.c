@@ -6,7 +6,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-LOG_MODULE_REGISTER(sand, LOG_LEVEL_DBG);
+LOG_MODULE_REGISTER(sand, LOG_LEVEL_INF);
 
 /* XOR-shift PRNG — fast, no entropy hardware needed */
 static uint32_t rng_state = 0xDEADBEEF;

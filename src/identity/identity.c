@@ -17,7 +17,6 @@ LOG_MODULE_REGISTER(identity, LOG_LEVEL_INF);
 
 #define MAX_SEEN_HASHES     32
 #define DEV_DIST_NONE       0xFF   /* not connected to the dev chain */
-#define RSSI_CLOSE_DBM      (-70)  /* minimum RSSI to count as an encounter */
 
 /* Batch NVS hash writes: flush every N encounters or when the table is full.
  * NVS on nRF52 flash has ~10 000 erase cycles; batching reduces wear at busy

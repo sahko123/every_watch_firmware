@@ -123,17 +123,22 @@ void display_init(void)
 		return;
 	}
 
-	gpio_pin_configure_dt(&btn_l, GPIO_INPUT);
-	gpio_pin_configure_dt(&btn_r, GPIO_INPUT);
+	int rc;
 
-	/* GPIO_INT_EDGE_TO_ACTIVE = falling edge for active-low buttons */
-	gpio_pin_interrupt_configure_dt(&btn_l, GPIO_INT_EDGE_TO_ACTIVE);
-	gpio_pin_interrupt_configure_dt(&btn_r, GPIO_INT_EDGE_TO_ACTIVE);
+	rc  = gpio_pin_configure_dt(&btn_l, GPIO_INPUT);
+	rc |= gpio_pin_configure_dt(&btn_r, GPIO_INPUT);
+	rc |= gpio_pin_interrupt_configure_dt(&btn_l, GPIO_INT_EDGE_TO_ACTIVE);
+	rc |= gpio_pin_interrupt_configure_dt(&btn_r, GPIO_INT_EDGE_TO_ACTIVE);
 
 	gpio_init_callback(&btn_l_cb, btn_isr, BIT(btn_l.pin));
 	gpio_init_callback(&btn_r_cb, btn_isr, BIT(btn_r.pin));
-	gpio_add_callback(btn_l.port, &btn_l_cb);
-	gpio_add_callback(btn_r.port, &btn_r_cb);
+	rc |= gpio_add_callback(btn_l.port, &btn_l_cb);
+	rc |= gpio_add_callback(btn_r.port, &btn_r_cb);
+
+	if (rc) {
+		LOG_ERR("display button GPIO setup failed — display permanently off");
+		return;
+	}
 
 	/* Set is_on directly: sand and IMU threads already start running from
 	 * sand_init()/imu_init() in main(), so imu_resume()/sand_resume() are

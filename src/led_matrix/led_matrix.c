@@ -20,7 +20,7 @@ LOG_MODULE_REGISTER(led_matrix, LOG_LEVEL_INF);
  *
  * Note: nRF52833 SPIM supports only discrete rates (1/2/4/8 MHz etc.).
  * 2 MHz is the closest option to the ideal ~2.4 MHz; 4 MHz gives T1H = 500 ns
- * which is below the 550 ns minimum and is worse. Verify with oscilloscope.
+ * which is below the 650 ns T1H minimum and is worse. Verify with oscilloscope.
  *
  * 24 bits/LED × 3 SPI bits = 72 SPI bits = 9 bytes/LED.
  * Wire order is GRB; swap R↔G at encode time.

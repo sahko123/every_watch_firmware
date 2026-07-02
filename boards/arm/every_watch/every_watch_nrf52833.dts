@@ -62,9 +62,10 @@
 /* ── Flash partitions ────────────────────────────────────────────────── */
 /* nRF52833: 512 KB flash (0x00000000 – 0x0007FFFF)
  *
- *   MCUboot :  48 KB  0x00000000 – 0x0000BFFF  (USB DFU WAIT mode)
- *   Slot 0  : 456 KB  0x0000C000 – 0x0007DFFF  (single image slot, no slot 1)
- *   NVS     :   8 KB  0x0007E000 – 0x0007FFFF  (2 × 4 KB sectors)
+ *   MCUboot  :  48 KB  0x00000000 – 0x0000BFFF  (USB DFU WAIT mode)
+ *   Slot 0   : 448 KB  0x0000C000 – 0x0007BFFF  (single image slot, no slot 1)
+ *   Identity :   8 KB  0x0007C000 – 0x0007DFFF  (encounter hashes, enc_count — NVS)
+ *   Settings :   8 KB  0x0007E000 – 0x0007FFFF  (Zephyr Settings / BT bond keys)
  *
  * Single-slot: hold left button 3 s -> app reboots -> MCUboot opens 5 s USB
  * DFU window -> dfu-util -d 2fe3:0100 -a 0 -D build/zephyr/app_update.bin
@@ -83,10 +84,15 @@
 
 		slot0_partition: partition@C000 {
 			label = "image-0";
-			reg = <0x0000C000 0x72000>;
+			reg = <0x0000C000 0x70000>;
 		};
 
-		/* NVS for persistent identity / settings; matches pm_static.yml nvs_storage */
+		identity_partition: partition@7C000 {
+			label = "identity_partition";
+			reg = <0x0007C000 0x2000>;
+		};
+
+		/* Zephyr Settings backend (BT bond keys); matches pm_static.yml nvs_storage */
 		storage_partition: partition@7E000 {
 			label = "storage";
 			reg = <0x0007E000 0x2000>;
