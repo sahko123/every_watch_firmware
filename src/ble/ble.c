@@ -13,6 +13,7 @@
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/reboot.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/settings/settings.h>
 #include <string.h>
 
 LOG_MODULE_REGISTER(ble, LOG_LEVEL_ERR);
@@ -289,7 +290,7 @@ static ssize_t on_info_read(struct bt_conn *conn,
 BT_GATT_SERVICE_DEFINE(ew_svc,
     BT_GATT_PRIMARY_SERVICE(BT_UUID_EW_SVC),
     BT_GATT_CHARACTERISTIC(BT_UUID_EW_NOTIF,
-        BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
+        BT_GATT_CHRC_WRITE,
         BT_GATT_PERM_WRITE_ENCRYPT,
         NULL, on_notif_write, NULL),
     BT_GATT_CHARACTERISTIC(BT_UUID_EW_INFO,
@@ -307,6 +308,8 @@ static void bt_ready(int err)
         sys_reboot(SYS_REBOOT_COLD);
         return;
     }
+
+    settings_load();
 
     bt_le_scan_cb_register(&scan_callbacks);
 
@@ -333,9 +336,4 @@ void ble_init(void)
         LOG_ERR("bt_enable failed (%d) — rebooting", rc);
         sys_reboot(SYS_REBOOT_COLD);
     }
-}
-
-bool ble_is_connected(void)
-{
-    return phone_conn != NULL;
 }
