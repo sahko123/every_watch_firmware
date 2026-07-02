@@ -4,10 +4,11 @@
 # DFU: hold left button 3 s -> app calls sys_reboot() -> MCUboot opens
 #      5-second USB DFU window -> dfu-util -d 2fe3:0100 -a 0 -D app_update.bin
 #
-#   0x00000 – 0x0BFFF  MCUboot (48 KB)     — bootloader + USB DFU WAIT mode
-#   0x0C000 – 0x0C1FF  mcuboot_pad (512 B)  — MCUboot image header
-#   0x0C200 – 0x7DFFF  app (455.5 KB)       — single firmware image slot
-#   0x7E000 – 0x7FFFF  nvs_storage (8 KB)   — NVS: 2 × 4 KB sectors
+#   0x00000 – 0x0BFFF  MCUboot (48 KB)          — bootloader + USB DFU WAIT mode
+#   0x0C000 – 0x0C1FF  mcuboot_pad (512 B)       — MCUboot image header
+#   0x0C200 – 0x7BFFF  app (447.5 KB)            — single firmware image slot
+#   0x7C000 – 0x7DFFF  identity_partition (8 KB) — NVS: encounter hashes, enc_count
+#   0x7E000 – 0x7FFFF  nvs_storage (8 KB)        — Zephyr Settings: BT bond keys
 
 mcuboot:
   address: 0x0
@@ -31,29 +32,40 @@ mcuboot_pad:
 
 app:
   address: 0xc200
-  end_address: 0x7e000
+  end_address: 0x7c000
   region: flash_primary
-  size: 0x71e00
+  size: 0x6fe00
 
 mcuboot_primary:
   address: 0xc000
-  end_address: 0x7e000
+  end_address: 0x7c000
   orig_span: &id001
   - mcuboot_pad
   - app
   region: flash_primary
   sharers: 0x1
-  size: 0x72000
+  size: 0x70000
   span: *id001
 
 mcuboot_primary_app:
   address: 0xc200
-  end_address: 0x7e000
+  end_address: 0x7c000
   orig_span: &id002
   - app
   region: flash_primary
-  size: 0x71e00
+  size: 0x6fe00
   span: *id002
+
+identity_partition:
+  address: 0x7c000
+  end_address: 0x7e000
+  placement:
+    align:
+      start: 0x1000
+    before:
+    - nvs_storage
+  region: flash_primary
+  size: 0x2000
 
 nvs_storage:
   address: 0x7e000

@@ -6,7 +6,7 @@
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/logging/log.h>
 
-LOG_MODULE_REGISTER(light, LOG_LEVEL_DBG);
+LOG_MODULE_REGISTER(light, LOG_LEVEL_INF);
 
 #define POLL_INTERVAL_MS 2000
 

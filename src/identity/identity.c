@@ -72,8 +72,11 @@ static void add_seen(uint32_t hash)
 
     unsaved_encounters++;
     if (nvs_ready && unsaved_encounters >= NVS_WRITE_BATCH) {
-        nvs_write(&nvs, NVS_KEY_ENC_HASHES,
-                  seen_hashes, seen_count * sizeof(uint32_t));
+        int rc = nvs_write(&nvs, NVS_KEY_ENC_HASHES,
+                           seen_hashes, seen_count * sizeof(uint32_t));
+        if (rc < 0) {
+            LOG_ERR("NVS write hashes failed: %d", rc);
+        }
         unsaved_encounters = 0;
     }
 }
@@ -83,8 +86,15 @@ static void save_counters(void)
     if (!nvs_ready) {
         return;
     }
-    nvs_write(&nvs, NVS_KEY_DEV_DIST,  &dev_dist,  sizeof(dev_dist));
-    nvs_write(&nvs, NVS_KEY_ENC_COUNT, &enc_count, sizeof(enc_count));
+    int rc;
+    rc = nvs_write(&nvs, NVS_KEY_DEV_DIST,  &dev_dist,  sizeof(dev_dist));
+    if (rc < 0) {
+        LOG_ERR("NVS write dev_dist failed: %d", rc);
+    }
+    rc = nvs_write(&nvs, NVS_KEY_ENC_COUNT, &enc_count, sizeof(enc_count));
+    if (rc < 0) {
+        LOG_ERR("NVS write enc_count failed: %d", rc);
+    }
 }
 
 void identity_init(void)
@@ -94,9 +104,10 @@ void identity_init(void)
     uint32_t addr1 = NRF_FICR->DEVICEADDR[1] & 0x0000FFFF;
     own_hash = fnv1a_2x32(addr0, addr1);
 
-    /* Mount NVS on the storage_partition */
-    nvs.flash_device = FIXED_PARTITION_DEVICE(storage_partition);
-    nvs.offset       = FIXED_PARTITION_OFFSET(storage_partition);
+    /* Mount NVS on identity_partition (separate from storage_partition used by
+     * Zephyr Settings / BT bonds — two nvs_fs on the same partition corrupt ATEs) */
+    nvs.flash_device = FIXED_PARTITION_DEVICE(identity_partition);
+    nvs.offset       = FIXED_PARTITION_OFFSET(identity_partition);
     nvs.sector_size  = 0x1000;  /* 4 KB — nRF52833 flash erase unit */
     nvs.sector_count = 2;
 
