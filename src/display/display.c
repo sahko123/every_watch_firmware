@@ -119,7 +119,7 @@ static void off_work_fn(struct k_work *w) { ARG_UNUSED(w); display_off(); }
 void display_init(void)
 {
 	if (!gpio_is_ready_dt(&btn_l) || !gpio_is_ready_dt(&btn_r)) {
-		LOG_ERR("Button GPIO not ready");
+		LOG_ERR("display button GPIO not ready — display permanently off");
 		return;
 	}
 

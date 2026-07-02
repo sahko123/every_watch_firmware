@@ -16,7 +16,6 @@
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
-/* Non-const pointer so we can NULL it out on RTC failure for degraded boot. */
 static const struct device *rtc = DEVICE_DT_GET(DT_ALIAS(rtc0));
 
 /* Hold left button for 3 seconds while USB is plugged in to enter DFU mode.
