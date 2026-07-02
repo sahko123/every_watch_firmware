@@ -154,11 +154,13 @@ static void tick(void)
 /* Push simulation state into LED_LAYER_SAND and call led_commit(). */
 static void render(void)
 {
+	k_mutex_lock(&led_mask_mutex, K_FOREVER);
 	for (int row = 0; row < LED_ROWS; row++) {
 		for (int col = 0; col < LED_COLS; col++) {
 			led_mask[LED_LAYER_SAND][row][col] = grid[row][col];
 		}
 	}
+	k_mutex_unlock(&led_mask_mutex);
 	led_commit();
 }
 

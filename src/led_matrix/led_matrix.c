@@ -12,11 +12,15 @@ LOG_MODULE_REGISTER(led_matrix, LOG_LEVEL_INF);
  * WS2812B SPI encoding
  * --------------------
  * Each WS2812B bit → 3 SPI bits: T1=110, T0=100
- * At 2.5 MHz: 3 × 400 ns = 1.2 µs/bit  (spec: 1.25 µs ±600 ns)
- *   T1H = 2×400 = 800 ns  (spec max 950 ns ✓)
- *   T1L = 1×400 = 400 ns  (spec 300–600 ns ✓)
- *   T0H = 1×400 = 400 ns  (spec 250–550 ns ✓)
- *   T0L = 2×400 = 800 ns  (spec 700–1000 ns ✓)
+ * At 2 MHz: 3 × 500 ns = 1.5 µs/bit  (spec: 1.25 µs ±600 ns)
+ *   T1H = 2×500 = 1000 ns  (datasheet max 950 ns, but WS2812B tolerates ~1050 ns)
+ *   T1L = 1×500 =  500 ns  (spec 300–600 ns ✓)
+ *   T0H = 1×500 =  500 ns  (spec 250–550 ns, borderline — verify at bring-up)
+ *   T0L = 2×500 = 1000 ns  (spec 700–1000 ns ✓)
+ *
+ * Note: nRF52833 SPIM supports only discrete rates (1/2/4/8 MHz etc.).
+ * 2 MHz is the closest option to the ideal ~2.4 MHz; 4 MHz gives T1H = 500 ns
+ * which is below the 550 ns minimum and is worse. Verify with oscilloscope.
  *
  * 24 bits/LED × 3 SPI bits = 72 SPI bits = 9 bytes/LED.
  * Wire order is GRB; swap R↔G at encode time.
@@ -83,7 +87,7 @@ static const struct device *spi2 = DEVICE_DT_GET(DT_NODELABEL(spi2));
 static const struct device *spi3 = DEVICE_DT_GET(DT_NODELABEL(spi3));
 
 static const struct spi_config spi_cfg = {
-	.frequency = 2500000,
+	.frequency = 2000000,
 	.operation = SPI_WORD_SET(8) | SPI_OP_MODE_MASTER | SPI_TRANSFER_MSB,
 };
 

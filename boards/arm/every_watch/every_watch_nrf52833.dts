@@ -136,9 +136,9 @@
 };
 
 /* ── SPI peripherals — WS2812B LED matrix ───────────────────────────── */
-/* WS2812B bit encoding: each bit → 3 SPI bits at 2 MHz → ~1.5 µs/bit.
+/* WS2812B 3-bit encoding at 2 MHz: each LED bit → 3 SPI bits, 500 ns each.
  * SPIM1, SPIM2, SPIM3 fire in parallel via async DMA for rows 0-5.
- * Row 6 (P0.03) is sent sequentially after — see led_matrix.c.
+ * Row 6 (P0.03) uses bitbang — see led_matrix.c.
  * SPI0 is disabled: SPIM0 and TWIM0 share hardware at 0x40003000. */
 
 &spi0 {

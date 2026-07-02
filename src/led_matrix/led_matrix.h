@@ -32,8 +32,9 @@ extern struct led_rgb led_layer_color[LED_LAYER_COUNT];
  * Compositor walks layers highest-to-lowest priority, returns first active hit.
  *
  * LOCKING: all writes to led_mask[] from any context must hold led_mask_mutex.
- * This includes: render_time(), display_off(), show_notification() in ble.c,
- * and any future writers. build_buffers() acquires the mutex for its reads. */
+ * Writers: render() in sand.c, render_time() in time_display.c, display_off()
+ * in display.c, show_notification() in ble.c, show_low_battery_indicator() in
+ * battery.c. build_buffers() acquires the mutex for its reads. */
 extern uint8_t led_mask[LED_LAYER_COUNT][LED_ROWS][LED_COLS];
 
 /* Mutex protecting all led_mask[] accesses (writes from workqueue/BT thread,

@@ -24,10 +24,12 @@ static K_WORK_DEFINE(battery_work, battery_work_fn);
 /* Dim red stripe on row 6 (lowest row) — visible but not alarming */
 static void show_low_battery_indicator(void)
 {
+    k_mutex_lock(&led_mask_mutex, K_FOREVER);
     for (int col = 0; col < LED_COLS; col++) {
         led_mask[LED_LAYER_NOTIFICATION][LED_ROWS - 1][col] = 1;
     }
     led_layer_color[LED_LAYER_NOTIFICATION] = (struct led_rgb){180, 0, 0};
+    k_mutex_unlock(&led_mask_mutex);
     display_on();
     led_commit();
 }
