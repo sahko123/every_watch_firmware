@@ -6,6 +6,7 @@
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/logging/log.h>
 #include <stdatomic.h>
+#include <string.h>
 
 LOG_MODULE_REGISTER(battery, LOG_LEVEL_INF);
 
@@ -25,6 +26,8 @@ static K_WORK_DEFINE(battery_work, battery_work_fn);
 static void show_low_battery_indicator(void)
 {
     k_mutex_lock(&led_mask_mutex, K_FOREVER);
+    memset(led_mask[LED_LAYER_NOTIFICATION], 0,
+           sizeof(led_mask[LED_LAYER_NOTIFICATION]));
     for (int col = 0; col < LED_COLS; col++) {
         led_mask[LED_LAYER_NOTIFICATION][LED_ROWS - 1][col] = 1;
     }
@@ -45,10 +48,14 @@ static void battery_work_fn(struct k_work *work)
     }
 
     struct sensor_value soc, volt, current;
+    int ch_err;
 
-    sensor_channel_get(bq, SENSOR_CHAN_GAUGE_STATE_OF_CHARGE, &soc);
-    sensor_channel_get(bq, SENSOR_CHAN_GAUGE_VOLTAGE, &volt);
-    sensor_channel_get(bq, SENSOR_CHAN_GAUGE_AVG_CURRENT, &current);
+    ch_err = sensor_channel_get(bq, SENSOR_CHAN_GAUGE_STATE_OF_CHARGE, &soc);
+    if (ch_err) { LOG_WRN("SoC channel read failed: %d", ch_err); return; }
+    ch_err = sensor_channel_get(bq, SENSOR_CHAN_GAUGE_VOLTAGE, &volt);
+    if (ch_err) { LOG_WRN("Voltage channel read failed: %d", ch_err); return; }
+    ch_err = sensor_channel_get(bq, SENSOR_CHAN_GAUGE_AVG_CURRENT, &current);
+    if (ch_err) { LOG_WRN("Current channel read failed: %d", ch_err); return; }
 
     uint8_t  pct  = (uint8_t)soc.val1;
     uint32_t mv   = (uint32_t)(volt.val1 * 1000 + volt.val2 / 1000);

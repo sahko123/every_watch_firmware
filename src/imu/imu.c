@@ -1,6 +1,5 @@
 #include "imu.h"
 #include "sand/sand.h"
-#include "display/display.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/sensor.h>
@@ -59,11 +58,10 @@ static void imu_thread(void *p1, void *p2, void *p3)
 			continue;
 		}
 
-		struct sensor_value ax, ay, az;
+		struct sensor_value ax, ay;
 
 		sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_X, &ax);
 		sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_Y, &ay);
-		sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_Z, &az);
 
 		sand_set_gravity(accel_to_gravity(&ax, &ay));
 
