@@ -48,9 +48,9 @@
 
 	/* SPI3 (SPIM3 @ 0x4002F000): LED rows 4-5, MOSI=P0.02
 	 * Drives 40 LEDs (snake: row 4 L→R idx 0-19, row 5 R→L idx 20-39)
-	 * Row 6 (P0.03, 20 LEDs) is sent sequentially after this transfer
-	 * completes — requires nrfx_spim on SPIM0 with a mutex to prevent I2C
-	 * overlap, which is deferred until hardware bring-up. */
+	 * Row 6 (P0.03, 20 LEDs) uses bitbang after this DMA transfer completes.
+	 * SPIM0/TWIM0 share hardware at 0x40003000 so SPIM0 cannot be used while
+	 * I2C0 is active — SPI0 is disabled in the DTS for this reason. */
 	spi3_default: spi3_default {
 		group1 {
 			psels = <NRF_PSEL(SPIM_MOSI, 0, 2)>;
