@@ -1,0 +1,24 @@
+/*
+ * Stage 0 devicetree overlay — instantiate nothing but the I2C controller.
+ *
+ *   west build -b every_watch/nrf52833 every_watch_firmware -p always \
+ *       -d build_stage0 -- -DCONF_FILE=stage0.conf \
+ *                          -DEXTRA_DTC_OVERLAY_FILE=stage0.overlay
+ *
+ * Switching the drivers off in Kconfig alone is not enough. The out-of-tree
+ * FRTC8900 driver is selected by DT_HAS_NYFEA_FRTC8900_ENABLED and in turn
+ * selects RTC, so CONFIG_RTC=n while the node is enabled is a Kconfig conflict.
+ * Disabling the nodes removes the driver instances at the source.
+ *
+ * i2c0 itself stays enabled — scanning the bus is the entire point of stage 0.
+ */
+
+&frtc8900 { status = "disabled"; };
+&bmi270   { status = "disabled"; };
+&bh1750   { status = "disabled"; };
+&bq27441  { status = "disabled"; };
+
+/* LED matrix is not driven in stage 0. */
+&spi1 { status = "disabled"; };
+&spi2 { status = "disabled"; };
+&spi3 { status = "disabled"; };

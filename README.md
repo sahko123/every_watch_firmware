@@ -88,14 +88,58 @@ Approximate sizes (slot is 450,048 B):
 > path, and `sysbuild/mcuboot.conf` is stale — it is missing the single-slot and
 > USB DFU settings that `pm_static.yml` and the in-app DFU trigger depend on.
 
+**Stage 0** — the minimal first-power-on image. No sensor drivers, no RTC
+driver, no SPI, no BLE, no LED matrix: nothing that can hang during driver init
+on an unproven board. Scans the I2C bus, reads the GPIOs, and drops you at a
+shell. Flash this first on a board that has never been powered:
+
+```bash
+west build -b every_watch/nrf52833 every_watch_firmware -p always -d build_stage0 \
+    -- -DCONF_FILE=stage0.conf -DEXTRA_DTC_OVERLAY_FILE=stage0.overlay
+```
+
 ## Flashing
 
 **The first flash must be over SWD.** USB DFU is provided *by* MCUboot, so
-MCUboot has to be on the chip before USB flashing can work at all. Connect a
-J-Link (or an nRF52840 DK acting as one) to the SWD pads:
+MCUboot has to be on the chip before USB flashing can work at all.
+
+### With a Raspberry Pi Pico (no commercial debugger needed)
+
+Flash your Pico with Raspberry Pi's `debugprobe` firmware, then wire it to the
+watch's SWD pads:
+
+| Pico | Watch |
+|---|---|
+| GP2 | SWCLK |
+| GP3 | SWDIO |
+| GND | GND |
+
+Do **not** power the watch from the Pico — let it run from its own battery or
+USB and share only ground.
+
+Install OpenOCD (0.11 or newer), then:
 
 ```bash
-west flash                      # flashes MCUboot + app (merged.hex)
+west flash                      # openocd is the default runner for this board
+```
+
+If the chip refuses to connect, it may have readback protection enabled from
+the factory. Recover it once with:
+
+```bash
+openocd -f interface/cmsis-dap.cfg -f target/nrf52.cfg -c "init; nrf52_recover; exit"
+```
+
+### With a J-Link or nRF52840 DK
+
+```bash
+west flash -r jlink
+```
+
+### Once MCUboot is on the chip
+
+```bash
+west flash -r dfu-util
 ```
 
 **After that, updates go over USB.** Hold the **left button for 3 seconds** —
@@ -109,13 +153,23 @@ This works on battery power too: plug USB in first, then hold the button.
 
 ## Watching the console
 
-RTT build, with the J-Link attached:
+Logs are on RTT buffer 0, the interactive shell on buffer 1.
+
+With OpenOCD (Pico), start an RTT server and telnet to it:
+
+```bash
+openocd -f interface/cmsis-dap.cfg -f target/nrf52.cfg \
+        -c "init; rtt setup 0x20000000 0x20000 \"SEGGER RTT\"; rtt start; rtt server start 9090 0; rtt server start 9091 1"
+# then, in another terminal
+telnet localhost 9090     # logs
+telnet localhost 9091     # shell
+```
+
+With a J-Link:
 
 ```bash
 JLinkRTTViewer            # or: JLinkRTTClient
 ```
-
-Logs are on RTT buffer 0, the interactive shell on buffer 1.
 
 USB CDC build: open the virtual COM port with any terminal at any baud rate
 (CDC ignores it).
