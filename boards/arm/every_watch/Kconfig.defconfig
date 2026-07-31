@@ -3,6 +3,31 @@ if BOARD_EVERY_WATCH
 config HW_STACK_PROTECTION
 	default ARCH_HAS_STACK_PROTECTION
 
+# Low-frequency clock source.
+#
+# Zephyr defaults nRF52 to the 32.768 kHz crystal. This board has no working
+# crystal, so with the default the kernel NEVER FINISHES BOOTING: at
+# PRE_KERNEL_2, sys_clock_driver_init() calls z_nrf_clock_control_lf_on() and
+# spins forever in lfclk_spinwait() waiting for a clock that never arrives.
+# The symptom is a board that looks alive over SWD — CPU running, clocks up —
+# but produces no console output at all and never reaches main(). Confirmed on
+# hardware 2026-07-31 by a GDB backtrace through the boot path.
+#
+# Timekeeping does not depend on this: the FRTC8900 has its own DTCXO and is
+# the authority on wall-clock time. The LF clock only drives the kernel tick
+# and BLE timing.
+#
+# Accuracy follows automatically — CLOCK_CONTROL_NRF_ACCURACY_PPM defaults to
+# 500 ppm for RC on nRF52, instead of the 50 ppm the XTAL default claims.
+# Do not force it back to 50 ppm: the BLE controller uses it for sleep clock
+# accuracy, and over-claiming causes dropped connection events.
+#
+# If a crystal is ever populated and verified, revert this to XTAL and enable
+# the node in the devicetree.
+choice CLOCK_CONTROL_NRF_SOURCE
+	default CLOCK_CONTROL_NRF_K32SRC_RC
+endchoice
+
 # BT_CTLR=y tells the BT stack that the controller is on-chip (not an external
 # UART-connected HCI device). NCS then overrides the implementation to use the
 # SoftDevice Controller (SDC) instead of Zephyr's software LL, but BT_CTLR must

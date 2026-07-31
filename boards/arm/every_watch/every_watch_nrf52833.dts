@@ -107,7 +107,11 @@
 	pinctrl-0 = <&i2c0_default>;
 	pinctrl-1 = <&i2c0_sleep>;
 	pinctrl-names = "default", "sleep";
-	clock-frequency = <I2C_BITRATE_FAST>;
+	/* 100 kHz, not 400 kHz: this PCB revision has no external pull-up
+	 * resistors, so the bus relies on the nRF's internal ~13k pull-ups and
+	 * their ~1 us rise time. See the workaround note in the pinctrl file.
+	 * Restore I2C_BITRATE_FAST once 2.2k-4.7k resistors are fitted. */
+	clock-frequency = <I2C_BITRATE_STANDARD>;
 
 	frtc8900: frtc8900@32 {
 		compatible = "nyfea,frtc8900";
@@ -192,10 +196,19 @@
 };
 
 /* ── Low-frequency clock ─────────────────────────────────────────────── */
-/* TODO: verify a 32.768 kHz crystal is populated on the PCB, then enable:
- *   &clock { lf-clk-src = <1>; };   (1 = XTAL, 0 = RC)
- * Without XTAL, BLE timing uses the internal RC oscillator (±250 ppm vs
- * ±20–50 ppm for crystal), increasing power consumption on connection retries. */
+/* No 32.768 kHz crystal is fitted, and the FRTC8900's 32 kHz output is
+ * deliberately not routed to the nRF — the RTC keeps wall-clock time on its
+ * own DTCXO, so the SoC does not need an accurate external reference.
+ *
+ * The LFCLK source is therefore the internal RC oscillator, selected in
+ * Kconfig.defconfig. It is NOT optional: Zephyr defaults nRF52 to XTAL and
+ * hangs forever in lfclk_spinwait() at PRE_KERNEL_2 without one.
+ *
+ * Do not switch this to SYNTH ("derive it from the main clock") — that keeps
+ * HFCLK running continuously at roughly a milliamp and cannot sleep. RC is a
+ * separate low-power oscillator that survives sleep, which is what a battery
+ * device needs. Cost is ±500 ppm instead of ±20-50 ppm, which BLE tolerates,
+ * plus periodic recalibration against HFCLK. */
 
 /* ── USB — MCUboot USB DFU WAIT mode ─────────────────────────────────── */
 /* nRF52833 USBD uses dedicated D+/D- pins; VBUS detected via POWER

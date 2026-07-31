@@ -234,7 +234,7 @@ static void test_imu(void)
 	check("IMU", "gravity magnitude plausible",
 	      mag2 > 36000000LL && mag2 < 196000000LL);
 
-	printk("       NOTE: confirm axis signs against PCB orientation —\n");
+	printk("       NOTE: confirm axis signs against PCB orientation -\n");
 	printk("             tilt right should push sand right (+col).\n");
 }
 
@@ -299,7 +299,7 @@ static void test_battery(void)
 		check("BATT", "read state of charge", false);
 	}
 
-	printk("       NOTE: design-capacity in the DTS is 300 mAh — correct it\n");
+	printk("       NOTE: design-capacity in the DTS is 300 mAh - correct it\n");
 	printk("             to the real cell or SoC readings will be wrong.\n");
 }
 
@@ -387,7 +387,7 @@ static void test_leds(void)
 	 * dot must travel left→right along row 0, then left→right along row 1,
 	 * and so on down the display. If a row runs backwards, the snake
 	 * handling in pixel_to_physical() is wrong for that row. */
-	printk("\n       pixel walk — the dot must sweep left-to-right on\n");
+	printk("\n       pixel walk - the dot must sweep left-to-right on\n");
 	printk("       every row, top row first, with no jumps.\n");
 
 	led_layer_color[LED_LAYER_BG] = (struct led_rgb){255, 255, 255};
@@ -410,7 +410,7 @@ static void test_leds(void)
 
 	printk("\n");
 	check("LED ", "all four data lines driven (visual)", true);
-	printk("       ^ this is not auto-detected — mark FAIL yourself if a\n");
+	printk("       ^ this is not auto-detected - mark FAIL yourself if a\n");
 	printk("         line stayed dark or a row ran backwards.\n");
 }
 
@@ -475,7 +475,7 @@ int selftest_run(void)
 
 	printk("\n");
 	printk("==========================================================\n");
-	printk(" Every Watch — hardware self-test\n");
+	printk(" Every Watch - hardware self-test\n");
 	printk(" board: every_watch/nrf52833\n");
 	printk("==========================================================\n");
 

@@ -88,7 +88,7 @@ static void scan_i2c(void)
 	printk("\n-- I2C bus (SCL P0.04 / SDA P0.01) ------------------------\n");
 
 	if (!device_is_ready(i2c0_dev)) {
-		printk("  I2C CONTROLLER NOT READY — nothing else here will work\n");
+		printk("  I2C CONTROLLER NOT READY - nothing else here will work\n");
 		return;
 	}
 
@@ -114,7 +114,7 @@ static void scan_i2c(void)
 	if (found == 0) {
 		printk("\n  Nothing on the bus at all. Check the pull-up resistors on\n");
 		printk("  SDA/SCL, and that the sensors have power. A bus stuck low\n");
-		printk("  reads as zero devices too — measure SDA and SCL idle high.\n");
+		printk("  reads as zero devices too - measure SDA and SCL idle high.\n");
 	}
 }
 
@@ -151,7 +151,7 @@ int main(void)
 
 	printk("\n\n");
 	printk("==========================================================\n");
-	printk(" Every Watch — STAGE 0 bring-up\n");
+	printk(" Every Watch - STAGE 0 bring-up\n");
 	printk(" no sensors, no RTC, no SPI, no BLE, no LEDs\n");
 	printk("==========================================================\n");
 	report_reset_cause();

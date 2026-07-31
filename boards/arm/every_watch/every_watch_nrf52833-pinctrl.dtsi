@@ -8,6 +8,23 @@
 		group1 {
 			psels = <NRF_PSEL(TWIM_SDA, 0, 1)>,
 				<NRF_PSEL(TWIM_SCL, 0, 4)>;
+			/* WORKAROUND: no external I2C pull-up resistors are fitted
+			 * on this revision of the PCB. Measured 2026-07-31 — both
+			 * lines sit at 0 with the CPU halted and float high as soon
+			 * as the internal pull-ups are enabled. Without these the
+			 * bus cannot work at all: I2C is open-drain, so nothing ever
+			 * pulls the lines high and every transfer times out.
+			 *
+			 * The nRF internal pull-ups are only ~13k, giving roughly a
+			 * 1 us rise time. That is inside the 1 us budget for 100 kHz
+			 * standard mode but far outside the 300 ns that 400 kHz fast
+			 * mode needs — hence clock-frequency is dropped to
+			 * I2C_BITRATE_STANDARD in the board DTS.
+			 *
+			 * Proper fix is 2.2k-4.7k resistors to VDD on SDA and SCL on
+			 * the next board revision, after which these lines and the
+			 * bitrate reduction can both be reverted. */
+			bias-pull-up;
 		};
 	};
 	i2c0_sleep: i2c0_sleep {
