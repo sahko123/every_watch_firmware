@@ -5,6 +5,18 @@
 
 menu "Every Watch"
 
+config EW_STAGE0
+	bool "Build the stage 0 bring-up image instead of the application"
+	default n
+	help
+	  Replaces the whole application with a minimal first-power-on image:
+	  an I2C bus scan, a GPIO read, and a shell. No sensor drivers, no RTC
+	  driver, no SPI, no BLE and no LED matrix, so there is nothing that can
+	  hang during driver initialisation on an unproven board.
+
+	  Enabled by stage0.conf, which is used as CONF_FILE rather than as an
+	  overlay. Not useful on its own.
+
 config EW_SELFTEST
 	bool "Run the hardware self-test at boot"
 	default n

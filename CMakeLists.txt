@@ -7,18 +7,25 @@ project(every_watch)
 
 target_include_directories(app PRIVATE src)
 
-target_sources(app PRIVATE
-    src/main.c
-    src/led_matrix/led_matrix.c
-    src/sand/sand.c
-    src/time_display/time_display.c
-    src/display/display.c
-    src/imu/imu.c
-    src/identity/identity.c
-    src/ble/ble.c
-    src/battery/battery.c
-    src/light/light.c
-)
+if(CONFIG_EW_STAGE0)
+    # Stage 0 replaces the application entirely — see stage0.conf. None of the
+    # normal modules are compiled, because the drivers they depend on are
+    # switched off in that configuration.
+    target_sources(app PRIVATE src/stage0/stage0.c)
+else()
+    target_sources(app PRIVATE
+        src/main.c
+        src/led_matrix/led_matrix.c
+        src/sand/sand.c
+        src/time_display/time_display.c
+        src/display/display.c
+        src/imu/imu.c
+        src/identity/identity.c
+        src/ble/ble.c
+        src/battery/battery.c
+        src/light/light.c
+    )
 
-# Hardware self-test — only compiled into bring-up / manufacturing builds.
-target_sources_ifdef(CONFIG_EW_SELFTEST app PRIVATE src/selftest/selftest.c)
+    # Hardware self-test — only in bring-up / manufacturing builds.
+    target_sources_ifdef(CONFIG_EW_SELFTEST app PRIVATE src/selftest/selftest.c)
+endif()
