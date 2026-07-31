@@ -30,6 +30,19 @@ config EW_SELFTEST
 	  Requires a console backend — see bringup.conf (RTT, needs a debugger)
 	  or bringup_usb.conf (USB CDC, no debugger needed).
 
+config EW_SELFTEST_INTERACTIVE
+	bool "Include the checks that need a person watching"
+	depends on EW_SELFTEST
+	default n
+	help
+	  Run the LED sweep, pixel-mapping walk, rainbow and button prompts as
+	  part of the self-test. These take about a minute and need someone at
+	  the bench, so they are off by default — with them disabled the boot
+	  report covers only the automatic checks (I2C, RTC, sensors, GPIO) and
+	  finishes in a couple of seconds.
+
+	  Turn on for first bring-up of a new board or for end-of-line test.
+
 config EW_SELFTEST_HALT_ON_FAIL
 	bool "Stop before starting the application if the self-test fails"
 	depends on EW_SELFTEST

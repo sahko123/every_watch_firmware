@@ -66,7 +66,11 @@ extern uint8_t led_max_brightness;
  * e.g. 45000 / (140 × 3 × 199) ≈ 53.7% when all 140 LEDs are at white-max. */
 extern uint32_t led_current_budget;
 
-/* Initialise SPI devices. Call once before first led_commit(). */
+/* Colour wheel: 0-255 walks once around the hue circle. Integer only — no
+ * floats, no division — so it is cheap enough to call per pixel per frame. */
+struct led_rgb led_color_wheel(uint8_t pos);
+
+/* Initialise the LED matrix. Call once before first led_commit(). */
 void led_matrix_init(void);
 
 /* Composite all layers + color layer → SPI DMA buffers → parallel DMA to strips.

@@ -30,11 +30,50 @@ static uint32_t rand32(void)
 
 static uint8_t grid[LED_ROWS][LED_COLS]; /* 1 = particle, 0 = empty */
 
-/* Constrained (time reveal) mode. target[] is the shape being filled; when
- * constrained is set the simulation ignores the gravity vector entirely and
- * runs straight down, so the reveal looks identical however the watch is held. */
+/*
+ * Simulation mode.
+ *
+ *   SAND_FREE        normal falling sand, gravity from the accelerometer
+ *   SAND_CONSTRAINED particles lock into target[] — fills a shape bottom-up
+ *   SAND_RAIN        a curtain sweeping top to bottom, density ramping up to
+ *                    full and back down, used for the time reveal
+ *
+ * Both reveal modes ignore the gravity vector and run straight down, so they
+ * look identical however the watch is held.
+ */
+enum sand_mode {
+	SAND_FREE = 0,
+	SAND_CONSTRAINED,
+	SAND_RAIN,
+};
+
+static enum sand_mode mode;
+
+/* SAND_CONSTRAINED: the shape being filled. */
 static uint8_t target[LED_ROWS][LED_COLS];
-static bool    constrained;
+
+/* SAND_RAIN: density envelope, in ticks at TICK_MS.
+ *
+ * Particles descend one row every RAIN_FALL_DIVIDER ticks, so the screen takes
+ * (LED_ROWS * RAIN_FALL_DIVIDER) ticks to traverse. Each tick every column is
+ * offered a new particle with probability rain_density/255, so the density the
+ * eye sees at any height is the envelope value from when that row was spawned —
+ * the ramp is literally travelling down the display.
+ *
+ * The hold is longer than one traversal so the screen reaches complete cover,
+ * which is the moment the digits are put in place underneath. */
+#define RAIN_FALL_DIVIDER  2     /* 15 rows/s at 30 Hz -> ~470 ms to cross */
+#define RAIN_RAMP_TICKS   21     /* ~0.7 s fading in, and again fading out */
+#define RAIN_HOLD_TICKS   16     /* ~0.5 s at full density */
+
+static uint16_t rain_tick;
+static uint8_t  rain_density;
+static bool     rain_peak_fired;
+static bool     rain_peak_pending;
+static bool     rain_done_pending;
+
+static void (*rain_on_peak)(void);
+static void (*rain_on_done)(void);
 
 /* Default gravity: straight down. GRAVITY_Q8_1G defined in sand.h. */
 static struct sand_gravity gravity = {.col = 0, .row = GRAVITY_Q8_1G};
@@ -227,12 +266,111 @@ static void tick_constrained(void)
 	}
 }
 
+/* -------------------------------------------------------------------------
+ * Rain tick — the curtain reveal
+ * -------------------------------------------------------------------------*/
+
+/* Density envelope: fade in, hold at full, fade out, then let the last of it
+ * fall clear. Returns false once the whole animation is finished. */
+static bool rain_step_envelope(void)
+{
+	uint16_t t = rain_tick++;
+
+	if (t < RAIN_RAMP_TICKS) {
+		rain_density = (uint8_t)((t * 255u) / RAIN_RAMP_TICKS);
+		return true;
+	}
+	t -= RAIN_RAMP_TICKS;
+
+	if (t < RAIN_HOLD_TICKS) {
+		rain_density = 255;
+
+		/* Full cover: hand the digits over to be placed underneath the
+		 * sand, so they are already there when the curtain thins out. */
+		if (!rain_peak_fired) {
+			rain_peak_fired   = true;
+			rain_peak_pending = true;
+		}
+		return true;
+	}
+	t -= RAIN_HOLD_TICKS;
+
+	if (t < RAIN_RAMP_TICKS) {
+		rain_density = (uint8_t)(255u - (t * 255u) / RAIN_RAMP_TICKS);
+		return true;
+	}
+
+	/* Envelope over. Keep falling until the last particles have left. */
+	rain_density = 0;
+
+	for (int row = 0; row < LED_ROWS; row++) {
+		for (int col = 0; col < LED_COLS; col++) {
+			if (grid[row][col]) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+static void tick_rain(void)
+{
+	if (!rain_step_envelope()) {
+		mode = SAND_FREE;
+		rain_done_pending = true;
+		return;
+	}
+
+	/* Advance the curtain on every Nth tick so it descends at a readable
+	 * speed rather than crossing the display in a fifth of a second. */
+	if ((rain_tick % RAIN_FALL_DIVIDER) != 0) {
+		return;
+	}
+
+	/* Everything moves down one row in lockstep — this is a curtain, not a
+	 * pile, so the bottom row leaves the display rather than accumulating. */
+	for (int col = 0; col < LED_COLS; col++) {
+		grid[LED_ROWS - 1][col] = 0;
+	}
+	for (int row = LED_ROWS - 2; row >= 0; row--) {
+		for (int col = 0; col < LED_COLS; col++) {
+			grid[row + 1][col] = grid[row][col];
+			grid[row][col] = 0;
+		}
+	}
+
+	/* Feed the top row at the current density. */
+	for (int col = 0; col < LED_COLS; col++) {
+		grid[0][col] = ((rand32() & 0xFF) < rain_density) ? 1 : 0;
+	}
+}
+
 /* Copy simulation state into LED_LAYER_SAND.
  * Caller holds sand_mutex; this takes led_mask_mutex for the copy.
  * Does NOT commit — see sand_thread() for why that is kept separate. */
+/* Colour the curtain. Hue runs down the display and drifts sideways and with
+ * time, so the falling sheet is a moving rainbow rather than a flat wash.
+ * Writes led_color[], so the caller must hold led_mask_mutex — the compositor
+ * reads it under that lock. */
+static void paint_rainbow(void)
+{
+	for (int row = 0; row < LED_ROWS; row++) {
+		for (int col = 0; col < LED_COLS; col++) {
+			uint8_t hue = (uint8_t)(row * 26 + col * 5 + rain_tick * 3);
+
+			led_color[row][col] = led_color_wheel(hue);
+		}
+	}
+}
+
 static void publish_mask(void)
 {
 	k_mutex_lock(&led_mask_mutex, K_FOREVER);
+
+	if (mode == SAND_RAIN) {
+		paint_rainbow();
+	}
+
 	for (int row = 0; row < LED_ROWS; row++) {
 		for (int col = 0; col < LED_COLS; col++) {
 			led_mask[LED_LAYER_SAND][row][col] = grid[row][col];
@@ -258,13 +396,38 @@ static void sand_thread(void *p1, void *p2, void *p3)
 
 	while (true) {
 		k_mutex_lock(&sand_mutex, K_FOREVER);
-		if (constrained) {
+		switch (mode) {
+		case SAND_CONSTRAINED:
 			tick_constrained();
-		} else {
+			break;
+		case SAND_RAIN:
+			tick_rain();
+			break;
+		default:
 			tick();
+			break;
 		}
 		publish_mask();
+
+		/* Latch the callbacks and fire them after the mutex is released:
+		 * they reach into the LED layers, and holding two locks across a
+		 * caller-supplied function is how deadlocks get written. */
+		bool peak = rain_peak_pending;
+		bool done = rain_done_pending;
+
+		rain_peak_pending = false;
+		rain_done_pending = false;
+		void (*cb_peak)(void) = rain_on_peak;
+		void (*cb_done)(void) = rain_on_done;
+
 		k_mutex_unlock(&sand_mutex);
+
+		if (peak && cb_peak) {
+			cb_peak();
+		}
+		if (done && cb_done) {
+			cb_done();
+		}
 
 		/* led_commit() blocks ~3 ms in DMA and is deliberately called
 		 * with sand_mutex released. display_off() suspends this thread,
@@ -373,13 +536,35 @@ void sand_set_target(const uint8_t t[LED_ROWS][LED_COLS])
 
 	if (t != NULL) {
 		memcpy(target, t, sizeof(target));
-		constrained = true;
+		mode = SAND_CONSTRAINED;
 	} else {
 		memset(target, 0, sizeof(target));
-		constrained = false;
+		mode = SAND_FREE;
 	}
 
 	k_mutex_unlock(&sand_mutex);
+}
+
+void sand_rain_start(void (*on_peak)(void), void (*on_done)(void))
+{
+	k_mutex_lock(&sand_mutex, K_FOREVER);
+
+	memset(grid, 0, sizeof(grid));
+	rain_tick         = 0;
+	rain_density      = 0;
+	rain_peak_fired   = false;
+	rain_peak_pending = false;
+	rain_done_pending = false;
+	rain_on_peak      = on_peak;
+	rain_on_done      = on_done;
+	mode              = SAND_RAIN;
+
+	k_mutex_unlock(&sand_mutex);
+}
+
+bool sand_rain_active(void)
+{
+	return mode == SAND_RAIN;
 }
 
 bool sand_target_complete(void)
@@ -388,7 +573,7 @@ bool sand_target_complete(void)
 
 	k_mutex_lock(&sand_mutex, K_FOREVER);
 
-	if (!constrained) {
+	if (mode != SAND_CONSTRAINED) {
 		done = false;
 	} else {
 		for (int row = 0; row < LED_ROWS && done; row++) {

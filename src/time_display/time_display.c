@@ -106,6 +106,7 @@ static void clear_digits(void)
  * -------------------------------------------------------------------------- */
 
 static const struct device *rtc_dev;
+static bool revealing;
 
 static bool read_time(int *hours, int *minutes)
 {
@@ -130,9 +131,8 @@ static void time_work_fn(struct k_work *work)
 		return;
 	}
 
-	/* While a reveal is in progress the sand is drawing the digits, so
-	 * leave the digit layer alone rather than fighting it. */
-	if (sand_target_complete() || !time_display_revealing()) {
+	/* Leave the digit layer alone while a reveal owns it. */
+	if (!revealing) {
 		build_bitmap(h, m);
 		publish_digits();
 	}
@@ -152,11 +152,24 @@ K_TIMER_DEFINE(time_timer, time_timer_cb, NULL);
  * Public API
  * -------------------------------------------------------------------------- */
 
-static bool revealing;
-
-bool time_display_revealing(void)
+/* Fired by the simulation the moment the curtain reaches full cover. The
+ * digits go into LED_LAYER_DIGITS, which sits below LED_LAYER_SAND in the
+ * compositor, so they stay hidden under the sand and are simply left behind
+ * as it thins out. */
+static void on_curtain_peak(void)
 {
-	return revealing;
+	publish_digits();
+}
+
+static void on_curtain_done(void)
+{
+	revealing = false;
+
+	/* Put the sand colour back — the curtain leaves led_color[] full of
+	 * rainbow, and free-mode sand should be amber again. */
+	led_color_fill(255, 160, 20);
+
+	LOG_INF("Time reveal complete");
 }
 
 void time_display_reveal(void)
@@ -170,16 +183,44 @@ void time_display_reveal(void)
 
 	build_bitmap(h, m);
 
-	/* The falling particles become the digits, so the static digit layer is
-	 * cleared — otherwise the shape would already be visible underneath and
-	 * there would be nothing to reveal. */
-	clear_digits();
+	/* Blank the whole display, not just the digits. Anything left over —
+	 * settled sand, a battery warning on the notification layer — would sit
+	 * there through the reveal, and the point is that the curtain arrives on
+	 * an empty screen. */
+	k_mutex_lock(&led_mask_mutex, K_FOREVER);
+	led_mask_clear_all();
+	k_mutex_unlock(&led_mask_mutex);
+	sand_clear();
+	led_commit();
 
+	revealing = true;
+	sand_rain_start(on_curtain_peak, on_curtain_done);
+
+	LOG_INF("Curtain reveal started: %02d:%02d", h, m);
+}
+
+/*
+ * The earlier reveal: particles stream only into the columns that contain
+ * digits and lock into the shape, building it from the bottom up. Kept because
+ * it is a good effect in its own right — a candidate for a second display mode
+ * or a long-press action rather than the default.
+ */
+void time_display_reveal_fill(void)
+{
+	int h, m;
+
+	if (!read_time(&h, &m)) {
+		LOG_WRN("reveal: RTC unreadable");
+		return;
+	}
+
+	build_bitmap(h, m);
+	clear_digits();
 	sand_clear();
 	sand_set_target(bitmap);
 	revealing = true;
 
-	LOG_INF("Time reveal started: %02d:%02d", h, m);
+	LOG_INF("Fill reveal started: %02d:%02d", h, m);
 }
 
 void time_display_stop_reveal(void)
@@ -190,6 +231,11 @@ void time_display_stop_reveal(void)
 	revealing = false;
 	sand_set_target(NULL);
 	LOG_INF("Time reveal ended");
+}
+
+bool time_display_revealing(void)
+{
+	return revealing;
 }
 
 void time_display_init(const struct device *dev)

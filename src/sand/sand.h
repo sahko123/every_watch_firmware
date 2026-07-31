@@ -64,3 +64,23 @@ void sand_set_target(const uint8_t target[LED_ROWS][LED_COLS]);
 
 /* True once every target cell is occupied. Always false in free mode. */
 bool sand_target_complete(void);
+
+/*
+ * Rain mode — the curtain reveal.
+ *
+ * A sheet of sand sweeps down the whole display: density fades in from nothing
+ * to complete cover, holds there, then fades back out, with particles running
+ * off the bottom rather than piling up. Because everything descends in
+ * lockstep, the density envelope is literally travelling down the screen.
+ *
+ * on_peak fires once, at the moment the display is fully covered — the point
+ * to put something underneath the sand so it is already in place as the
+ * curtain thins and clears. on_done fires when the last particle has left.
+ *
+ * Both callbacks run on the simulation thread with no simulation lock held.
+ * Either may be NULL. Gravity is fixed downward; the accelerometer is ignored.
+ */
+void sand_rain_start(void (*on_peak)(void), void (*on_done)(void));
+
+/* True while the curtain animation is running. */
+bool sand_rain_active(void);

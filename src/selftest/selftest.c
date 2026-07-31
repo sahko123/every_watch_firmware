@@ -325,7 +325,7 @@ static void test_gpio(void)
  * LED matrix — needs a human watching
  * ------------------------------------------------------------------------- */
 
-static void led_fill_rows(int row_lo, int row_hi, uint8_t r, uint8_t g, uint8_t b)
+__maybe_unused static void led_fill_rows(int row_lo, int row_hi, uint8_t r, uint8_t g, uint8_t b)
 {
 	k_mutex_lock(&led_mask_mutex, K_FOREVER);
 	led_mask_clear_all();
@@ -340,7 +340,7 @@ static void led_fill_rows(int row_lo, int row_hi, uint8_t r, uint8_t g, uint8_t 
 	led_commit();
 }
 
-static void led_all_off(void)
+__maybe_unused static void led_all_off(void)
 {
 	k_mutex_lock(&led_mask_mutex, K_FOREVER);
 	led_mask_clear_all();
@@ -350,7 +350,7 @@ static void led_all_off(void)
 
 /* Colour wheel: 0-255 around the hue circle, integer only, no floats and no
  * division. Each third of the range crossfades between two primaries. */
-static struct led_rgb wheel(uint8_t pos)
+__maybe_unused static struct led_rgb wheel(uint8_t pos)
 {
 	pos = 255 - pos;
 
@@ -375,7 +375,7 @@ static struct led_rgb wheel(uint8_t pos)
  * uniform colour would not. Banding, tearing, a stuck row or a line that drops
  * out only under full load will show up here and nowhere else in the test.
  */
-static void test_leds_rainbow(void)
+__maybe_unused static void test_leds_rainbow(void)
 {
 	printk("\n       rainbow sweep - all 140 LEDs, every pixel a different\n");
 	printk("       colour. Look for smooth diagonal bands with no tearing,\n");
@@ -413,7 +413,7 @@ static void test_leds_rainbow(void)
 	led_color_fill(0, 0, 0);
 }
 
-static void test_leds(void)
+__maybe_unused static void test_leds(void)
 {
 	static const struct {
 		const char *name;
@@ -491,7 +491,7 @@ static void test_leds(void)
 
 #define BTN_TIMEOUT_MS 15000
 
-static bool wait_for_button(const struct gpio_dt_spec *btn, const char *name)
+__maybe_unused static bool wait_for_button(const struct gpio_dt_spec *btn, const char *name)
 {
 	printk("       press the %s button (%d s)...\n", name, BTN_TIMEOUT_MS / 1000);
 
@@ -512,7 +512,7 @@ static bool wait_for_button(const struct gpio_dt_spec *btn, const char *name)
 	return false;
 }
 
-static void test_buttons(void)
+__maybe_unused static void test_buttons(void)
 {
 	printk("\n-- Buttons -----------------------------------------------\n");
 
@@ -556,8 +556,14 @@ int selftest_run(void)
 	test_light();
 	test_battery();
 	test_gpio();
-	test_leds();
-	test_buttons();
+
+	if (IS_ENABLED(CONFIG_EW_SELFTEST_INTERACTIVE)) {
+		test_leds();
+		test_buttons();
+	} else {
+		printk("\n-- LED matrix / buttons ----------------------------------\n");
+		printk("       skipped: CONFIG_EW_SELFTEST_INTERACTIVE=n\n");
+	}
 
 	printk("\n==========================================================\n");
 	printk(" RESULT: %d passed, %d failed\n", passed, failed);

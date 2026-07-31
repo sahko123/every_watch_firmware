@@ -102,6 +102,21 @@ uint32_t       led_current_budget = 45000; /* auto-dim when total channel sum ex
  * WS2812B encoding
  * -------------------------------------------------------------------------- */
 
+struct led_rgb led_color_wheel(uint8_t pos)
+{
+	pos = 255 - pos;
+
+	if (pos < 85) {
+		return (struct led_rgb){255 - pos * 3, 0, pos * 3};
+	}
+	if (pos < 170) {
+		pos -= 85;
+		return (struct led_rgb){0, pos * 3, 255 - pos * 3};
+	}
+	pos -= 170;
+	return (struct led_rgb){pos * 3, 255 - pos * 3, 0};
+}
+
 /* Expand one pixel into 24 PWM duty values. Wire order is GRB, MSB first. */
 static void encode_led(const struct led_rgb *c, uint16_t *out)
 {
