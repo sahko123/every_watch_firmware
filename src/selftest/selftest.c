@@ -348,6 +348,71 @@ static void led_all_off(void)
 	led_commit();
 }
 
+/* Colour wheel: 0-255 around the hue circle, integer only, no floats and no
+ * division. Each third of the range crossfades between two primaries. */
+static struct led_rgb wheel(uint8_t pos)
+{
+	pos = 255 - pos;
+
+	if (pos < 85) {
+		return (struct led_rgb){255 - pos * 3, 0, pos * 3};
+	}
+	if (pos < 170) {
+		pos -= 85;
+		return (struct led_rgb){0, pos * 3, 255 - pos * 3};
+	}
+	pos -= 170;
+	return (struct led_rgb){pos * 3, 255 - pos * 3, 0};
+}
+
+/*
+ * Diagonal rainbow scrolled across the whole grid.
+ *
+ * More than decoration: it drives all 140 LEDs on all four data lines at once
+ * with every pixel a different colour, which is the hardest thing to ask of
+ * this display. It exercises the full encode path, all three parallel DMA
+ * transfers plus the row-6 bitbang together, and the current limiter — a
+ * uniform colour would not. Banding, tearing, a stuck row or a line that drops
+ * out only under full load will show up here and nowhere else in the test.
+ */
+static void test_leds_rainbow(void)
+{
+	printk("\n       rainbow sweep - all 140 LEDs, every pixel a different\n");
+	printk("       colour. Look for smooth diagonal bands with no tearing,\n");
+	printk("       no flicker, and no row lagging behind the others.\n");
+
+	/* Per-cell colour: layer_color must be zero for the compositor to read
+	 * led_color[row][col] instead of a flat layer colour. */
+	led_layer_color[LED_LAYER_BG] = (struct led_rgb){0, 0, 0};
+
+	k_mutex_lock(&led_mask_mutex, K_FOREVER);
+	led_mask_clear_all();
+	for (int row = 0; row < LED_ROWS; row++) {
+		for (int col = 0; col < LED_COLS; col++) {
+			led_mask[LED_LAYER_BG][row][col] = 1;
+		}
+	}
+	k_mutex_unlock(&led_mask_mutex);
+
+	/* ~5 s at 30 fps. Hue advances along the diagonal so the bands run
+	 * across the grid rather than straight down a data line — that way a
+	 * single misbehaving line is obvious against its neighbours. */
+	for (int frame = 0; frame < 150; frame++) {
+		for (int row = 0; row < LED_ROWS; row++) {
+			for (int col = 0; col < LED_COLS; col++) {
+				uint8_t hue = (uint8_t)(col * 10 + row * 18 + frame * 3);
+
+				led_color[row][col] = wheel(hue);
+			}
+		}
+		led_commit();
+		k_msleep(33);
+	}
+
+	led_all_off();
+	led_color_fill(0, 0, 0);
+}
+
 static void test_leds(void)
 {
 	static const struct {
@@ -406,6 +471,12 @@ static void test_leds(void)
 
 	led_all_off();
 	led_layer_color[LED_LAYER_BG] = (struct led_rgb){0, 0, 0};
+
+	/* All four lines at once, every pixel a different colour. Kept inside
+	 * the dimmed section deliberately — this is the highest-load pattern the
+	 * test produces. */
+	test_leds_rainbow();
+
 	led_max_brightness = saved_max;
 
 	printk("\n");
