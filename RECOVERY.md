@@ -150,15 +150,99 @@ currently incurred on **every** boot, connected to USB or not.
 
 ### Application
 
-- **Hardware watchdog.** The single most important piece. A ~10 s timeout fed
-  from a low-priority thread. Consider only feeding it while the system is
-  actually healthy, so a deadlocked display or BLE thread converts into a reset
-  — and therefore into a recovery opportunity — rather than a silent brick.
+- **Feed the watchdog** from a low-priority thread, ideally only while the
+  system is provably healthy, so a deadlocked display or BLE thread converts
+  into a reset — and therefore a recovery opportunity — rather than a silent
+  brick. See "The watchdog must start in MCUboot" below for why the app must
+  not be the thing that *starts* it.
+- **`CONFIG_WDT_DISABLE_AT_BOOT=n`**, or Zephyr switches off the watchdog the
+  bootloader just handed over.
 - **`bootmode_set(BOOT_MODE_TYPE_BOOTLOADER)` then `sys_reboot()`**, replacing
   the current bare `sys_reboot()` on the 3-second button hold.
 - A `bootloader` shell command in the bring-up builds.
 - Later: a BLE characteristic doing the same, so the companion app can start an
   update.
+
+---
+
+## The watchdog must start in MCUboot
+
+A corrupt image is **not** caught by the watchdog and does not need to be: the
+SHA-256 check fails, MCUboot never jumps, and the CPU never executes a single
+instruction of the bad image. MCUboot stays in control and enters recovery.
+
+The watchdog exists for a different failure: an image that *passes* validation
+and then misbehaves. That splits in two:
+
+| | Outcome |
+|---|---|
+| Hangs **after** the watchdog is started | Reset, then recovery. Fine. |
+| Hangs **before** the watchdog is started | Nothing fires. Brick. |
+
+The second case is not hypothetical on this board. Zephyr runs every driver's
+init before `main()`, and four devices share one I2C bus. A sensor holding SDA
+low, or a driver spinning on an ACK that never arrives, hangs the system before
+any application code executes — so an application that starts its own watchdog
+never gets the chance.
+
+**The fix is to have MCUboot start it.** The nRF52 watchdog cannot be stopped
+once started — there is no stop task, only a reset clears it. So a watchdog
+started by the bootloader is inherited by the application as something it must
+feed or die, covering driver init and everything else before `main()`.
+
+MCUboot already has the hook: `MCUBOOT_WATCHDOG_SETUP()` at `main.c:450`, ahead
+of every recovery check. **On nRF it currently expands to nothing:**
+
+- `BOOT_WATCHDOG_FEED` defaults `y` on Nordic and `imply`s `NRFX_WDT`
+- the `CONFIG_NRFX_WDT` branch of `mcuboot_config.h` defines only
+  `MCUBOOT_WATCHDOG_FEED()`
+- the branch defining `MCUBOOT_WATCHDOG_SETUP()` as `wdt_setup()` is the
+  generic-driver `#elif`, which is therefore never taken
+- `mcuboot_config.h:381` then supplies an empty fallback definition
+
+So today MCUboot faithfully feeds a watchdog that nothing ever started.
+
+To get the real behaviour, force the generic driver path in MCUboot:
+
+```
+CONFIG_WATCHDOG=y
+CONFIG_WDT_NRFX=y
+CONFIG_NRFX_WDT=n     # override the imply so the nrfx branch is not taken
+```
+
+plus a `watchdog0` devicetree alias pointing at `&wdt0`.
+
+**Unverified:** MCUboot's macro calls `wdt_setup(wdt, 0)` with no preceding
+`wdt_install_timeout()`. Whether that arms a channel on the nrfx driver needs
+checking on hardware; if it does not, MCUboot needs a small `SYS_INIT` that
+installs a timeout and starts the watchdog itself.
+
+### Watchdog trade-offs
+
+- **Deep sleep.** A deadlocked Zephyr system does not spin — it drops into the
+  idle thread and sleeps. The watchdog therefore has to keep counting through
+  sleep, which means waking periodically to feed it. That works against the
+  <10 µA idle target. The nRF52 watchdog can time out up to ~36 hours, so a
+  30-60 s window keeps the wake cost small.
+- **Debugger halts.** Get `CONFIG.HALT` right or the watchdog fires while the
+  CPU is stopped at a breakpoint during bring-up.
+
+### Proving it works
+
+Do not take any of this on faith — it is all testable, and belongs in the
+bring-up procedure:
+
+| Test | Method | Expected |
+|---|---|---|
+| Corrupt image rejected | Upload a truncated image | MCUboot refuses it, enters recovery |
+| Hang after init | Shell command that locks interrupts and spins | Watchdog reset within the timeout |
+| Hang before `main()` | Jumper SDA low through boot | Watchdog reset — proves the MCUboot-start fix |
+| Reset cause visible | `hwinfo_get_reset_cause()` logged every boot | Reports watchdog, not power-on |
+
+That last one is worth keeping permanently: logging the reset cause turns "it
+rebooted on its own" into something diagnosable.
+
+---
 
 ### Consequence to be aware of
 
