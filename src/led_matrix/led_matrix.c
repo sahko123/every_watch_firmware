@@ -69,6 +69,11 @@ LOG_MODULE_REGISTER(led_matrix, LOG_LEVEL_INF);
 #define NOP35   NOP16; NOP16; NOP2; _NOP()
 #define NOP58   NOP35; NOP16; NOP4; NOP2; _NOP()
 
+/* Upper bound on how long one strip's DMA may take before we give up on it.
+ * 360 bytes at 2 MHz ≈ 1.5 ms; 50 ms means only a genuinely stuck transfer
+ * trips it. */
+#define COMMIT_TIMEOUT_MS 50
+
 #define BYTES_PER_LED 9   /* 24 bits × 3 SPI bits / 8 = 9 bytes */
 #define LEDS_01       40  /* rows 0-1: SPIM1 (P0.29) */
 #define LEDS_23       40  /* rows 2-3: SPIM2 (P0.28) */
@@ -367,13 +372,36 @@ void led_commit(void)
 	static struct spi_buf_set tx2 = {.buffers = &tx2_buf, .count = 1};
 	static struct spi_buf_set tx3 = {.buffers = &tx3_buf, .count = 1};
 
-	spi_transceive_cb(spi1, &spi_cfg, &tx1, NULL, cb1, NULL);
-	spi_transceive_cb(spi2, &spi_cfg, &tx2, NULL, cb2, NULL);
-	spi_transceive_cb(spi3, &spi_cfg, &tx3, NULL, cb3, NULL);
+	/* Clear any stale give from a previous frame that timed out after its
+	 * transfer eventually completed. Without this, the take below would
+	 * return immediately while DMA is still reading the buffer. */
+	k_sem_reset(&done1);
+	k_sem_reset(&done2);
+	k_sem_reset(&done3);
 
-	k_sem_take(&done1, K_FOREVER);
-	k_sem_take(&done2, K_FOREVER);
-	k_sem_take(&done3, K_FOREVER);
+	int rc1 = spi_transceive_cb(spi1, &spi_cfg, &tx1, NULL, cb1, NULL);
+	int rc2 = spi_transceive_cb(spi2, &spi_cfg, &tx2, NULL, cb2, NULL);
+	int rc3 = spi_transceive_cb(spi3, &spi_cfg, &tx3, NULL, cb3, NULL);
+
+	if (rc1 || rc2 || rc3) {
+		LOG_ERR("SPI start failed: %d %d %d", rc1, rc2, rc3);
+	}
+
+	/* Only wait on transfers that actually started — a failed start means
+	 * its callback never runs. Waiting forever here would wedge this thread
+	 * while holding led_commit_mutex, which also deadlocks display_off().
+	 *
+	 * 360 bytes at 2 MHz is ~1.5 ms, so COMMIT_TIMEOUT_MS is generous.
+	 * Timing out costs one frame instead of the whole display. */
+	if (!rc1 && k_sem_take(&done1, K_MSEC(COMMIT_TIMEOUT_MS))) {
+		LOG_ERR("SPI1 transfer timed out");
+	}
+	if (!rc2 && k_sem_take(&done2, K_MSEC(COMMIT_TIMEOUT_MS))) {
+		LOG_ERR("SPI2 transfer timed out");
+	}
+	if (!rc3 && k_sem_take(&done3, K_MSEC(COMMIT_TIMEOUT_MS))) {
+		LOG_ERR("SPI3 transfer timed out");
+	}
 
 	/* Row 6 (P0.03, 20 LEDs): bitbang after parallel DMA completes */
 	ws2812_bitbang_row6();

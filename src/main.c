@@ -14,6 +14,10 @@
 #include "battery/battery.h"
 #include "light/light.h"
 
+#ifdef CONFIG_EW_SELFTEST
+#include "selftest/selftest.h"
+#endif
+
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 static const struct device *rtc = DEVICE_DT_GET(DT_ALIAS(rtc0));
@@ -34,6 +38,22 @@ int main(void)
 	}
 
 	led_matrix_init();
+
+#ifdef CONFIG_EW_SELFTEST
+	/* Runs before any application thread starts, so it has the LED matrix
+	 * to itself. Note it sets the RTC to a fixed date as part of the test —
+	 * re-sync over BLE afterwards. */
+	{
+		int fails = selftest_run();
+
+		if (IS_ENABLED(CONFIG_EW_SELFTEST_HALT_ON_FAIL) && fails > 0) {
+			LOG_ERR("Self-test failed (%d) — halting before app start", fails);
+			while (true) {
+				k_sleep(K_FOREVER);
+			}
+		}
+	}
+#endif
 
 	/* Sand: warm amber (per-cell, no layer_color override) */
 	led_color_fill(255, 160, 20);

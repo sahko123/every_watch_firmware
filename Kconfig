@@ -1,0 +1,33 @@
+# Every Watch application configuration.
+#
+# Zephyr sources this file automatically for an application-level Kconfig; it
+# must end by sourcing Kconfig.zephyr.
+
+menu "Every Watch"
+
+config EW_SELFTEST
+	bool "Run the hardware self-test at boot"
+	default n
+	help
+	  Probe every peripheral on the board and print a PASS/FAIL report to
+	  the console before the normal application starts. Includes interactive
+	  checks that need a person watching: an LED line and pixel-mapping walk,
+	  and a left/right button press.
+
+	  Intended for first board bring-up and end-of-line manufacturing test.
+	  Requires a console backend — see bringup.conf (RTT, needs a debugger)
+	  or bringup_usb.conf (USB CDC, no debugger needed).
+
+config EW_SELFTEST_HALT_ON_FAIL
+	bool "Stop before starting the application if the self-test fails"
+	depends on EW_SELFTEST
+	default n
+	help
+	  Leave the board sitting at the report instead of continuing to boot.
+	  Useful on a manufacturing line where a unit must not be shipped if any
+	  check failed. During bring-up you usually want the opposite: see the
+	  failures but still get a running watch to poke at.
+
+endmenu
+
+source "Kconfig.zephyr"

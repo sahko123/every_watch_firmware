@@ -23,8 +23,9 @@ static uint32_t rand32(void)
  * Grid
  * -------------------------------------------------------------------------
  * The simulation runs on the same 7×20 logical grid as the LED matrix.
- * LED_LAYER_DIGITS cells are treated as immovable obstacles — sand cannot
- * enter them but can rest against them.
+ * Digit cells are NOT obstacles: sand flows freely over LED_LAYER_DIGITS and
+ * the digits are revealed underneath as particles clear, because the
+ * compositor draws the sand layer above the digit layer.
  */
 
 static uint8_t grid[LED_ROWS][LED_COLS]; /* 1 = particle, 0 = empty */
@@ -150,8 +151,10 @@ static void tick(void)
 	}
 }
 
-/* Push simulation state into LED_LAYER_SAND and call led_commit(). */
-static void render(void)
+/* Copy simulation state into LED_LAYER_SAND.
+ * Caller holds sand_mutex; this takes led_mask_mutex for the copy.
+ * Does NOT commit — see sand_thread() for why that is kept separate. */
+static void publish_mask(void)
 {
 	k_mutex_lock(&led_mask_mutex, K_FOREVER);
 	for (int row = 0; row < LED_ROWS; row++) {
@@ -160,7 +163,6 @@ static void render(void)
 		}
 	}
 	k_mutex_unlock(&led_mask_mutex);
-	led_commit();
 }
 
 /* -------------------------------------------------------------------------
@@ -181,8 +183,15 @@ static void sand_thread(void *p1, void *p2, void *p3)
 	while (true) {
 		k_mutex_lock(&sand_mutex, K_FOREVER);
 		tick();
-		render();
+		publish_mask();
 		k_mutex_unlock(&sand_mutex);
+
+		/* led_commit() blocks ~3 ms in DMA and is deliberately called
+		 * with sand_mutex released. display_off() suspends this thread,
+		 * and being suspended while holding sand_mutex would block every
+		 * caller of sand_set_gravity(), sand_count() and sand_clear()
+		 * until the display came back on. */
+		led_commit();
 
 		k_msleep(TICK_MS);
 	}

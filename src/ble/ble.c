@@ -233,6 +233,18 @@ static const struct led_rgb notif_colors[] = {
     [3] = {255,   0,  0 },  /* alarm    — red   */
 };
 
+/* Wake the display and push the frame from the system work queue.
+ * led_commit() blocks ~3 ms in DMA and locks interrupts for ~585 µs during the
+ * row-6 bitbang; doing that on the BT RX thread starves the controller and
+ * risks dropped connection events. */
+static void notif_commit_fn(struct k_work *w)
+{
+    ARG_UNUSED(w);
+    display_on();
+    led_commit();
+}
+static K_WORK_DEFINE(notif_commit_work, notif_commit_fn);
+
 static void show_notification(uint8_t category)
 {
     if (category >= ARRAY_SIZE(notif_colors)) {
@@ -249,8 +261,7 @@ static void show_notification(uint8_t category)
     led_layer_color[LED_LAYER_NOTIFICATION] = notif_colors[category];
     k_mutex_unlock(&led_mask_mutex);
 
-    display_on();
-    led_commit();
+    k_work_submit(&notif_commit_work);
 }
 
 static ssize_t on_notif_write(struct bt_conn *conn,

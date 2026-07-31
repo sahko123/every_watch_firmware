@@ -19,3 +19,6 @@ target_sources(app PRIVATE
     src/battery/battery.c
     src/light/light.c
 )
+
+# Hardware self-test — only compiled into bring-up / manufacturing builds.
+target_sources_ifdef(CONFIG_EW_SELFTEST app PRIVATE src/selftest/selftest.c)
