@@ -78,6 +78,40 @@ static void boot_indicator_stop(void)
 	k_mutex_unlock(&led_mask_mutex);
 }
 
+/*
+ * Paint a "waiting for firmware" pattern, then let the reset happen.
+ *
+ * WS2812B latch the last frame they received and hold it for as long as they
+ * have power — nothing refreshes them. So a frame committed here survives the
+ * reset and stays lit through MCUboot's entire DFU window, even though the
+ * bootloader never touches the LEDs. That would otherwise be impossible:
+ * MCUboot's own CONFIG_MCUBOOT_INDICATION_LED drives a plain GPIO, and it has
+ * no room for a WS2812B driver.
+ *
+ * It also outlives a failed update. If a DFU transfer dies partway the image
+ * is invalid, MCUboot halts, and this pattern is still on screen — so a watch
+ * in that state says "I am waiting for firmware" instead of looking dead.
+ *
+ * Blue along the top edge: distinct from the red low-battery row at the
+ * bottom, and not something any normal mode draws.
+ */
+static void show_dfu_pattern(void)
+{
+	k_mutex_lock(&led_mask_mutex, K_FOREVER);
+	led_mask_clear_all();
+	for (int col = 0; col < LED_COLS; col++) {
+		led_mask[LED_LAYER_NOTIFICATION][0][col] = 1;
+	}
+	led_layer_color[LED_LAYER_NOTIFICATION] = (struct led_rgb){0, 80, 200};
+	k_mutex_unlock(&led_mask_mutex);
+
+	led_commit();
+
+	/* led_commit() already waits for the transfer and the latch delay, but
+	 * give the frame a little margin before the reset tears the PWM down. */
+	k_msleep(30);
+}
+
 int main(void)
 {
 	if (!device_is_ready(rtc)) {
@@ -163,6 +197,7 @@ int main(void)
 			held_ms = MIN(held_ms + 50, 5000);
 			if (held_ms >= 3000) {
 				LOG_INF("DFU: rebooting into bootloader");
+				show_dfu_pattern();
 				sys_reboot(SYS_REBOOT_COLD);
 			}
 		} else {
