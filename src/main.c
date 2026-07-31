@@ -27,6 +27,57 @@ static const struct device *rtc = DEVICE_DT_GET(DT_ALIAS(rtc0));
  * window. Works from battery: plug in USB first, then hold the button. */
 static const struct gpio_dt_spec btn_dfu = GPIO_DT_SPEC_GET(DT_ALIAS(btn_left), gpios);
 
+/*
+ * Boot indicator — one blinking pixel, top-left.
+ *
+ * Something has to be on screen while the application starts, otherwise a slow
+ * or stuck boot is indistinguishable from a dead watch. Drawn on LED_LAYER_BG
+ * rather than the notification layer so it cannot collide with the low-battery
+ * warning, which comes up during init.
+ *
+ * Note this only covers the application. MCUboot's USB DFU window runs for five
+ * seconds before any of this, and the display is dark for all of it.
+ */
+static void boot_blink_fn(struct k_work *w)
+{
+	static bool lit;
+
+	ARG_UNUSED(w);
+	lit = !lit;
+
+	k_mutex_lock(&led_mask_mutex, K_FOREVER);
+	led_mask[LED_LAYER_BG][0][0] = lit ? 1 : 0;
+	led_layer_color[LED_LAYER_BG] = (struct led_rgb){0, 90, 160};
+	k_mutex_unlock(&led_mask_mutex);
+
+	led_commit();
+}
+
+K_WORK_DEFINE(boot_blink_work, boot_blink_fn);
+
+static void boot_blink_timer_cb(struct k_timer *t)
+{
+	ARG_UNUSED(t);
+	k_work_submit(&boot_blink_work);
+}
+
+K_TIMER_DEFINE(boot_blink_timer, boot_blink_timer_cb, NULL);
+
+static void boot_indicator_start(void)
+{
+	k_timer_start(&boot_blink_timer, K_NO_WAIT, K_MSEC(120));
+}
+
+static void boot_indicator_stop(void)
+{
+	k_timer_stop(&boot_blink_timer);
+
+	k_mutex_lock(&led_mask_mutex, K_FOREVER);
+	led_mask[LED_LAYER_BG][0][0] = 0;
+	led_layer_color[LED_LAYER_BG] = (struct led_rgb){0, 0, 0};
+	k_mutex_unlock(&led_mask_mutex);
+}
+
 int main(void)
 {
 	if (!device_is_ready(rtc)) {
@@ -38,6 +89,7 @@ int main(void)
 	}
 
 	led_matrix_init();
+	boot_indicator_start();
 
 #ifdef CONFIG_EW_SELFTEST
 	/* Runs before any application thread starts, so it has the LED matrix
@@ -65,8 +117,10 @@ int main(void)
 		time_display_init(rtc);
 	}
 
+	/* No particles seeded here. The watch idles with the display off; sand
+	 * appears when a mode asks for it. Seeding at boot left a pile of amber
+	 * sitting in the bottom rows underneath the time, permanently. */
 	sand_init();
-	sand_add_particles(60);
 
 	display_init();
 	imu_init();
@@ -74,6 +128,18 @@ int main(void)
 	ble_init();
 	battery_init();
 	light_init();
+
+	/* Boot finished: stop the indicator, blank everything and drop to idle.
+	 * The watch shows nothing until a button asks it to — pressing left runs
+	 * the reveal. */
+	boot_indicator_stop();
+
+	k_mutex_lock(&led_mask_mutex, K_FOREVER);
+	led_mask_clear_all();
+	k_mutex_unlock(&led_mask_mutex);
+	led_commit();
+
+	display_off();
 
 	bool dfu_ok = false;
 	if (!gpio_is_ready_dt(&btn_dfu)) {
