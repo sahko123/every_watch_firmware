@@ -94,9 +94,9 @@ K_MUTEX_DEFINE(led_mask_mutex);
 struct led_rgb led_color[LED_ROWS][LED_COLS];
 struct led_rgb led_layer_color[LED_LAYER_COUNT]; /* zero = use led_color per cell */
 uint8_t        led_mask[LED_LAYER_COUNT][LED_ROWS][LED_COLS];
-uint8_t        led_brightness     = 255;   /* ambient scaling; set by light sensor */
-uint8_t        led_max_brightness = 200;   /* hard cap ~78% — lower for battery saving */
-uint32_t       led_current_budget = 45000; /* auto-dim when total channel sum exceeds this */
+uint8_t        led_brightness     = 255;  /* ambient scaling 0-255; set by light sensor */
+uint8_t        led_max_brightness = 32;   /* per-pixel ceiling, ~12% */
+uint32_t       led_current_budget = 1900; /* ~150 mA total — see the maths below */
 
 /* --------------------------------------------------------------------------
  * WS2812B encoding
@@ -179,7 +179,7 @@ static struct led_rgb composite(int col, int row)
  *   Pass 1 — composite + clamp to effective brightness → accumulate channel sum
  *   Pass 2 — apply current-limit scale factor → encode into the sequences
  *
- * Effective brightness = MIN(led_brightness, led_max_brightness).
+ * Effective brightness = led_brightness * led_max_brightness / 255.
  * Current scale        = MIN(1.0, led_current_budget / total_sum).
  *
  * Caller (led_commit) holds led_commit_mutex; this function additionally
@@ -187,9 +187,16 @@ static struct led_rgb composite(int col, int row)
  */
 static void build_buffers(void)
 {
-	/* Effective brightness cap (Q8: 0-255) */
-	uint8_t br = (led_brightness < led_max_brightness)
-	             ? led_brightness : led_max_brightness;
+	/*
+	 * Ambient level scales *within* the ceiling rather than being MIN'd
+	 * against it. With MIN, every ambient value above led_max_brightness
+	 * collapsed to the same output, so the light sensor did nothing at all
+	 * once the room was brighter than a dim office — the display sat at the
+	 * ceiling almost all the time. Multiplying keeps the full range usable:
+	 * led_max_brightness is the brightest the watch ever gets, and
+	 * led_brightness picks a point below it.
+	 */
+	uint8_t br = (uint8_t)(((uint16_t)led_brightness * led_max_brightness) / 255);
 
 	k_mutex_lock(&led_mask_mutex, K_FOREVER);
 
@@ -335,3 +342,87 @@ void led_commit(void)
 
 	k_mutex_unlock(&led_commit_mutex);
 }
+
+/* --------------------------------------------------------------------------
+ * Shell commands — live brightness tuning
+ * --------------------------------------------------------------------------
+ *
+ * Brightness is a thing you judge by looking at it, and reflashing this board
+ * means reconnecting a debug probe. These let it be dialled in over RTT while
+ * the watch is running, then written back into the defaults above once the
+ * numbers are right.
+ *
+ * Note `led ambient` only sticks while the display is on: the light sensor
+ * rewrites led_brightness every 2 s whenever the display is off.
+ * -------------------------------------------------------------------------- */
+
+#ifdef CONFIG_SHELL
+
+#include <zephyr/shell/shell.h>
+#include <stdlib.h>
+
+/* Sum-of-channels to milliamps: 107,100 sum ≈ 8.4 A, so ~0.078 mA per unit. */
+static unsigned int budget_to_ma(uint32_t budget)
+{
+	return (unsigned int)((budget * 78u) / 1000u);
+}
+
+static int cmd_led_max(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc == 2) {
+		led_max_brightness = (uint8_t)strtoul(argv[1], NULL, 0);
+		led_commit();
+	}
+	shell_print(sh, "max_brightness = %u / 255  (%u%%)",
+		    led_max_brightness, (led_max_brightness * 100u) / 255u);
+	return 0;
+}
+
+static int cmd_led_budget(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc == 2) {
+		led_current_budget = (uint32_t)strtoul(argv[1], NULL, 0);
+		led_commit();
+	}
+	shell_print(sh, "current_budget = %u  (~%u mA driven)",
+		    led_current_budget, budget_to_ma(led_current_budget));
+	return 0;
+}
+
+static int cmd_led_ambient(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc == 2) {
+		led_brightness = (uint8_t)strtoul(argv[1], NULL, 0);
+		led_commit();
+	}
+	shell_print(sh, "ambient = %u / 255  (overwritten by the light sensor "
+			"while the display is off)", led_brightness);
+	return 0;
+}
+
+static int cmd_led_show(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc); ARG_UNUSED(argv);
+
+	uint8_t eff = (uint8_t)(((uint16_t)led_brightness * led_max_brightness) / 255);
+
+	shell_print(sh, "ambient        %u / 255", led_brightness);
+	shell_print(sh, "max_brightness %u / 255", led_max_brightness);
+	shell_print(sh, "effective      %u / 255  (%u%%)", eff, (eff * 100u) / 255u);
+	shell_print(sh, "current_budget %u  (~%u mA driven)",
+		    led_current_budget, budget_to_ma(led_current_budget));
+	shell_print(sh, "note: 140 WS2812B also draw ~100 mA just being powered");
+	return 0;
+}
+
+SHELL_STATIC_SUBCMD_SET_CREATE(led_sub,
+	SHELL_CMD_ARG(show,    NULL, "Print current brightness settings",   cmd_led_show,    1, 0),
+	SHELL_CMD_ARG(max,     NULL, "Per-pixel ceiling, 0-255",            cmd_led_max,     1, 1),
+	SHELL_CMD_ARG(budget,  NULL, "Total current budget (sum units)",    cmd_led_budget,  1, 1),
+	SHELL_CMD_ARG(ambient, NULL, "Ambient level, 0-255",                cmd_led_ambient, 1, 1),
+	SHELL_SUBCMD_SET_END
+);
+
+SHELL_CMD_REGISTER(led, &led_sub, "LED brightness tuning", NULL);
+
+#endif /* CONFIG_SHELL */

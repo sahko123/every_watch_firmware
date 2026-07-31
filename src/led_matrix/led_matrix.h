@@ -46,24 +46,38 @@ extern struct k_mutex led_mask_mutex;
  * thread cannot be suspended mid-DMA leaving semaphores stuck at zero. */
 extern struct k_mutex led_commit_mutex;
 
-/* Ambient brightness scaler 0-255 set by the light sensor (default 255 = full).
- * Only updated while the display is off to avoid LED-to-sensor feedback. */
+/* Ambient level 0-255 set by the light sensor. Scales within
+ * led_max_brightness rather than overriding it, so 255 means "as bright as
+ * this watch ever gets", not "full power".
+ * Only updated while the display is off, to avoid the LEDs feeding back into
+ * the sensor and driving themselves brighter. */
 extern uint8_t led_brightness;
 
-/* Hard cap applied after ambient scaling (default 200 ≈ 78%).
- * Lower this to reduce peak power draw. Range 0-255. */
+/* The brightest any single pixel is ever driven, 0-255. Default 64 (~25%).
+ * This is a perceptual ceiling; led_current_budget below is the one that
+ * protects the battery. */
 extern uint8_t led_max_brightness;
 
-/* Sum-of-all-channel-values budget for current limiting.
- * When the composited frame exceeds this, every pixel is scaled down uniformly
- * so that the total stays at the budget — "a handful of LEDs at full brightness,
- * but if all LEDs come on the brightness reduces automatically."
+/* Total-current limit, expressed as a budget on the sum of every channel value
+ * in the composited frame. When a frame exceeds it, all pixels are scaled down
+ * together — so a handful of LEDs can be bright, but lighting the whole display
+ * dims it automatically instead of drawing amps.
  *
- * Default 45000 ≈ 60 LEDs at full-white after max_brightness cap.
- * Set to 0 to disable current limiting.
+ * Converting budget to current:
+ *   140 LEDs at full white = 140 × 3 × 255 = 107,100 sum, and draws ~8.4 A.
+ *   So 1 unit of sum ≈ 8400 / 107100 ≈ 0.078 mA.
  *
- * Maths: budget / (total_leds × 3 × max_channel) = avg fraction of max brightness.
- * e.g. 45000 / (140 × 3 × 199) ≈ 53.7% when all 140 LEDs are at white-max. */
+ *   budget 1900  ≈ 150 mA   (default: safe on USB, ~0.4C on a 400 mAh cell)
+ *   budget 45000 ≈ 3.5 A    (the old default — never engaged, so a full-screen
+ *                            frame at the old 78% ceiling pulled about 2.2 A)
+ *
+ * Set to 0 to disable limiting entirely. Do not, unless the watch is on a
+ * bench supply.
+ *
+ * Note this governs the LEDs' *driven* current only. WS2812B also draw roughly
+ * 0.5-1 mA each just being powered, so 140 of them idle at somewhere near
+ * 100 mA regardless of what is displayed — that is a hardware property and no
+ * firmware setting affects it. */
 extern uint32_t led_current_budget;
 
 /* Colour wheel: 0-255 walks once around the hue circle. Integer only — no

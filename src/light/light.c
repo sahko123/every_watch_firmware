@@ -14,10 +14,16 @@ static const struct device *bh = DEVICE_DT_GET(DT_ALIAS(light0));
 
 /*
  * Piecewise-linear lux → brightness curve.
- * Tuned for a watch in a wrist-wear context:
- *   dark room / pocket  →  low brightness (easy on eyes, saves power)
- *   office lighting     →  mid brightness
- *   bright outdoor sun  →  full brightness
+ *
+ * The output is a fraction of led_max_brightness, not an absolute drive level,
+ * so 255 here means "as bright as this watch ever gets" rather than full power.
+ *
+ * Tuned for something worn on a wrist and looked at up close. The bottom end
+ * matters most: a watch glanced at in a dark room needs far less output than
+ * the eye expects on paper, and the previous curve bottomed out at 30 (12%),
+ * which is genuinely dazzling at night. Human brightness perception is roughly
+ * logarithmic, which is why the lux breakpoints climb by decades while the
+ * output climbs roughly linearly.
  */
 static uint8_t lux_to_brightness(uint32_t lux)
 {
@@ -25,12 +31,12 @@ static uint8_t lux_to_brightness(uint32_t lux)
         uint32_t lux;
         uint8_t  brightness;
     } pts[] = {
-        {0,      30},
-        {10,     50},
-        {100,    100},
-        {1000,   170},
-        {10000,  230},
-        {50000,  255},
+        {0,        8},   /* pitch dark, or face-down on a table / in a pocket */
+        {5,       20},   /* dim room at night                                 */
+        {50,      60},   /* normal indoor evening lighting                    */
+        {200,    110},   /* well-lit room, office                             */
+        {1000,   180},   /* bright indoors, or overcast outdoors              */
+        {10000,  255},   /* direct sunlight — everything it has               */
     };
 
     for (int i = 1; i < (int)ARRAY_SIZE(pts); i++) {
