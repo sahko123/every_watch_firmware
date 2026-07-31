@@ -226,6 +226,20 @@ void sand_add_particles(int n)
 {
 	k_mutex_lock(&sand_mutex, K_FOREVER);
 
+	int dcol, drow;
+
+	gravity_step(&dcol, &drow);
+
+	/* Direction to walk when looking for somewhere to put a particle. With
+	 * no meaningful gravity, fall back to downward so the search always
+	 * makes progress and cannot spin. */
+	int step_col = (dcol > 0) ? 1 : (dcol < 0) ? -1 : 0;
+	int step_row = (drow > 0) ? 1 : (drow < 0) ? -1 : 0;
+
+	if (step_col == 0 && step_row == 0) {
+		step_row = 1;
+	}
+
 	int added = 0;
 
 	for (int attempt = 0; attempt < n * 4 && added < n; attempt++) {
@@ -233,10 +247,6 @@ void sand_add_particles(int n)
 		 * Spawn on the edge that particles enter from — the face
 		 * opposite to the gravity direction.
 		 */
-		int dcol, drow;
-
-		gravity_step(&dcol, &drow);
-
 		int col, row;
 
 		if (abs(drow) >= abs(dcol)) {
@@ -249,10 +259,29 @@ void sand_add_particles(int n)
 			row = rand32() % LED_ROWS;
 		}
 
-		if (passable(col, row)) {
+		/*
+		 * Walk along the gravity direction to the first free cell.
+		 *
+		 * Placing only on the edge itself caps the total at the width of
+		 * that edge — 20 cells for vertical gravity — because once the
+		 * edge fills, every later attempt fails and the request silently
+		 * under-delivers. sand_add_particles(60) used to add exactly 20,
+		 * which then settled into precisely one full row.
+		 */
+		while (in_bounds(col, row) && grid[row][col]) {
+			col += step_col;
+			row += step_row;
+		}
+
+		if (in_bounds(col, row)) {
 			grid[row][col] = 1;
 			added++;
 		}
+	}
+
+	if (added < n) {
+		LOG_WRN("sand: asked for %d particles, grid had room for %d",
+			n, added);
 	}
 
 	k_mutex_unlock(&sand_mutex);
