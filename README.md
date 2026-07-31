@@ -105,17 +105,38 @@ MCUboot has to be on the chip before USB flashing can work at all.
 
 ### With a Raspberry Pi Pico (no commercial debugger needed)
 
-Flash your Pico with Raspberry Pi's `debugprobe` firmware, then wire it to the
-watch's SWD pads:
+Flash the Pico with Raspberry Pi's `debugprobe` firmware — note the file
+differs by board, and `debugprobe.uf2` is for the dedicated Debug Probe
+hardware, *not* a plain Pico:
 
-| Pico | Watch |
+| Board | Asset |
 |---|---|
-| GP2 | SWCLK |
-| GP3 | SWDIO |
-| GND | GND |
+| Pico / Pico W (RP2040) | `debugprobe_on_pico.uf2` |
+| Pico 2 / Pico 2 W (RP2350) | `debugprobe_on_pico2.uf2` |
+| RPi Debug Probe | `debugprobe.uf2` |
+
+From <https://github.com/raspberrypi/debugprobe/releases>. Hold BOOTSEL while
+plugging the Pico in, then drag the `.uf2` onto the `RPI-RP2` drive.
+
+Wiring — the three pins are adjacent on the Pico header:
+
+| Pico pin | GPIO | Watch |
+|---|---|---|
+| 3 | GND | GND |
+| 4 | GP2 | SWCLK |
+| 5 | GP3 | SWDIO |
 
 Do **not** power the watch from the Pico — let it run from its own battery or
-USB and share only ground.
+USB and share only ground. Keep the SWD leads short; long flying leads are the
+usual cause of intermittent `cannot read IDR`.
+
+Check the probe can reach the chip before writing anything to it:
+
+```bash
+openocd -f interface/cmsis-dap.cfg -f target/nrf52.cfg -c "init; targets; exit"
+```
+
+You want `nrf52.cpu` listed and `halted`.
 
 Install OpenOCD (0.11 or newer), then:
 
