@@ -1,107 +1,88 @@
 #include "led_matrix.h"
 
 #include <zephyr/kernel.h>
-#include <zephyr/drivers/spi.h>
 #include <zephyr/logging/log.h>
 #include <hal/nrf_gpio.h>
+#include <nrfx_pwm.h>
 #include <string.h>
 
 LOG_MODULE_REGISTER(led_matrix, LOG_LEVEL_INF);
 
 /*
- * WS2812B SPI encoding
- * --------------------
- * Each WS2812B bit → 3 SPI bits: T1=110, T0=100
- * At 2 MHz: 3 × 500 ns = 1.5 µs/bit  (spec: 1.25 µs ±600 ns)
- *   T1H = 2×500 = 1000 ns  (datasheet max 950 ns, but WS2812B tolerates ~1050 ns)
- *   T1L = 1×500 =  500 ns  (spec 300–600 ns ✓)
- *   T0H = 1×500 =  500 ns  (spec 250–550 ns, borderline — verify at bring-up)
- *   T0L = 2×500 = 1000 ns  (spec 700–1000 ns ✓)
+ * WS2812B via PWM + EasyDMA
+ * ------------------------
+ * WS2812B is self-clocked: the value of each bit is encoded in the width of a
+ * high pulse within a fixed 1.25 us period. There is no clock line, so the job
+ * is purely to generate an accurately timed waveform on one GPIO per data line.
  *
- * Note: nRF52833 SPIM supports only discrete rates (1/2/4/8 MHz etc.).
- * 2 MHz is the closest option to the ideal ~2.4 MHz; 4 MHz gives T1H = 500 ns
- * which is below the 650 ns T1H minimum and is worse. Verify with oscilloscope.
+ * The nRF52833 PWM peripheral does exactly that. Each instance plays a sequence
+ * of duty-cycle values out of RAM by DMA, one value per period, with no CPU
+ * involvement. There are four instances (PWM0-3) and four data lines, so every
+ * line gets its own and all four transmit simultaneously.
  *
- * 24 bits/LED × 3 SPI bits = 72 SPI bits = 9 bytes/LED.
- * Wire order is GRB; swap R↔G at encode time.
+ * Timing, base clock 16 MHz (62.5 ns/tick), TOP = 20 ticks = 1.25 us period:
  *
- * SPI lines (SPIM1, SPIM2, SPIM3) fire in parallel for rows 0-5.
- * Row 6 (P0.03) is sent sequentially on SPIM3 after rows 4-5 complete.
- * SPIM0 is unavailable: it shares hardware with TWIM0 (I2C0 @ 0x40003000).
+ *   bit 0 :  6 ticks high = 375.0 ns   (datasheet T0H 400 ns +/-150 -> 250-550)
+ *   bit 1 : 13 ticks high = 812.5 ns   (datasheet T1H 800 ns +/-150 -> 650-950)
+ *
+ * Both sit comfortably mid-range. The previous SPI approach could only produce
+ * T1H = 1000 ns, outside the 950 ns maximum, which genuine parts tolerate and
+ * clones frequently do not.
+ *
+ * In each 16-bit sequence value, bit 15 selects polarity and bits 14-0 are the
+ * compare value. With bit 15 set the output starts high and falls at compare,
+ * so the value is simply the high time — which is what WS2812B encodes.
+ *
+ * Why not SPI: driving WS2812B from SPIM needs SCK assigned to a physical pin
+ * because the shift register is clocked from it, and this board has no pin to
+ * spare for a signal that goes nowhere. On hardware, SPIM1 and SPIM2 returned
+ * -ETIMEDOUT on every transfer with SCK unassigned. PWM needs no such stub, and
+ * it also removes the interrupt-locked bitbang that row 6 previously required.
  */
 
-/* Row 6 bitbang on P0.03
- * ---------------------
- * The nRF52833 has no PIO block. The closest equivalent is PWM + EasyDMA:
- * preload a buffer of 16-bit duty-cycle values (one per WS2812B bit) and the
- * PWM peripheral generates the waveform on any GPIO pin without CPU involvement.
- * PWM0-3 are all free (separate hardware blocks from SPIM/TWIM).
- *
- * For now, row 6 uses a simple bit-bang. The CPU disables interrupts and
- * toggles P0.03 via direct OUTSET/OUTCLR register writes with nop delays.
- * At 64 MHz: 1 nop ≈ 15.6 ns. Interrupt-off window: 20 LEDs × 24 bits × 1250 ns ≈ 600 µs.
- *
- * TODO: migrate row 6 to PWM0 + EasyDMA for zero CPU cost and deterministic
- *       timing without the ~585 µs interrupt-disable window that can cause BLE
- *       connection supervision timeouts at short connection intervals.
- */
-#define ROW6_PORT  0
-#define ROW6_PIN   3   /* P0.03 */
-#define ROW6_MASK  BIT(3)
+#define PWM_TOP        20              /* 20 ticks @ 16 MHz = 1.25 us */
+#define PWM_BIT_0      (0x8000u | 6)   /* 375.0 ns high */
+#define PWM_BIT_1      (0x8000u | 13)  /* 812.5 ns high */
+#define PWM_LINE_LOW   (0x8000u | 0)   /* compare 0 -> low for the whole period */
 
-/*
- * Nop delay macros. Calibrated for 64 MHz with flash cache warm (1 nop ≈ 15.6 ns).
- * Peripheral register writes (OUTSET/OUTCLR) take ~2 APB cycles ≈ 31 ns each.
- * Verify high/low pulse widths with an oscilloscope on first board bring-up.
- *
- * Target: T1H ≈ 580 ns, T0H ≈ 220 ns, bit period ≈ 1250 ns.
- *   T1: OUTSET(2) + nop×35(35) + OUTCLR(2) = 39 cycles H ≈ 609 ns
- *       OUTSET(2) + nop×35(35) + OUTCLR(2) = 39 cycles L ≈ 609 ns  → period ≈ 1218 ns
- *   T0: OUTSET(2) + nop×12(12) + OUTCLR(2) = 16 cycles H ≈ 250 ns
- *       OUTSET(2) + nop×58(58) + OUTCLR(2) = 62 cycles L ≈ 969 ns  → period ≈ 1219 ns
- */
-#define _NOP()  __asm__ volatile ("nop" ::: "memory")
-#define NOP2    _NOP(); _NOP()
-#define NOP4    NOP2; NOP2
-#define NOP8    NOP4; NOP4
-#define NOP12   NOP8; NOP4
-#define NOP16   NOP8; NOP8
-#define NOP35   NOP16; NOP16; NOP2; _NOP()
-#define NOP58   NOP35; NOP16; NOP4; NOP2; _NOP()
+/* WS2812B latches a frame after the data line is held low for >280 us.
+ * 280 us / 1.25 us = 224 periods; 240 gives margin. This costs no memory:
+ * end_delay repeats the final sequence value, which is why every sequence is
+ * terminated with one PWM_LINE_LOW word. */
+#define LATCH_PERIODS  240
 
-/* Upper bound on how long one strip's DMA may take before we give up on it.
- * 360 bytes at 2 MHz ≈ 1.5 ms; 50 ms means only a genuinely stuck transfer
- * trips it. */
+#define BITS_PER_LED   24              /* GRB, 8 bits each */
+
+#define LEDS_L1        40  /* rows 0-1, P0.29 */
+#define LEDS_L2        40  /* rows 2-3, P0.28 */
+#define LEDS_L3        40  /* rows 4-5, P0.02 */
+#define LEDS_L4        20  /* row 6,    P0.03 */
+
+/* Upper bound on how long a frame may take before we give up on it. A full
+ * line is 40 x 24 x 1.25 us = 1.2 ms plus a 300 us latch, so 50 ms only trips
+ * on something genuinely stuck. */
 #define COMMIT_TIMEOUT_MS 50
 
-#define BYTES_PER_LED 9   /* 24 bits × 3 SPI bits / 8 = 9 bytes */
-#define LEDS_01       40  /* rows 0-1: SPIM1 (P0.29) */
-#define LEDS_23       40  /* rows 2-3: SPIM2 (P0.28) */
-#define LEDS_45       40  /* rows 4-5: SPIM3 (P0.02) */
-#define LEDS_6        20  /* row 6:    P0.03 bitbang  */
+/* Sequence buffers. One 16-bit duty value per WS2812B bit, plus one trailing
+ * low word for the latch. EasyDMA requires these in RAM. */
+static uint16_t seq_l1[LEDS_L1 * BITS_PER_LED + 1];
+static uint16_t seq_l2[LEDS_L2 * BITS_PER_LED + 1];
+static uint16_t seq_l3[LEDS_L3 * BITS_PER_LED + 1];
+static uint16_t seq_l4[LEDS_L4 * BITS_PER_LED + 1];
 
-/* DMA buffers — placed in RAM, naturally aligned for EasyDMA */
-static uint8_t buf01[LEDS_01 * BYTES_PER_LED];
-static uint8_t buf23[LEDS_23 * BYTES_PER_LED];
-static uint8_t buf45[LEDS_45 * BYTES_PER_LED];
-static uint8_t buf6 [LEDS_6  * BYTES_PER_LED];
-
-/* SPI devices from DTS */
-static const struct device *spi1 = DEVICE_DT_GET(DT_NODELABEL(spi1));
-static const struct device *spi2 = DEVICE_DT_GET(DT_NODELABEL(spi2));
-static const struct device *spi3 = DEVICE_DT_GET(DT_NODELABEL(spi3));
-
-static const struct spi_config spi_cfg = {
-	.frequency = 2000000,
-	.operation = SPI_WORD_SET(8) | SPI_OP_MODE_MASTER | SPI_TRANSFER_MSB,
+static nrfx_pwm_t pwm[4] = {
+	NRFX_PWM_INSTANCE(0),
+	NRFX_PWM_INSTANCE(1),
+	NRFX_PWM_INSTANCE(2),
+	NRFX_PWM_INSTANCE(3),
 };
 
-/* Semaphores signalled by the async SPI callbacks */
-static struct k_sem done1, done2, done3;
+static nrf_pwm_sequence_t pwm_seq[4];
+static bool pwm_ready;
 
-/* Protects the full led_commit() sequence (DMA + bitbang).
- * display_off() acquires this before suspending the sand thread so it
- * cannot suspend mid-DMA leaving semaphores stuck at zero. */
+/* Protects the full led_commit() sequence.
+ * display_off() acquires this before suspending the sand thread so it cannot
+ * suspend mid-transfer. */
 K_MUTEX_DEFINE(led_commit_mutex);
 
 /* Protects all writes to led_mask[] from concurrent contexts
@@ -121,41 +102,14 @@ uint32_t       led_current_budget = 45000; /* auto-dim when total channel sum ex
  * WS2812B encoding
  * -------------------------------------------------------------------------- */
 
-/*
- * Encode one byte of LED data (one colour channel) into 3 SPI bytes.
- *
- * Each input bit maps to the 3-bit SPI pattern:
- *   bit=1 → 110  (0xC, 0x8 packed — see below)
- *   bit=0 → 100  (0x4, 0x0 packed — see below)
- *
- * 8 input bits × 3 SPI bits = 24 SPI bits = 3 SPI bytes, packed MSB-first.
- * The three output bytes share boundaries between encoded bits:
- *   out[0]: bits [23:16]  = encode(b7) | encode(b6)[2:1]
- *   out[1]: bits [15:8]   = encode(b6)[0] | encode(b5) | encode(b4)[2]
- *   out[2]: bits [7:0]    = encode(b4)[1:0] | encode(b3) | encode(b2) | ...
- *
- * Built via a 24-bit shift register then split to bytes.
- */
-static void encode_byte(uint8_t val, uint8_t *out)
+/* Expand one pixel into 24 PWM duty values. Wire order is GRB, MSB first. */
+static void encode_led(const struct led_rgb *c, uint16_t *out)
 {
-	uint32_t bits = 0;
+	uint32_t grb = ((uint32_t)c->g << 16) | ((uint32_t)c->r << 8) | c->b;
 
-	for (int i = 7; i >= 0; i--) {
-		/* T1=110 (6), T0=100 (4) in the 3 LSBs */
-		bits = (bits << 3) | ((val >> i & 1) ? 6u : 4u);
+	for (int bit = BITS_PER_LED - 1; bit >= 0; bit--) {
+		*out++ = (grb & BIT(bit)) ? PWM_BIT_1 : PWM_BIT_0;
 	}
-
-	out[0] = (bits >> 16) & 0xFF;
-	out[1] = (bits >>  8) & 0xFF;
-	out[2] =  bits        & 0xFF;
-}
-
-static void encode_led(const struct led_rgb *c, uint8_t *out)
-{
-	/* WS2812B wire order: GRB */
-	encode_byte(c->g, out);
-	encode_byte(c->r, out + 3);
-	encode_byte(c->b, out + 6);
 }
 
 /* --------------------------------------------------------------------------
@@ -163,18 +117,18 @@ static void encode_led(const struct led_rgb *c, uint8_t *out)
  * --------------------------------------------------------------------------
  *
  * col: 0-19 left→right, row: 0-6 top→bottom.
- * Returns the SPI strip index (0-3) and the pixel offset within that strip.
+ * Returns the strip index (0-3) and the pixel offset within that strip.
  *
  * Wiring is snake: even rows run L→R (index 0-19),
- * odd rows run R→L (index 20-39 within the same strip buffer).
+ * odd rows run R→L (index 20-39 within the same strip).
  *
- *   Strip 0 (SPIM1): row 0 → pixels  0-19  (L→R)
- *                    row 1 → pixels 20-39  (R→L, i.e. col 0 → pixel 39)
- *   Strip 1 (SPIM2): row 2 → pixels  0-19
- *                    row 3 → pixels 20-39
- *   Strip 2 (SPIM3): row 4 → pixels  0-19
- *                    row 5 → pixels 20-39
- *   Strip 3 (row 6): row 6 → pixels  0-19  (L→R, single row)
+ *   Strip 0 (PWM0, P0.29): row 0 → pixels  0-19  (L→R)
+ *                          row 1 → pixels 20-39  (R→L, col 0 → pixel 39)
+ *   Strip 1 (PWM1, P0.28): row 2 → pixels  0-19
+ *                          row 3 → pixels 20-39
+ *   Strip 2 (PWM2, P0.02): row 4 → pixels  0-19
+ *                          row 5 → pixels 20-39
+ *   Strip 3 (PWM3, P0.03): row 6 → pixels  0-19  (L→R, single row)
  */
 static void pixel_to_physical(int col, int row, int *strip, int *pixel)
 {
@@ -204,11 +158,11 @@ static struct led_rgb composite(int col, int row)
 	return (struct led_rgb){0, 0, 0};
 }
 
-/* Build all four SPI buffers from the current mask + color state.
+/* Build all four PWM sequences from the current mask + color state.
  *
  * Two-pass approach:
  *   Pass 1 — composite + clamp to effective brightness → accumulate channel sum
- *   Pass 2 — apply current-limit scale factor → encode to SPI buffers
+ *   Pass 2 — apply current-limit scale factor → encode into the sequences
  *
  * Effective brightness = MIN(led_brightness, led_max_brightness).
  * Current scale        = MIN(1.0, led_current_budget / total_sum).
@@ -253,8 +207,8 @@ static void build_buffers(void)
 		scale = (budget << 8) / total;
 	}
 
-	/* Pass 2: apply current scale → encode → SPI buffers */
-	uint8_t *strips[4] = {buf01, buf23, buf45, buf6};
+	/* Pass 2: apply current scale → encode → PWM sequences */
+	uint16_t *strips[4] = {seq_l1, seq_l2, seq_l3, seq_l4};
 
 	for (int row = 0; row < LED_ROWS; row++) {
 		for (int col = 0; col < LED_COLS; col++) {
@@ -267,144 +221,102 @@ static void build_buffers(void)
 			}
 
 			int strip, pixel;
+
 			pixel_to_physical(col, row, &strip, &pixel);
-			encode_led(&c, strips[strip] + pixel * BYTES_PER_LED);
+			encode_led(&c, strips[strip] + pixel * BITS_PER_LED);
 		}
 	}
-}
-
-/* --------------------------------------------------------------------------
- * Async SPI callbacks
- * -------------------------------------------------------------------------- */
-
-static void cb1(const struct device *dev, int result, void *userdata)
-{
-	ARG_UNUSED(dev); ARG_UNUSED(result); ARG_UNUSED(userdata);
-	k_sem_give(&done1);
-}
-
-static void cb2(const struct device *dev, int result, void *userdata)
-{
-	ARG_UNUSED(dev); ARG_UNUSED(result); ARG_UNUSED(userdata);
-	k_sem_give(&done2);
-}
-
-static void cb3(const struct device *dev, int result, void *userdata)
-{
-	ARG_UNUSED(dev); ARG_UNUSED(result); ARG_UNUSED(userdata);
-	k_sem_give(&done3);
 }
 
 /* --------------------------------------------------------------------------
  * Public API
  * -------------------------------------------------------------------------- */
 
-/*
- * Bitbang WS2812B on P0.03 (row 6, 20 LEDs).
- *
- * Sends buf6 with interrupts locked. The nop counts give approximately:
- *   T1H ≈ 609 ns, T0H ≈ 250 ns, bit period ≈ 1219 ns
- * WS2812B tolerates ±150 ns on pulse widths, so these land safely in-spec.
- * Interrupt-off window: 20 × 24 × 1219 ns ≈ 585 µs.
- */
-static void __attribute__((noinline, optimize("O2"))) ws2812_bitbang_row6(void)
-{
-	NRF_GPIO_Type *port = nrf_gpio_pin_port_decode(
-				&(uint32_t){NRF_GPIO_PIN_MAP(ROW6_PORT, ROW6_PIN)});
-	unsigned int key = irq_lock();
-
-	for (int i = 0; i < (int)sizeof(buf6); i++) {
-		uint8_t byte = buf6[i];
-
-		for (int bit = 7; bit >= 0; bit--) {
-			if (byte & BIT(bit)) {
-				port->OUTSET = ROW6_MASK;
-				NOP35;
-				port->OUTCLR = ROW6_MASK;
-				NOP35;
-			} else {
-				port->OUTSET = ROW6_MASK;
-				NOP12;
-				port->OUTCLR = ROW6_MASK;
-				NOP58;
-			}
-		}
-	}
-
-	irq_unlock(key);
-
-	/* WS2812B reset: hold data line low for >280 µs to latch the frame. */
-	k_busy_wait(300);
-}
-
 void led_matrix_init(void)
 {
-	if (!device_is_ready(spi1) || !device_is_ready(spi2) || !device_is_ready(spi3)) {
-		LOG_ERR("SPI device(s) not ready");
-		return;
+	static const uint32_t pins[4] = {
+		NRF_GPIO_PIN_MAP(0, 29),   /* line 1, rows 0-1 */
+		NRF_GPIO_PIN_MAP(0, 28),   /* line 2, rows 2-3 */
+		NRF_GPIO_PIN_MAP(0, 2),    /* line 3, rows 4-5 */
+		NRF_GPIO_PIN_MAP(0, 3),    /* line 4, row 6    */
+	};
+	static uint16_t *const seqs[4] = {seq_l1, seq_l2, seq_l3, seq_l4};
+	static const uint16_t lens[4] = {
+		ARRAY_SIZE(seq_l1), ARRAY_SIZE(seq_l2),
+		ARRAY_SIZE(seq_l3), ARRAY_SIZE(seq_l4),
+	};
+
+	for (int i = 0; i < 4; i++) {
+		nrfx_pwm_config_t cfg = NRFX_PWM_DEFAULT_CONFIG(
+			pins[i],
+			NRF_PWM_PIN_NOT_CONNECTED,
+			NRF_PWM_PIN_NOT_CONNECTED,
+			NRF_PWM_PIN_NOT_CONNECTED);
+
+		cfg.base_clock = NRF_PWM_CLK_16MHz;
+		cfg.count_mode = NRF_PWM_MODE_UP;
+		cfg.top_value  = PWM_TOP;
+		cfg.load_mode  = NRF_PWM_LOAD_COMMON;
+		cfg.step_mode  = NRF_PWM_STEP_AUTO;
+
+		/* NULL handler: playback is polled rather than interrupt-driven, so
+		 * no PWM IRQ has to be routed through nrfx_glue and no ISR runs
+		 * during a frame. */
+		nrfx_err_t err = nrfx_pwm_init(&pwm[i], &cfg, NULL, NULL);
+
+		if (err != NRFX_SUCCESS) {
+			LOG_ERR("PWM%d init failed: 0x%08x", i, (unsigned int)err);
+			return;
+		}
+
+		/* Terminate with a low period; end_delay then holds the line low
+		 * long enough for the WS2812B latch without extra memory. */
+		seqs[i][lens[i] - 1] = PWM_LINE_LOW;
+
+		pwm_seq[i].values.p_common = seqs[i];
+		pwm_seq[i].length          = lens[i];
+		pwm_seq[i].repeats         = 0;
+		pwm_seq[i].end_delay       = LATCH_PERIODS;
 	}
-
-	k_sem_init(&done1, 0, 1);
-	k_sem_init(&done2, 0, 1);
-	k_sem_init(&done3, 0, 1);
-
-	/* Configure P0.03 as output low for row 6 bitbang */
-	nrf_gpio_cfg_output(NRF_GPIO_PIN_MAP(ROW6_PORT, ROW6_PIN));
-	nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(ROW6_PORT, ROW6_PIN));
 
 	memset(led_color, 0, sizeof(led_color));
 	memset(led_mask,  0, sizeof(led_mask));
+	pwm_ready = true;
 
-	LOG_INF("LED matrix ready (rows 0-5 parallel DMA, row 6 bitbang)");
+	LOG_INF("LED matrix ready (4x PWM + EasyDMA, all lines parallel)");
 }
 
 void led_commit(void)
 {
+	if (!pwm_ready) {
+		return;
+	}
+
 	k_mutex_lock(&led_commit_mutex, K_FOREVER);
 
 	build_buffers();
 
-	/* Parallel async transfers for rows 0-5 */
-	static struct spi_buf tx1_buf = {.buf = buf01, .len = sizeof(buf01)};
-	static struct spi_buf tx2_buf = {.buf = buf23, .len = sizeof(buf23)};
-	static struct spi_buf tx3_buf = {.buf = buf45, .len = sizeof(buf45)};
-	static struct spi_buf_set tx1 = {.buffers = &tx1_buf, .count = 1};
-	static struct spi_buf_set tx2 = {.buffers = &tx2_buf, .count = 1};
-	static struct spi_buf_set tx3 = {.buffers = &tx3_buf, .count = 1};
-
-	/* Clear any stale give from a previous frame that timed out after its
-	 * transfer eventually completed. Without this, the take below would
-	 * return immediately while DMA is still reading the buffer. */
-	k_sem_reset(&done1);
-	k_sem_reset(&done2);
-	k_sem_reset(&done3);
-
-	int rc1 = spi_transceive_cb(spi1, &spi_cfg, &tx1, NULL, cb1, NULL);
-	int rc2 = spi_transceive_cb(spi2, &spi_cfg, &tx2, NULL, cb2, NULL);
-	int rc3 = spi_transceive_cb(spi3, &spi_cfg, &tx3, NULL, cb3, NULL);
-
-	if (rc1 || rc2 || rc3) {
-		LOG_ERR("SPI start failed: %d %d %d", rc1, rc2, rc3);
+	/* Start all four. They run concurrently in hardware, so a frame costs
+	 * the length of one line (~1.2 ms) rather than the sum of all four. */
+	for (int i = 0; i < 4; i++) {
+		(void)nrfx_pwm_simple_playback(&pwm[i], &pwm_seq[i], 1,
+					       NRFX_PWM_FLAG_STOP);
 	}
 
-	/* Only wait on transfers that actually started — a failed start means
-	 * its callback never runs. Waiting forever here would wedge this thread
-	 * while holding led_commit_mutex, which also deadlocks display_off().
-	 *
-	 * 360 bytes at 2 MHz is ~1.5 ms, so COMMIT_TIMEOUT_MS is generous.
-	 * Timing out costs one frame instead of the whole display. */
-	if (!rc1 && k_sem_take(&done1, K_MSEC(COMMIT_TIMEOUT_MS))) {
-		LOG_ERR("SPI1 transfer timed out");
-	}
-	if (!rc2 && k_sem_take(&done2, K_MSEC(COMMIT_TIMEOUT_MS))) {
-		LOG_ERR("SPI2 transfer timed out");
-	}
-	if (!rc3 && k_sem_take(&done3, K_MSEC(COMMIT_TIMEOUT_MS))) {
-		LOG_ERR("SPI3 transfer timed out");
-	}
+	/* Wait for playback to finish before releasing the buffers to the next
+	 * frame. Bounded: a stuck instance costs one frame, not the display. */
+	int64_t deadline = k_uptime_get() + COMMIT_TIMEOUT_MS;
 
-	/* Row 6 (P0.03, 20 LEDs): bitbang after parallel DMA completes */
-	ws2812_bitbang_row6();
+	for (int i = 0; i < 4; i++) {
+		while (!nrfx_pwm_stopped_check(&pwm[i])) {
+			if (k_uptime_get() > deadline) {
+				LOG_ERR("PWM%d did not stop within %d ms",
+					i, COMMIT_TIMEOUT_MS);
+				break;
+			}
+			k_msleep(1);
+		}
+	}
 
 	k_mutex_unlock(&led_commit_mutex);
 }

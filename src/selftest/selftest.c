@@ -419,10 +419,10 @@ static void test_leds(void)
 		const char *name;
 		int lo, hi;
 	} lines[] = {
-		{"line 1  P0.29  rows 0-1  (40 LEDs)", 0, 1},
-		{"line 2  P0.28  rows 2-3  (40 LEDs)", 2, 3},
-		{"line 3  P0.02  rows 4-5  (40 LEDs)", 4, 5},
-		{"line 4  P0.03  row 6     (20 LEDs, bitbang)", 6, 6},
+		{"line 1  PWM0 P0.29  rows 0-1  (40 LEDs)", 0, 1},
+		{"line 2  PWM1 P0.28  rows 2-3  (40 LEDs)", 2, 3},
+		{"line 3  PWM2 P0.02  rows 4-5  (40 LEDs)", 4, 5},
+		{"line 4  PWM3 P0.03  row 6     (20 LEDs)", 6, 6},
 	};
 
 	printk("\n-- LED matrix --------------------------------------------\n");
