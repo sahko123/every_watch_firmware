@@ -135,12 +135,26 @@
 	bq27441: bq27441@55 {
 		compatible = "ti,bq274xx";
 		reg = <0x55>;
-		/* IMPORTANT: set design-capacity to match the actual battery cell (mAh).
-		 * Wrong value causes inaccurate state-of-charge readings from BQ27441.
-		 * Check the battery datasheet and update before shipping. */
-		design-capacity = <300>;
+		/* design-capacity MUST match the cell actually fitted, in mAh. The
+		 * BQ27441 scales every state-of-charge figure by it, so a wrong
+		 * value does not just skew the percentage — it is what made the
+		 * gauge report 5-10% on a healthy 3.65 V battery during bring-up
+		 * and left the low-battery indicator permanently asserted.
+		 *
+		 * Currently 400 mAh: the cell to hand. Update this one number when
+		 * a larger cell goes in — nothing else in the firmware needs to
+		 * change, and the low-battery warning triggers on voltage so it
+		 * stays correct either way.
+		 *
+		 * The driver writes this to the gauge at init, but the BQ27441
+		 * still refines its own model over a full charge/discharge cycle,
+		 * so expect the percentage to be approximate until then. */
+		design-capacity = <400>;
 		design-voltage = <3700>;   /* mV nominal */
-		taper-current = <45>;      /* mA */
+		/* Charge-termination current. Convention is C/10, so 40 mA at
+		 * 400 mAh. Ideally match whatever the SGM41524 actually terminates
+		 * at rather than the convention. */
+		taper-current = <40>;      /* mA */
 		terminate-voltage = <3000>; /* mV cutoff */
 	};
 };
