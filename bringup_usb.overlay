@@ -1,0 +1,21 @@
+/*
+ * Devicetree overlay for the USB CDC console bring-up build.
+ *
+ *   west build -b every_watch/nrf52833 every_watch_firmware \
+ *       -- -DEXTRA_CONF_FILE=bringup_usb.conf \
+ *          -DEXTRA_DTC_OVERLAY_FILE=bringup_usb.overlay
+ *
+ * Deliberately kept out of the board DTS: the production image has no console
+ * at all, and pointing zephyr,console at cdc_acm_uart0 there would pull the
+ * whole USB device stack into every build.
+ *
+ * cdc_acm_uart0 itself is declared in the board DTS because MCUboot needs it
+ * for the USB DFU class; this overlay only routes the console to it.
+ */
+
+/ {
+	chosen {
+		zephyr,console = &cdc_acm_uart0;
+		zephyr,shell-uart = &cdc_acm_uart0;
+	};
+};

@@ -1,0 +1,193 @@
+# Every Watch — firmware
+
+Zephyr firmware for the Every Watch: an nRF52833 wearable with a 20×7 WS2812B
+matrix, a falling-sand simulation that reveals the time as particles clear, and
+a BLE proximity-encounter system.
+
+Open by design — build it, modify it, flash it. The BLE protocol is documented
+so anyone can write a companion app, and images are unsigned so you don't need
+our keys.
+
+See [FIRMWARE_PLAN.md](FIRMWARE_PLAN.md) for hardware detail and architecture.
+
+---
+
+## Toolchain
+
+nRF Connect SDK **v2.7.0**. The Nordic toolchain bundle ships its own Python,
+CMake, Ninja and ARM GCC, so nothing else needs installing.
+
+```bash
+# 1. nRF Util (~6 MB) — put it somewhere on PATH
+curl -L -o nrfutil.exe https://files.nordicsemi.com/artifactory/swtools/external/nrfutil/executables/x86_64-pc-windows-msvc/nrfutil.exe
+
+# 2. Toolchain bundle (~2 GB)
+nrfutil install toolchain-manager
+nrfutil toolchain-manager install --ncs-version v2.7.0
+```
+
+## Workspace
+
+This repository *is* the west manifest repo, so it has to live inside the
+workspace rather than the other way round:
+
+```bash
+west init -m https://github.com/sahko123/every_watch_firmware --mr master C:/ewdev
+cd C:/ewdev
+west update            # ~5 GB, 30-60 min
+```
+
+> **Use a short, space-free path.** Zephyr's CMake does not survive paths
+> containing spaces or `!`. On Windows, `C:\ewdev` plus a junction
+> (`mklink /J W:\ew C:\ewdev`) works well if you want it visible elsewhere.
+
+Every `west` command below runs inside the toolchain environment:
+
+```bash
+nrfutil toolchain-manager launch --ncs-version v2.7.0 -- west build ...
+```
+
+## Building
+
+Run these from the workspace root (`C:/ewdev`).
+
+**Production image** — no console, logging at ERROR, `-Os`:
+
+```bash
+west build -b every_watch/nrf52833 every_watch_firmware -p always
+```
+
+**Bring-up image, RTT console** — use this for first power-on. Adds the
+hardware self-test, full logging and a Zephyr shell, over SEGGER RTT on the SWD
+pads. RTT is alive from the first instruction, so it catches failures that
+happen long before USB could enumerate:
+
+```bash
+west build -b every_watch/nrf52833 every_watch_firmware -p always -d build_bringup \
+    -- -DEXTRA_CONF_FILE=bringup.conf
+```
+
+**Bring-up image, USB CDC console** — same thing with the console on the USB
+port as a virtual COM port, for once the board is known good and you no longer
+want a debugger attached:
+
+```bash
+west build -b every_watch/nrf52833 every_watch_firmware -p always -d build_usb \
+    -- -DEXTRA_CONF_FILE=bringup_usb.conf -DEXTRA_DTC_OVERLAY_FILE=bringup_usb.overlay
+```
+
+Approximate sizes (slot is 450,048 B):
+
+| Build | Flash | RAM |
+|---|---:|---:|
+| Production | 229 KB (51%) | 38 KB (29%) |
+| Bring-up, RTT | 353 KB (78%) | 52 KB (40%) |
+| Bring-up, USB CDC | 373 KB (83%) | 59 KB (45%) |
+
+> Do **not** pass `--sysbuild`. This app builds through the legacy child-image
+> path, and `sysbuild/mcuboot.conf` is stale — it is missing the single-slot and
+> USB DFU settings that `pm_static.yml` and the in-app DFU trigger depend on.
+
+## Flashing
+
+**The first flash must be over SWD.** USB DFU is provided *by* MCUboot, so
+MCUboot has to be on the chip before USB flashing can work at all. Connect a
+J-Link (or an nRF52840 DK acting as one) to the SWD pads:
+
+```bash
+west flash                      # flashes MCUboot + app (merged.hex)
+```
+
+**After that, updates go over USB.** Hold the **left button for 3 seconds** —
+the app reboots into MCUboot, which opens a 5-second USB DFU window:
+
+```bash
+dfu-util -d 2fe3:0100 -a 0 -D build/zephyr/app_update.bin
+```
+
+This works on battery power too: plug USB in first, then hold the button.
+
+## Watching the console
+
+RTT build, with the J-Link attached:
+
+```bash
+JLinkRTTViewer            # or: JLinkRTTClient
+```
+
+Logs are on RTT buffer 0, the interactive shell on buffer 1.
+
+USB CDC build: open the virtual COM port with any terminal at any baud rate
+(CDC ignores it).
+
+## First bring-up
+
+Flash the RTT bring-up image over SWD and watch the console. `CONFIG_EW_SELFTEST`
+runs before any application thread starts and reports PASS/FAIL for:
+
+- **I2C** — full bus scan, then a targeted probe of all four expected devices
+  (0x23 BH1750, 0x32 FRTC8900, 0x55 BQ27441, 0x68 BMI270)
+- **RTC** — set a known time, read it back, confirm seconds advance. This is the
+  riskiest part of the system: the FRTC8900 driver is custom, out-of-tree, and
+  has never run on hardware
+- **IMU** — fetch accel, print all three axes, sanity-check the gravity vector
+  magnitude
+- **Light / battery** — read lux, voltage and state of charge
+- **GPIO** — charge indicator state
+- **LEDs** — each data line in red/green/blue, then a single-pixel walk across
+  the whole grid. *Watch this one.* A dark line means a bad solder joint on that
+  pin; a row that runs backwards means the snake mapping in
+  `pixel_to_physical()` is wrong; wrong colours mean the GRB swap is wrong
+- **Buttons** — prompts for a left then a right press
+
+The self-test **sets the RTC to a fixed date** as part of testing it. Re-sync
+over BLE afterwards.
+
+Set `CONFIG_EW_SELFTEST_HALT_ON_FAIL=y` to stop before starting the application
+when any check fails — intended for an end-of-line manufacturing test rather
+than bring-up.
+
+### Known open items
+
+Things to check with a scope or meter on first hardware, all flagged in the
+source:
+
+- **WS2812B T1H is marginally out of spec.** SPI at 2 MHz gives a 1000 ns high
+  pulse for a `1`; the datasheet says 800 ns ±150. Genuine parts usually
+  tolerate it, clones often do not. Scope P0.29 early
+- **Row 6 locks interrupts for ~585 µs per frame.** It is bit-banged on P0.03
+  because SPIM0 is unavailable (it shares hardware with TWIM0). At 30 fps this
+  is very likely to disturb BLE connection events. The fix is PWM0 + EasyDMA —
+  see the TODO in `led_matrix.c`
+- **LFXO not confirmed.** The DTS assumes the internal RC oscillator. If a
+  32.768 kHz crystal is populated, enable it (`&clock { lf-clk-src = <1>; }`)
+  for better BLE timing and lower power
+- **Fuel gauge capacity is a placeholder.** `design-capacity = <300>` in the DTS
+  must match the real cell or state-of-charge readings will be wrong
+- **IMU axis signs are unverified.** Tilting right should push sand right
+- **No deep sleep yet.** `CONFIG_PM=y` is set but nothing drives it; BLE scans
+  and advertises continuously. The power figures in FIRMWARE_PLAN.md are targets,
+  not measurements
+- **Button UX is not implemented.** Both buttons currently just wake the
+  display; the left/right short/long mapping in the plan does not exist yet
+
+## Layout
+
+```
+boards/arm/every_watch/   board definition, pinctrl, flash partitions
+child_image/mcuboot.conf  MCUboot config (single-slot + USB DFU) — the live one
+sysbuild/                 stale, unused — see the --sysbuild warning above
+pm_static.yml             static flash layout
+src/led_matrix/           WS2812B encoding, compositor, parallel DMA commit
+src/sand/                 falling-sand cellular automaton, 30 Hz
+src/time_display/         3×5 digit font, HH:MM onto the digit layer
+src/display/              on/off state, button interrupts, auto-off timer
+src/imu/                  BMI270 → gravity vector
+src/identity/             watch identity hash, encounter counters in NVS
+src/ble/                  advertising, encounter scanning, GATT, notifications
+src/battery/ src/light/   fuel gauge and ambient light
+src/selftest/             bring-up hardware self-test (CONFIG_EW_SELFTEST)
+```
+
+The FRTC8900 RTC driver is a separate west module:
+[sahko123/frtc8900-zephyr](https://github.com/sahko123/frtc8900-zephyr).
