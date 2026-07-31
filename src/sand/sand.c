@@ -30,6 +30,12 @@ static uint32_t rand32(void)
 
 static uint8_t grid[LED_ROWS][LED_COLS]; /* 1 = particle, 0 = empty */
 
+/* Constrained (time reveal) mode. target[] is the shape being filled; when
+ * constrained is set the simulation ignores the gravity vector entirely and
+ * runs straight down, so the reveal looks identical however the watch is held. */
+static uint8_t target[LED_ROWS][LED_COLS];
+static bool    constrained;
+
 /* Default gravity: straight down. GRAVITY_Q8_1G defined in sand.h. */
 static struct sand_gravity gravity = {.col = 0, .row = GRAVITY_Q8_1G};
 static K_MUTEX_DEFINE(sand_mutex);
@@ -151,6 +157,76 @@ static void tick(void)
 	}
 }
 
+/* -------------------------------------------------------------------------
+ * Constrained tick — the time reveal
+ * -------------------------------------------------------------------------*/
+
+/* Lowest cell of the target still empty in this column, or -1 if the column
+ * has nothing left to fill. Particles home to this row and lock there, so the
+ * shape fills from the bottom up. */
+static int landing_row(int col)
+{
+	for (int row = LED_ROWS - 1; row >= 0; row--) {
+		if (target[row][col] && !grid[row][col]) {
+			return row;
+		}
+	}
+	return -1;
+}
+
+/* Keep the waterfall flowing: top up row 0 for any column still being filled.
+ * The random gate staggers the columns — dropping every column on every tick
+ * looks like a descending bar rather than falling sand. */
+static void spawn_stream(void)
+{
+	for (int col = 0; col < LED_COLS; col++) {
+		if (grid[0][col] || landing_row(col) < 0) {
+			continue;
+		}
+		if ((rand32() & 3) == 0) {
+			grid[0][col] = 1;
+		}
+	}
+}
+
+static void tick_constrained(void)
+{
+	spawn_stream();
+
+	/* Bottom-up so a particle cannot be moved twice in one tick: once it
+	 * steps into row+1 that row has already been processed. */
+	for (int row = LED_ROWS - 1; row >= 0; row--) {
+		for (int col = 0; col < LED_COLS; col++) {
+			if (!grid[row][col]) {
+				continue;
+			}
+
+			/* Look for the landing slot with this particle taken out
+			 * of the grid, otherwise one already sitting on its own
+			 * target would see the slot as occupied and drift off. */
+			grid[row][col] = 0;
+			int land = landing_row(col);
+
+			grid[row][col] = 1;
+
+			if (land == row) {
+				continue;              /* locked into the shape */
+			}
+
+			if (row + 1 >= LED_ROWS) {
+				grid[row][col] = 0;    /* nothing to fill: drains away */
+				continue;
+			}
+
+			if (!grid[row + 1][col]) {
+				grid[row][col] = 0;
+				grid[row + 1][col] = 1;
+			}
+			/* else blocked — wait for the one below to settle */
+		}
+	}
+}
+
 /* Copy simulation state into LED_LAYER_SAND.
  * Caller holds sand_mutex; this takes led_mask_mutex for the copy.
  * Does NOT commit — see sand_thread() for why that is kept separate. */
@@ -182,7 +258,11 @@ static void sand_thread(void *p1, void *p2, void *p3)
 
 	while (true) {
 		k_mutex_lock(&sand_mutex, K_FOREVER);
-		tick();
+		if (constrained) {
+			tick_constrained();
+		} else {
+			tick();
+		}
 		publish_mask();
 		k_mutex_unlock(&sand_mutex);
 
@@ -285,6 +365,44 @@ void sand_add_particles(int n)
 	}
 
 	k_mutex_unlock(&sand_mutex);
+}
+
+void sand_set_target(const uint8_t t[LED_ROWS][LED_COLS])
+{
+	k_mutex_lock(&sand_mutex, K_FOREVER);
+
+	if (t != NULL) {
+		memcpy(target, t, sizeof(target));
+		constrained = true;
+	} else {
+		memset(target, 0, sizeof(target));
+		constrained = false;
+	}
+
+	k_mutex_unlock(&sand_mutex);
+}
+
+bool sand_target_complete(void)
+{
+	bool done = true;
+
+	k_mutex_lock(&sand_mutex, K_FOREVER);
+
+	if (!constrained) {
+		done = false;
+	} else {
+		for (int row = 0; row < LED_ROWS && done; row++) {
+			for (int col = 0; col < LED_COLS; col++) {
+				if (target[row][col] && !grid[row][col]) {
+					done = false;
+					break;
+				}
+			}
+		}
+	}
+
+	k_mutex_unlock(&sand_mutex);
+	return done;
 }
 
 void sand_clear(void)

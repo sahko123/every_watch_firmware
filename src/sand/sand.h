@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "led_matrix/led_matrix.h"
+
 /* Q8 fixed-point scale: GRAVITY_Q8_1G = 1.0 g. Scale factor for sensor_value
  * (m/s²): GRAVITY_Q8_1G / 9.8 ≈ 26 counts per m/s². */
 #define GRAVITY_Q8_1G  256
@@ -40,3 +42,25 @@ int sand_count(void);
 /* Suspend / resume the simulation thread (called by display state machine). */
 void sand_suspend(void);
 void sand_resume(void);
+
+/*
+ * Constrained mode — the time reveal.
+ *
+ * Hand it a 7x20 bitmap of cells to fill (the digit shape). The simulation
+ * then switches from free physics to the waterfall:
+ *
+ *   - gravity is fixed straight down and the accelerometer is ignored, so the
+ *     reveal looks the same however the watch is being held
+ *   - particles are streamed into the top of any column that still has cells
+ *     to fill, staggered so the columns do not drop in lockstep
+ *   - a falling particle locks in place when it reaches the lowest cell of the
+ *     target still empty in its column, so the shape fills from the bottom up
+ *   - particles in columns with nothing left to fill keep going and are
+ *     removed at the bottom edge
+ *
+ * Pass NULL to drop back to free physics.
+ */
+void sand_set_target(const uint8_t target[LED_ROWS][LED_COLS]);
+
+/* True once every target cell is occupied. Always false in free mode. */
+bool sand_target_complete(void);

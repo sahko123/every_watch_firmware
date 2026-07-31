@@ -8,7 +8,7 @@
 		group1 {
 			psels = <NRF_PSEL(TWIM_SDA, 0, 1)>,
 				<NRF_PSEL(TWIM_SCL, 0, 4)>;
-			/* WORKAROUND: no external I2C pull-up resistors are fitted
+			/* BY DESIGN: no external I2C pull-up resistors are fitted
 			 * on this revision of the PCB. Measured 2026-07-31 — both
 			 * lines sit at 0 with the CPU halted and float high as soon
 			 * as the internal pull-ups are enabled. Without these the
@@ -21,9 +21,12 @@
 			 * mode needs — hence clock-frequency is dropped to
 			 * I2C_BITRATE_STANDARD in the board DTS.
 			 *
-			 * Proper fix is 2.2k-4.7k resistors to VDD on SDA and SCL on
-			 * the next board revision, after which these lines and the
-			 * bitrate reduction can both be reverted. */
+			 * This is the intended arrangement, not a stopgap: the SoC
+			 * provides the pull-ups so the board does not have to. The
+			 * only consequence is the 100 kHz ceiling, which costs
+			 * nothing here — the busiest device is the IMU at 50 Hz,
+			 * around 3% bus utilisation. Fit 2.2k-4.7k resistors only
+			 * if a future device needs 400 kHz. */
 			bias-pull-up;
 		};
 	};

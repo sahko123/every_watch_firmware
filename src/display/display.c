@@ -2,6 +2,7 @@
 #include "led_matrix/led_matrix.h"
 #include "sand/sand.h"
 #include "imu/imu.h"
+#include "time_display/time_display.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
@@ -45,10 +46,26 @@ static const struct gpio_dt_spec btn_r = GPIO_DT_SPEC_GET(DT_ALIAS(btn_right), g
 static struct gpio_callback btn_l_cb;
 static struct gpio_callback btn_r_cb;
 
+/* Left button additionally starts the time reveal. Deferred to the work queue
+ * like everything else here: the reveal reads the RTC over I2C, which must not
+ * happen in ISR context. */
+static void reveal_work_fn(struct k_work *w)
+{
+	ARG_UNUSED(w);
+	time_display_reveal();
+}
+
+K_WORK_DEFINE(reveal_work, reveal_work_fn);
+
 static void btn_isr(const struct device *port, struct gpio_callback *cb, uint32_t pins)
 {
-	ARG_UNUSED(port); ARG_UNUSED(cb); ARG_UNUSED(pins);
+	ARG_UNUSED(port); ARG_UNUSED(cb);
+
 	k_work_submit(&on_work);
+
+	if (pins & BIT(btn_l.pin)) {
+		k_work_submit(&reveal_work);
+	}
 }
 
 /* -------------------------------------------------------------------------

@@ -1,9 +1,11 @@
 #include "time_display.h"
 #include "led_matrix/led_matrix.h"
+#include "sand/sand.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/rtc.h>
 #include <zephyr/logging/log.h>
+#include <string.h>
 
 LOG_MODULE_REGISTER(time_display, LOG_LEVEL_INF);
 
@@ -49,35 +51,53 @@ static const uint8_t font[10][5] = {
 #define D2_COL     11  /* M tens  */
 #define D3_COL     15  /* M units */
 
-static void stamp_digit(int digit, int col_start)
+/* Scratch bitmap. Built once and then either copied into the digit mask (for a
+ * plain static display) or handed to the sand simulation as a fill target (for
+ * the waterfall reveal). */
+static uint8_t bitmap[LED_ROWS][LED_COLS];
+
+static void stamp_digit(uint8_t out[LED_ROWS][LED_COLS], int digit, int col_start)
 {
 	for (int r = 0; r < 5; r++) {
 		uint8_t row_bits = font[digit][r];
 
 		for (int c = 0; c < 3; c++) {
 			if (row_bits & (0x4 >> c)) {
-				led_mask[LED_LAYER_DIGITS][ROW_OFFSET + r][col_start + c] = 1;
+				out[ROW_OFFSET + r][col_start + c] = 1;
 			}
 		}
 	}
 }
 
-static void stamp_colon(int col)
+static void stamp_colon(uint8_t out[LED_ROWS][LED_COLS], int col)
 {
 	/* Two dots at font rows 1 and 3 */
-	led_mask[LED_LAYER_DIGITS][ROW_OFFSET + 1][col] = 1;
-	led_mask[LED_LAYER_DIGITS][ROW_OFFSET + 3][col] = 1;
+	out[ROW_OFFSET + 1][col] = 1;
+	out[ROW_OFFSET + 3][col] = 1;
 }
 
-static void render_time(int hours, int minutes)
+/* Render HH:MM into the scratch bitmap. Caller decides what to do with it. */
+static void build_bitmap(int hours, int minutes)
+{
+	memset(bitmap, 0, sizeof(bitmap));
+	stamp_digit(bitmap, hours   / 10, D0_COL);
+	stamp_digit(bitmap, hours   % 10, D1_COL);
+	stamp_colon(bitmap, COLON_COL);
+	stamp_digit(bitmap, minutes / 10, D2_COL);
+	stamp_digit(bitmap, minutes % 10, D3_COL);
+}
+
+static void publish_digits(void)
+{
+	k_mutex_lock(&led_mask_mutex, K_FOREVER);
+	memcpy(led_mask[LED_LAYER_DIGITS], bitmap, sizeof(bitmap));
+	k_mutex_unlock(&led_mask_mutex);
+}
+
+static void clear_digits(void)
 {
 	k_mutex_lock(&led_mask_mutex, K_FOREVER);
 	led_mask_clear(LED_LAYER_DIGITS);
-	stamp_digit(hours   / 10, D0_COL);
-	stamp_digit(hours   % 10, D1_COL);
-	stamp_colon(COLON_COL);
-	stamp_digit(minutes / 10, D2_COL);
-	stamp_digit(minutes % 10, D3_COL);
 	k_mutex_unlock(&led_mask_mutex);
 }
 
@@ -87,17 +107,35 @@ static void render_time(int hours, int minutes)
 
 static const struct device *rtc_dev;
 
-static void time_work_fn(struct k_work *work)
+static bool read_time(int *hours, int *minutes)
 {
 	struct rtc_time t = {0};
-	int err = rtc_get_time(rtc_dev, &t);
 
-	if (err) {
-		LOG_WRN("rtc_get_time failed: %d", err);
+	if (rtc_dev == NULL || rtc_get_time(rtc_dev, &t) != 0) {
+		return false;
+	}
+	*hours   = t.tm_hour;
+	*minutes = t.tm_min;
+	return true;
+}
+
+static void time_work_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	int h, m;
+
+	if (!read_time(&h, &m)) {
+		LOG_WRN("rtc_get_time failed");
 		return;
 	}
 
-	render_time(t.tm_hour, t.tm_min);
+	/* While a reveal is in progress the sand is drawing the digits, so
+	 * leave the digit layer alone rather than fighting it. */
+	if (sand_target_complete() || !time_display_revealing()) {
+		build_bitmap(h, m);
+		publish_digits();
+	}
 }
 
 K_WORK_DEFINE(time_work, time_work_fn);
@@ -114,19 +152,60 @@ K_TIMER_DEFINE(time_timer, time_timer_cb, NULL);
  * Public API
  * -------------------------------------------------------------------------- */
 
+static bool revealing;
+
+bool time_display_revealing(void)
+{
+	return revealing;
+}
+
+void time_display_reveal(void)
+{
+	int h, m;
+
+	if (!read_time(&h, &m)) {
+		LOG_WRN("reveal: RTC unreadable");
+		return;
+	}
+
+	build_bitmap(h, m);
+
+	/* The falling particles become the digits, so the static digit layer is
+	 * cleared — otherwise the shape would already be visible underneath and
+	 * there would be nothing to reveal. */
+	clear_digits();
+
+	sand_clear();
+	sand_set_target(bitmap);
+	revealing = true;
+
+	LOG_INF("Time reveal started: %02d:%02d", h, m);
+}
+
+void time_display_stop_reveal(void)
+{
+	if (!revealing) {
+		return;
+	}
+	revealing = false;
+	sand_set_target(NULL);
+	LOG_INF("Time reveal ended");
+}
+
 void time_display_init(const struct device *dev)
 {
 	rtc_dev = dev;
 
-	/* Render immediately so digits appear before sand settles */
-	struct rtc_time t = {0};
+	/* Render immediately so something is on screen before the first tick */
+	int h, m;
 
-	if (rtc_get_time(dev, &t) == 0) {
-		render_time(t.tm_hour, t.tm_min);
+	if (read_time(&h, &m)) {
+		build_bitmap(h, m);
 	} else {
 		/* RTC not set yet — show 00:00 as a placeholder */
-		render_time(0, 0);
+		build_bitmap(0, 0);
 	}
+	publish_digits();
 
 	k_timer_start(&time_timer, K_SECONDS(1), K_SECONDS(1));
 	LOG_INF("Time display started");
