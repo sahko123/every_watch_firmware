@@ -10,6 +10,11 @@
 		/delete-property/ rtc0;
 		/delete-property/ batt0;
 		/delete-property/ light0;
+
+		/* Required by CONFIG_BOOT_USB_DFU_GPIO -- io.c hard-#errors without
+		 * it. MCUboot samples this pin before booting the app: held = stay
+		 * in USB DFU indefinitely, released = boot normally with no delay. */
+		mcuboot-button0 = &button_left;
 	};
 };
 
@@ -20,4 +25,4 @@
 	/delete-node/ bq27441@55;
 };
 
-/* USB stays enabled — MCUboot uses it for the USB DFU WAIT window */
+/* USB stays enabled — MCUboot uses it for USB DFU mode */

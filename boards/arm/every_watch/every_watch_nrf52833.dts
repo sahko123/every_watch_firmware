@@ -12,8 +12,9 @@
 		zephyr,sram           = &sram0;
 		zephyr,flash          = &flash0;
 		zephyr,code-partition = &slot0_partition;
-		/* DFU: MCUboot USB DFU WAIT mode — hold left button 3 s in app to
-		 * reboot into bootloader, then:
+		/* DFU: MCUboot USB DFU GPIO mode — hold the left button through a
+		 * power-on (or through the in-app 3 s hold reboot) and the
+		 * bootloader stays in DFU until flashed:
 		 *   dfu-util -d 2fe3:0100 -a 0 -D build/zephyr/app_update.bin */
 	};
 
@@ -62,13 +63,14 @@
 /* ── Flash partitions ────────────────────────────────────────────────── */
 /* nRF52833: 512 KB flash (0x00000000 – 0x0007FFFF)
  *
- *   MCUboot  :  48 KB  0x00000000 – 0x0000BFFF  (USB DFU WAIT mode)
+ *   MCUboot  :  48 KB  0x00000000 – 0x0000BFFF  (USB DFU GPIO mode, 97% full)
  *   Slot 0   : 448 KB  0x0000C000 – 0x0007BFFF  (single image slot, no slot 1)
  *   Identity :   8 KB  0x0007C000 – 0x0007DFFF  (encounter hashes, enc_count — NVS)
  *   Settings :   8 KB  0x0007E000 – 0x0007FFFF  (Zephyr Settings / BT bond keys)
  *
- * Single-slot: hold left button 3 s -> app reboots -> MCUboot opens 5 s USB
- * DFU window -> dfu-util -d 2fe3:0100 -a 0 -D build/zephyr/app_update.bin
+ * Single-slot: hold the left button through power-on (or through the in-app
+ * 3 s hold reboot) -> MCUboot stays in USB DFU until flashed ->
+ * dfu-util -d 2fe3:0100 -a 0 -D build/zephyr/app_update.bin
  * Matches pm_static.yml. */
 &flash0 {
 	partitions {

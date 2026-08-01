@@ -8,8 +8,11 @@ There is exactly one exception, at the bottom of this document, and it cannot
 occur without physically reflashing the bootloader.
 
 > **Status: proposed, not yet implemented.** The current firmware uses MCUboot's
-> USB DFU class with a 5-second window on every boot. This document describes
-> the design that replaces it. See "Implementation" below for what changes.
+> USB DFU class (`CONFIG_BOOT_USB_DFU_GPIO`), entered by holding the left
+> button through reset and held indefinitely until a transfer completes — not
+> the fixed 5-second window this document was originally written against. The
+> MCUmgr serial-recovery scheme below is still what replaces it; that part
+> hasn't changed. See "Implementation" below for what changes.
 
 ---
 

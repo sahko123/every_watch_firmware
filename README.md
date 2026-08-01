@@ -101,7 +101,16 @@ west build -b every_watch/nrf52833 every_watch_firmware -p always -d build_stage
 ## Flashing
 
 **The first flash must be over SWD.** USB DFU is provided *by* MCUboot, so
-MCUboot has to be on the chip before USB flashing can work at all.
+MCUboot has to be on the chip before USB flashing can work at all. The same
+applies to any later change to MCUboot itself — a bootloader cannot replace
+itself over the update path it provides.
+
+**SWD is still required for recovery.** There is no reset pin and no
+user-accessible power cycle, so "hold the button and apply power" needs the
+battery disconnected. If the app is invalid, MCUboot hits `FIH_PANIC` and halts
+with no watchdog to restart it. Closing this needs MCUboot to start the
+watchdog before chainloading, which does not fit until the RSA-2048 test-key
+signature comes out — the bootloader is at 97% of its 48 KB partition.
 
 ### With a Raspberry Pi Pico (no commercial debugger needed)
 
@@ -164,13 +173,40 @@ west flash -r dfu-util
 ```
 
 **After that, updates go over USB.** Hold the **left button for 3 seconds** —
-the app reboots into MCUboot, which opens a 5-second USB DFU window:
+the app reboots into MCUboot — and **keep holding through the reset**. MCUboot
+samples the button before booting the app and stays in USB DFU indefinitely, so
+there is no window to race. Release once it enumerates.
 
 ```bash
-dfu-util -d 2fe3:0100 -a 0 -D build/zephyr/app_update.bin
+dfu-util -d 2fe3:ffff -a 0 -D build/zephyr/app_update.bin
 ```
 
 This works on battery power too: plug USB in first, then hold the button.
+
+To recover a watch whose app will not boot, hold the left button and *then*
+apply power. The pin is sampled before the image is validated, so a corrupt app
+cannot lock you out of the bootloader.
+
+### Windows: two Zadig installs, not one
+
+The USB DFU class has no built-in Windows driver (`CONFIG_USB_DEVICE_OS_DESC`
+is off and Zephyr's `usb_dfu.c` has no MS OS descriptor support, so WinUSB
+cannot auto-bind). Run Zadig as administrator, tick *Options -> List All
+Devices*, and bind **WinUSB** to **both** of these:
+
+| USB ID        | When it appears                                    |
+|---------------|----------------------------------------------------|
+| `2FE3:0100`   | Runtime mode — how MCUboot first enumerates        |
+| `2FE3:FFFF`   | DFU mode — after dfu-util sends its detach request |
+
+Zephyr changes the product ID when it switches into DFU mode, so the second is
+a hardware ID Windows has never seen and needs its own driver. Miss it and
+dfu-util reports `LIBUSB_ERROR_NOT_SUPPORTED` / `Lost device after RESET?`
+immediately after `Device will detach and reattach...`.
+
+Target `2fe3:ffff` directly when the device is already in DFU mode. Passing
+`-d 2fe3:0100` makes dfu-util issue a detach and then lose the device across
+the re-enumeration, because it does not follow the PID change.
 
 ## Watching the console
 
@@ -243,8 +279,11 @@ source:
 - **No deep sleep yet.** `CONFIG_PM=y` is set but nothing drives it; BLE scans
   and advertises continuously. The power figures in FIRMWARE_PLAN.md are targets,
   not measurements
-- **Button UX is not implemented.** Both buttons currently just wake the
-  display; the left/right short/long mapping in the plan does not exist yet
+- **Button UX is partial.** Left button: press wakes the display and starts
+  the time reveal; 3 s hold reboots into DFU. Right button: 3 s hold shows the
+  battery percentage (a no-op if the charging view is already up); a bare
+  press does nothing on its own. Short/long mapping beyond this does not exist
+  yet
 
 ## Layout
 
