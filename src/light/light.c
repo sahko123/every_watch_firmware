@@ -8,22 +8,25 @@
 
 LOG_MODULE_REGISTER(light, LOG_LEVEL_INF);
 
-#define POLL_INTERVAL_MS 2000
-
 static const struct device *bh = DEVICE_DT_GET(DT_ALIAS(light0));
 
 /*
  * Piecewise-linear lux → brightness curve.
  *
- * The output is a fraction of led_max_brightness, not an absolute drive level,
- * so 255 here means "as bright as this watch ever gets" rather than full power.
+ * The output is a fraction of led_max_brightness (32 by default, ~12%), not
+ * an absolute drive level, so 255 here means "as bright as this watch ever
+ * gets": effective brightness = this value * led_max_brightness / 255, so
+ * most of this 0-255 range maps into a fairly narrow real output band.
  *
- * Tuned for something worn on a wrist and looked at up close. The bottom end
- * matters most: a watch glanced at in a dark room needs far less output than
- * the eye expects on paper, and the previous curve bottomed out at 30 (12%),
- * which is genuinely dazzling at night. Human brightness perception is roughly
- * logarithmic, which is why the lux breakpoints climb by decades while the
- * output climbs roughly linearly.
+ * These breakpoints are a starting guess for a watch worn on a wrist and
+ * looked at up close, not a measured calibration — this LED/diffuser
+ * combination is custom, so there's no standard WS2812B brightness reference
+ * to lean on. Expect to retune by eye on the actual hardware (`led ambient`
+ * and `led max` in the shell force a level without waiting on the sensor).
+ *
+ * The floor at 0 lux is deliberately not zero: full darkness should still
+ * leave a dim, clearly-on glow, not a blackout — a watch that goes fully dark
+ * when covered or face-down reads as broken, not power-saving.
  */
 static uint8_t lux_to_brightness(uint32_t lux)
 {
@@ -31,12 +34,12 @@ static uint8_t lux_to_brightness(uint32_t lux)
         uint32_t lux;
         uint8_t  brightness;
     } pts[] = {
-        {0,        8},   /* pitch dark, or face-down on a table / in a pocket */
-        {5,       20},   /* dim room at night                                 */
-        {50,      60},   /* normal indoor evening lighting                    */
-        {200,    110},   /* well-lit room, office                             */
-        {1000,   180},   /* bright indoors, or overcast outdoors              */
-        {10000,  255},   /* direct sunlight — everything it has               */
+        {5,        16},   /* pitch dark, or face-down on a table / in a pocket */
+        {10,       60},   /* dim room at night                                 */
+        {50,       75},   /* normal indoor evening lighting                    */
+        {200,      95},   /* well-lit room, office                             */
+        {1000,    170},   /* bright indoors, or overcast outdoors              */
+        {10000,   255},   /* direct sunlight — everything it has               */
     };
 
     for (int i = 1; i < (int)ARRAY_SIZE(pts); i++) {
@@ -82,13 +85,19 @@ static void light_work_fn(struct k_work *work)
 
 static K_WORK_DEFINE(light_work, light_work_fn);
 
-static void light_timer_cb(struct k_timer *timer)
+/*
+ * Sample on demand rather than on a fixed 2 s timer. A periodic poll meant
+ * the reading backing the next button press could be up to 2 s stale; this
+ * way it's taken right as the press happens instead. Callers must trigger
+ * this while the display is still off — light_work_fn's own is_on check
+ * would otherwise silently skip the read.
+ *
+ * ISR-safe: only submits work, does not touch I2C directly.
+ */
+void light_sample_now(void)
 {
-    ARG_UNUSED(timer);
     k_work_submit(&light_work);
 }
-
-static K_TIMER_DEFINE(light_timer, light_timer_cb, NULL);
 
 void light_init(void)
 {
@@ -97,11 +106,9 @@ void light_init(void)
         return;
     }
 
-    /* Read immediately, then every 2 s */
-    k_work_submit(&light_work);
-    k_timer_start(&light_timer,
-                  K_MSEC(POLL_INTERVAL_MS),
-                  K_MSEC(POLL_INTERVAL_MS));
+    /* One baseline reading so led_brightness isn't sitting at its default
+     * before the first button press. */
+    light_sample_now();
 
-    LOG_INF("Light sensor started (poll every %dms)", POLL_INTERVAL_MS);
+    LOG_INF("Light sensor ready (sampled on button press)");
 }
