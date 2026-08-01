@@ -1,5 +1,6 @@
 #include "imu.h"
 #include "sand/sand.h"
+#include "display/display.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/sensor.h>
@@ -11,6 +12,57 @@ LOG_MODULE_REGISTER(imu, LOG_LEVEL_INF);
 
 static const struct device *bmi = DEVICE_DT_GET(DT_NODELABEL(bmi270));
 static bool imu_ready;
+
+/* -------------------------------------------------------------------------
+ * Wrist-tilt wake — BMI270 any-motion feature on INT1 (hardware, independent
+ * of the 50 Hz poll thread below; keeps firing even while that thread is
+ * suspended with the display off). Mirrors the plan's "wrist tilt wakes the
+ * display" transition, so it only acts while the display is off — once it's
+ * on, motion from normal wrist movement during sand mode must not keep
+ * restarting the reveal.
+ * ------------------------------------------------------------------------- */
+
+static void motion_trigger_handler(const struct device *dev,
+				    const struct sensor_trigger *trig)
+{
+	ARG_UNUSED(dev); ARG_UNUSED(trig);
+
+	if (!display_is_on()) {
+		display_wake_and_reveal();
+	}
+}
+
+static int motion_trigger_init(void)
+{
+	/* Threshold/duration tuned by feel, not measured — see light.c's lux
+	 * breakpoints for the same caveat on this hardware. 0.15g / 40ms is a
+	 * deliberate wrist raise, not a false trigger from setting the watch
+	 * down on a desk. */
+	struct sensor_value thresh = {.val1 = 0, .val2 = 150000}; /* 0.15 g */
+	struct sensor_value dur    = {.val1 = 40, .val2 = 0};     /* 40 ms */
+
+	int rc = sensor_attr_set(bmi, SENSOR_CHAN_ACCEL_XYZ,
+				  SENSOR_ATTR_SLOPE_TH, &thresh);
+	rc |= sensor_attr_set(bmi, SENSOR_CHAN_ACCEL_XYZ,
+			       SENSOR_ATTR_SLOPE_DUR, &dur);
+	if (rc) {
+		LOG_ERR("BMI270 any-motion attr config failed: %d", rc);
+		return rc;
+	}
+
+	struct sensor_trigger trig = {
+		.type = SENSOR_TRIG_MOTION,
+		.chan = SENSOR_CHAN_ACCEL_XYZ,
+	};
+
+	rc = sensor_trigger_set(bmi, &trig, motion_trigger_handler);
+	if (rc) {
+		LOG_ERR("BMI270 any-motion trigger set failed: %d", rc);
+		return rc;
+	}
+
+	return 0;
+}
 
 /*
  * Convert BMI270 sensor_value accelerometer reading to a Q8 sand gravity vector.
@@ -102,6 +154,10 @@ void imu_init(void)
 		LOG_ERR("BMI270 not ready");
 		return;
 	}
+
+	/* Non-fatal: worst case is losing wrist-tilt wake, gravity-driven sand
+	 * mode still works off the poll thread below. */
+	motion_trigger_init();
 
 	k_thread_create(&imu_thread_data, imu_stack,
 			K_THREAD_STACK_SIZEOF(imu_stack),

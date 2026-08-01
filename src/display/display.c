@@ -64,10 +64,8 @@ static void reveal_work_fn(struct k_work *w)
 
 K_WORK_DEFINE(reveal_work, reveal_work_fn);
 
-static void btn_isr(const struct device *port, struct gpio_callback *cb, uint32_t pins)
+void display_wake_and_reveal(void)
 {
-	ARG_UNUSED(port); ARG_UNUSED(cb); ARG_UNUSED(pins);
-
 	/* Sample ambient light before anything below turns the LEDs on — the
 	 * system workqueue runs these in submission order, so this reading is
 	 * still taken with the display off. */
@@ -75,6 +73,13 @@ static void btn_isr(const struct device *port, struct gpio_callback *cb, uint32_
 
 	k_work_submit(&on_work);
 	k_work_submit(&reveal_work);
+}
+
+static void btn_isr(const struct device *port, struct gpio_callback *cb, uint32_t pins)
+{
+	ARG_UNUSED(port); ARG_UNUSED(cb); ARG_UNUSED(pins);
+
+	display_wake_and_reveal();
 }
 
 /* -------------------------------------------------------------------------
