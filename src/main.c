@@ -27,6 +27,11 @@ static const struct device *rtc = DEVICE_DT_GET(DT_ALIAS(rtc0));
  * window. Works from battery: plug in USB first, then hold the button. */
 static const struct gpio_dt_spec btn_dfu = GPIO_DT_SPEC_GET(DT_ALIAS(btn_left), gpios);
 
+/* Hold right button for 3 seconds to show the battery percentage. Polled in
+ * the same loop as the DFU hold rather than off the GPIO interrupt in
+ * display.c, because a hold is a duration and the ISR only sees the edge. */
+static const struct gpio_dt_spec btn_batt = GPIO_DT_SPEC_GET(DT_ALIAS(btn_right), gpios);
+
 /*
  * Boot indicator — one blinking pixel, top-left.
  *
@@ -183,12 +188,22 @@ int main(void)
 		dfu_ok = true;
 	}
 
+	bool batt_ok = false;
+	if (!gpio_is_ready_dt(&btn_batt)) {
+		LOG_ERR("Battery button GPIO not ready");
+	} else {
+		gpio_pin_configure_dt(&btn_batt, GPIO_INPUT);
+		batt_ok = true;
+	}
+
 	LOG_INF("Every Watch starting");
 
 	/* With CONFIG_SINGLE_APPLICATION_SLOT=y, MCUboot has no secondary slot
 	 * and no revert mechanism. boot_write_img_confirmed() is not needed. */
 
-	int32_t held_ms = 0;
+	int32_t held_ms      = 0;
+	int32_t batt_held_ms = 0;
+	bool    batt_fired   = false;
 
 	while (true) {
 		k_sleep(K_MSEC(50));
@@ -202,6 +217,25 @@ int main(void)
 			}
 		} else {
 			held_ms = 0;
+		}
+
+		/* Latched on batt_fired so the readout appears once per hold. The
+		 * DFU branch above needs no equivalent because it never returns. */
+		if (batt_ok && gpio_pin_get_dt(&btn_batt)) {
+			if (batt_held_ms == 0) {
+				/* Just pressed: sample light now, with the display
+				 * still off, rather than reading whatever the timer
+				 * last happened to catch. */
+				light_sample_now();
+			}
+			batt_held_ms = MIN(batt_held_ms + 50, 5000);
+			if (batt_held_ms >= 3000 && !batt_fired) {
+				batt_fired = true;
+				battery_show_level();
+			}
+		} else {
+			batt_held_ms = 0;
+			batt_fired   = false;
 		}
 	}
 }

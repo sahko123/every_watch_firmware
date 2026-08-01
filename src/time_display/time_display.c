@@ -10,10 +10,8 @@
 LOG_MODULE_REGISTER(time_display, LOG_LEVEL_INF);
 
 /*
- * 3×5 pixel font (digits 0-9)
- *
- * Each row is a uint8_t: bit2 = left col, bit1 = mid col, bit0 = right col.
- * Visualised (# = lit, . = dark):
+ * The 3x5 digit font now lives in led_matrix.c as led_font_3x5, shared with the
+ * battery readout. Visualised (# = lit, . = dark):
  *
  *   0     1     2     3     4     5     6     7     8     9
  *  ###   .#.   ###   ###   #.#   ###   ###   ###   ###   ###
@@ -22,18 +20,6 @@ LOG_MODULE_REGISTER(time_display, LOG_LEVEL_INF);
  *  #.#   .#.   #..   ..#   ..#   ..#   #.#   ..#   #.#   ..#
  *  ###   ###   ###   ###   ..#   ###   ###   ..#   ###   ###
  */
-static const uint8_t font[10][5] = {
-	{0b111, 0b101, 0b101, 0b101, 0b111}, /* 0 */
-	{0b010, 0b110, 0b010, 0b010, 0b111}, /* 1 */
-	{0b111, 0b001, 0b111, 0b100, 0b111}, /* 2 */
-	{0b111, 0b001, 0b111, 0b001, 0b111}, /* 3 */
-	{0b101, 0b101, 0b111, 0b001, 0b001}, /* 4 */
-	{0b111, 0b100, 0b111, 0b001, 0b111}, /* 5 */
-	{0b111, 0b100, 0b111, 0b101, 0b111}, /* 6 */
-	{0b111, 0b001, 0b001, 0b001, 0b001}, /* 7 */
-	{0b111, 0b101, 0b111, 0b101, 0b111}, /* 8 */
-	{0b111, 0b101, 0b111, 0b001, 0b111}, /* 9 */
-};
 
 /*
  * HH:MM layout on the 7×20 grid.
@@ -58,15 +44,7 @@ static uint8_t bitmap[LED_ROWS][LED_COLS];
 
 static void stamp_digit(uint8_t out[LED_ROWS][LED_COLS], int digit, int col_start)
 {
-	for (int r = 0; r < 5; r++) {
-		uint8_t row_bits = font[digit][r];
-
-		for (int c = 0; c < 3; c++) {
-			if (row_bits & (0x4 >> c)) {
-				out[ROW_OFFSET + r][col_start + c] = 1;
-			}
-		}
-	}
+	led_stamp_digit(out, digit, ROW_OFFSET, col_start);
 }
 
 static void stamp_colon(uint8_t out[LED_ROWS][LED_COLS], int col)
@@ -108,6 +86,18 @@ static void clear_digits(void)
 static const struct device *rtc_dev;
 static bool revealing;
 
+/* True only while a reveal session is live — set by time_display_reveal[_fill]()
+ * and cleared by time_display_deactivate(). Gates the periodic tick below so
+ * time can only appear on screen as the result of an explicit reveal, never as
+ * a side effect of the display waking up for something else. */
+static bool active;
+
+/* Set while another screen owns the display (the battery readout). The 1 Hz
+ * tick keeps running and keeps reading the RTC, it just stops republishing the
+ * digit layer — otherwise the time would fade up behind the other screen within
+ * a second of it appearing. */
+static bool paused;
+
 static bool read_time(int *hours, int *minutes)
 {
 	struct rtc_time t = {0};
@@ -131,8 +121,9 @@ static void time_work_fn(struct k_work *work)
 		return;
 	}
 
-	/* Leave the digit layer alone while a reveal owns it. */
-	if (!revealing) {
+	/* Leave the digit layer alone unless a reveal session is live, and not
+	 * mid-reveal or while another screen owns the display. */
+	if (active && !revealing && !paused) {
 		build_bitmap(h, m);
 		publish_digits();
 	}
@@ -193,6 +184,7 @@ void time_display_reveal(void)
 	sand_clear();
 	led_commit();
 
+	active    = true;
 	revealing = true;
 	sand_rain_start(on_curtain_peak, on_curtain_done);
 
@@ -218,6 +210,7 @@ void time_display_reveal_fill(void)
 	clear_digits();
 	sand_clear();
 	sand_set_target(bitmap);
+	active    = true;
 	revealing = true;
 
 	LOG_INF("Fill reveal started: %02d:%02d", h, m);
@@ -236,6 +229,28 @@ void time_display_stop_reveal(void)
 bool time_display_revealing(void)
 {
 	return revealing;
+}
+
+void time_display_pause(void)
+{
+	paused = true;
+}
+
+void time_display_resume(void)
+{
+	if (!paused) {
+		return;
+	}
+	paused = false;
+
+	/* Redraw immediately rather than leaving the display blank for up to a
+	 * second until the next tick. */
+	k_work_submit(&time_work);
+}
+
+void time_display_deactivate(void)
+{
+	active = false;
 }
 
 void time_display_init(const struct device *dev)

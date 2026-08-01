@@ -84,6 +84,18 @@ extern uint32_t led_current_budget;
  * floats, no division — so it is cheap enough to call per pixel per frame. */
 struct led_rgb led_color_wheel(uint8_t pos);
 
+/* Shared 3x5 digit font. Each row is a bitmask: bit2 = left column, bit0 =
+ * right. Five rows tall, so two spare rows on a 7-row display. */
+extern const uint8_t led_font_3x5[10][5];
+
+/* Stamp one digit into a 7x20 bitmap with its top-left corner at (row, col).
+ * Pixels falling outside the grid are clipped, so callers may centre text by
+ * arithmetic without bounds-checking first. Writes 1s only — never clears. */
+void led_stamp_digit(uint8_t out[LED_ROWS][LED_COLS], int digit, int row, int col);
+
+/* Same, for a percent sign — occupies the same 3x5 cell as a digit. */
+void led_stamp_percent(uint8_t out[LED_ROWS][LED_COLS], int row, int col);
+
 /* Initialise the LED matrix. Call once before first led_commit(). */
 void led_matrix_init(void);
 

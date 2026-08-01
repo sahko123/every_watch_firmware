@@ -3,6 +3,7 @@
 #include "sand/sand.h"
 #include "imu/imu.h"
 #include "time_display/time_display.h"
+#include "light/light.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
@@ -41,14 +42,20 @@ K_TIMER_DEFINE(display_timer, timeout_cb, NULL);
  * ------------------------------------------------------------------------- */
 
 static const struct gpio_dt_spec btn_l = GPIO_DT_SPEC_GET(DT_ALIAS(btn_left),  gpios);
-static const struct gpio_dt_spec btn_r = GPIO_DT_SPEC_GET(DT_ALIAS(btn_right), gpios);
 
 static struct gpio_callback btn_l_cb;
-static struct gpio_callback btn_r_cb;
 
-/* Left button additionally starts the time reveal. Deferred to the work queue
- * like everything else here: the reveal reads the RTC over I2C, which must not
- * happen in ISR context. */
+/* Left button wakes the display and starts the time reveal. Deferred to the
+ * work queue like everything else here: the reveal reads the RTC over I2C,
+ * which must not happen in ISR context.
+ *
+ * The right button deliberately has no press handler here. It used to also
+ * wake the display, but time_display.c republishes the current time into the
+ * digit layer every second regardless of display state — so waking on a bare
+ * right press showed the time instantly with no reveal, which read as a
+ * separate, unintended "instant time" mode. The right button's own behaviour
+ * (the 3 s hold for the battery readout, polled in main.c) already wakes the
+ * display itself once it fires. */
 static void reveal_work_fn(struct k_work *w)
 {
 	ARG_UNUSED(w);
@@ -59,13 +66,15 @@ K_WORK_DEFINE(reveal_work, reveal_work_fn);
 
 static void btn_isr(const struct device *port, struct gpio_callback *cb, uint32_t pins)
 {
-	ARG_UNUSED(port); ARG_UNUSED(cb);
+	ARG_UNUSED(port); ARG_UNUSED(cb); ARG_UNUSED(pins);
+
+	/* Sample ambient light before anything below turns the LEDs on — the
+	 * system workqueue runs these in submission order, so this reading is
+	 * still taken with the display off. */
+	light_sample_now();
 
 	k_work_submit(&on_work);
-
-	if (pins & BIT(btn_l.pin)) {
-		k_work_submit(&reveal_work);
-	}
+	k_work_submit(&reveal_work);
 }
 
 /* -------------------------------------------------------------------------
@@ -111,6 +120,11 @@ void display_off(void)
 	k_mutex_unlock(&led_mask_mutex);
 	led_commit();
 
+	/* End the time-viewing session. Waking the display again (a battery
+	 * check, a low-battery blip) must not bring time back on its own — only
+	 * a fresh reveal should. */
+	time_display_deactivate();
+
 	LOG_INF("Display off");
 }
 
@@ -135,7 +149,7 @@ static void off_work_fn(struct k_work *w) { ARG_UNUSED(w); display_off(); }
 
 void display_init(void)
 {
-	if (!gpio_is_ready_dt(&btn_l) || !gpio_is_ready_dt(&btn_r)) {
+	if (!gpio_is_ready_dt(&btn_l)) {
 		LOG_ERR("display button GPIO not ready — display permanently off");
 		return;
 	}
@@ -143,14 +157,10 @@ void display_init(void)
 	int rc;
 
 	rc  = gpio_pin_configure_dt(&btn_l, GPIO_INPUT);
-	rc |= gpio_pin_configure_dt(&btn_r, GPIO_INPUT);
 	rc |= gpio_pin_interrupt_configure_dt(&btn_l, GPIO_INT_EDGE_TO_ACTIVE);
-	rc |= gpio_pin_interrupt_configure_dt(&btn_r, GPIO_INT_EDGE_TO_ACTIVE);
 
 	gpio_init_callback(&btn_l_cb, btn_isr, BIT(btn_l.pin));
-	gpio_init_callback(&btn_r_cb, btn_isr, BIT(btn_r.pin));
 	rc |= gpio_add_callback(btn_l.port, &btn_l_cb);
-	rc |= gpio_add_callback(btn_r.port, &btn_r_cb);
 
 	if (rc) {
 		LOG_ERR("display button GPIO setup failed — display permanently off");

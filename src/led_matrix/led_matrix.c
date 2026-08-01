@@ -99,6 +99,69 @@ uint8_t        led_max_brightness = 32;   /* per-pixel ceiling, ~12% */
 uint32_t       led_current_budget = 1900; /* ~150 mA total — see the maths below */
 
 /* --------------------------------------------------------------------------
+ * Shared 3x5 digit font
+ *
+ * Lives here rather than in the clock so anything that needs to put a number on
+ * screen uses the same glyphs — the clock and the battery readout at least.
+ * -------------------------------------------------------------------------- */
+
+const uint8_t led_font_3x5[10][5] = {
+	{0b111, 0b101, 0b101, 0b101, 0b111}, /* 0 */
+	{0b010, 0b110, 0b010, 0b010, 0b111}, /* 1 */
+	{0b111, 0b001, 0b111, 0b100, 0b111}, /* 2 */
+	{0b111, 0b001, 0b111, 0b001, 0b111}, /* 3 */
+	{0b101, 0b101, 0b111, 0b001, 0b001}, /* 4 */
+	{0b111, 0b100, 0b111, 0b001, 0b111}, /* 5 */
+	{0b111, 0b100, 0b111, 0b101, 0b111}, /* 6 */
+	{0b111, 0b001, 0b001, 0b001, 0b001}, /* 7 */
+	{0b111, 0b101, 0b111, 0b101, 0b111}, /* 8 */
+	{0b111, 0b101, 0b111, 0b001, 0b111}, /* 9 */
+};
+
+/* Percent sign, same 3x5 cell as the digits:
+ *
+ *   #.#
+ *   ..#
+ *   .#.
+ *   #..
+ *   #.#
+ */
+static const uint8_t glyph_percent[5] = {0b101, 0b001, 0b010, 0b100, 0b101};
+
+static void stamp_bits(uint8_t out[LED_ROWS][LED_COLS], const uint8_t bits[5],
+		       int row, int col)
+{
+	for (int r = 0; r < 5; r++) {
+		for (int c = 0; c < 3; c++) {
+			int rr = row + r;
+			int cc = col + c;
+
+			/* Clipped rather than asserted: callers centre text by
+			 * arithmetic, and a glyph running off the edge should lose a
+			 * column, not corrupt the frame buffer. */
+			if ((bits[r] & (0x4 >> c)) &&
+			    rr >= 0 && rr < LED_ROWS && cc >= 0 && cc < LED_COLS) {
+				out[rr][cc] = 1;
+			}
+		}
+	}
+}
+
+void led_stamp_percent(uint8_t out[LED_ROWS][LED_COLS], int row, int col)
+{
+	stamp_bits(out, glyph_percent, row, col);
+}
+
+void led_stamp_digit(uint8_t out[LED_ROWS][LED_COLS], int digit, int row, int col)
+{
+	if (digit < 0 || digit > 9) {
+		return;
+	}
+
+	stamp_bits(out, led_font_3x5[digit], row, col);
+}
+
+/* --------------------------------------------------------------------------
  * WS2812B encoding
  * -------------------------------------------------------------------------- */
 
