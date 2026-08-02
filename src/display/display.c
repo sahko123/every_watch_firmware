@@ -113,11 +113,17 @@ void display_off(void)
 	/* Acquire the commit mutex before suspending the sand thread. Zephyr's
 	 * k_mutex has priority inheritance: if the sand thread holds the mutex
 	 * mid-DMA, it gets elevated to our priority and completes before we
-	 * proceed. Once we hold it, sand cannot start a new commit. */
+	 * proceed. Once we hold it, sand cannot start a new commit.
+	 * sand_suspend() itself now also takes sand_mutex (see sand.c) so the
+	 * thread can't be frozen mid-tick holding it either. */
 	k_mutex_lock(&led_commit_mutex, K_FOREVER);
 	sand_suspend();
-	imu_suspend();
 	k_mutex_unlock(&led_commit_mutex);
+
+	/* Outside led_commit_mutex on purpose: this mutex exists solely to
+	 * stop sand suspending mid-DMA, and imu_suspend() has nothing to do
+	 * with that — it just needs to run after sand is safely stopped. */
+	imu_suspend();
 
 	/* Sand is suspended; push one blank frame to clear the LEDs */
 	k_mutex_lock(&led_mask_mutex, K_FOREVER);
@@ -146,7 +152,26 @@ void display_reset_timeout(void)
 }
 
 static void on_work_fn(struct k_work *w)  { ARG_UNUSED(w); display_on(); }
-static void off_work_fn(struct k_work *w) { ARG_UNUSED(w); display_off(); }
+
+static void off_work_fn(struct k_work *w)
+{
+	ARG_UNUSED(w);
+
+	/* off_work and on_work/reveal_work are both queued from independent
+	 * ISRs (the auto-off timer, the button) onto the same FIFO system
+	 * workqueue with no ordering between them. If the timeout fires in
+	 * the same instant as a fresh button press, off_work can end up
+	 * behind on_work/reveal_work in the queue — and by the time it runs,
+	 * display_on() has already reset display_timer with a fresh 10s
+	 * countdown. Trust the timer's current state over the fact that this
+	 * stale work item exists at all, or a press can be immediately
+	 * undone by the timeout that raced it. */
+	if (k_timer_remaining_get(&display_timer) > 0) {
+		return;
+	}
+
+	display_off();
+}
 
 /* -------------------------------------------------------------------------
  * Init
@@ -156,6 +181,12 @@ void display_init(void)
 {
 	if (!gpio_is_ready_dt(&btn_l)) {
 		LOG_ERR("display button GPIO not ready — display permanently off");
+		/* is_on is still false here (never set true), so a later
+		 * display_off() call would early-return and skip suspending
+		 * sand/imu — leaving both running at full rate forever despite
+		 * this log claiming "permanently off". Suspend them directly. */
+		sand_suspend();
+		imu_suspend();
 		return;
 	}
 
@@ -169,6 +200,8 @@ void display_init(void)
 
 	if (rc) {
 		LOG_ERR("display button GPIO setup failed — display permanently off");
+		sand_suspend();
+		imu_suspend();
 		return;
 	}
 

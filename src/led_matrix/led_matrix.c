@@ -383,6 +383,13 @@ void led_commit(void)
 
 	/* Start all four. They run concurrently in hardware, so a frame costs
 	 * the length of one line (~1.2 ms) rather than the sum of all four. */
+	/* nrfx_pwm_simple_playback() returns uint32_t, not a status code: the
+	 * task address for NRFX_PWM_FLAG_START_VIA_TASK, 0 otherwise. This
+	 * call doesn't use that flag, so the return is always 0 by design —
+	 * not an error indicator to check. (Confirmed against the actual
+	 * declaration in nrfx_pwm.h after a first pass here mistakenly added
+	 * an error check that fired on every single frame.) A genuinely stuck
+	 * instance is still caught below, by the bounded stopped-check wait. */
 	for (int i = 0; i < 4; i++) {
 		(void)nrfx_pwm_simple_playback(&pwm[i], &pwm_seq[i], 1,
 					       NRFX_PWM_FLAG_STOP);

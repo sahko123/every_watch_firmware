@@ -564,7 +564,13 @@ void sand_rain_start(void (*on_peak)(void), void (*on_done)(void))
 
 bool sand_rain_active(void)
 {
-	return mode == SAND_RAIN;
+	bool active;
+
+	k_mutex_lock(&sand_mutex, K_FOREVER);
+	active = (mode == SAND_RAIN);
+	k_mutex_unlock(&sand_mutex);
+
+	return active;
 }
 
 bool sand_target_complete(void)
@@ -613,7 +619,17 @@ int sand_count(void)
 
 void sand_suspend(void)
 {
+	/* Take sand_mutex first so the thread can only be frozen between
+	 * ticks, never mid-critical-section holding it. Without this, a
+	 * caller elsewhere (e.g. battery.c's level_show_for() -> sand_clear())
+	 * that tries to lock sand_mutex while the suspended thread is still
+	 * holding it would block forever — display_on()/sand_resume() being
+	 * the only thing that could ever unblock it creates a real deadlock
+	 * path, not just a lock-ordering nicety. Mirrors display.c's own
+	 * led_commit_mutex handshake for the same reason. */
+	k_mutex_lock(&sand_mutex, K_FOREVER);
 	k_thread_suspend(&sand_thread_data);
+	k_mutex_unlock(&sand_mutex);
 }
 
 void sand_resume(void)

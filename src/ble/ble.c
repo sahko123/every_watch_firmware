@@ -140,11 +140,15 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
 
 static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 {
-    if (phone_conn) {
+    /* CONFIG_BT_MAX_CONN=1 makes conn always match phone_conn today, but
+     * check anyway: unref'ing/clearing phone_conn without checking would be
+     * a live bug (clearing a ref to a still-live connection) the moment
+     * BT_MAX_CONN is ever raised. */
+    if (phone_conn == conn) {
         bt_conn_unref(phone_conn);
         phone_conn = NULL;
     }
-    LOG_ERR("Phone disconnected (reason=%d)", reason);
+    LOG_INF("Phone disconnected (reason=%d)", reason);
     start_adv();
 }
 
@@ -234,9 +238,8 @@ static const struct led_rgb notif_colors[] = {
 };
 
 /* Wake the display and push the frame from the system work queue.
- * led_commit() blocks ~3 ms in DMA and locks interrupts for ~585 µs during the
- * row-6 bitbang; doing that on the BT RX thread starves the controller and
- * risks dropped connection events. */
+ * led_commit() blocks ~1-3 ms in DMA; doing that directly on the BT RX
+ * thread starves the controller and risks dropped connection events. */
 static void notif_commit_fn(struct k_work *w)
 {
     ARG_UNUSED(w);
@@ -279,7 +282,7 @@ static ssize_t on_notif_write(struct bt_conn *conn,
     uint8_t category = data[0];
 
     if (len > 1) {
-        LOG_ERR("Notification cat=%u text len=%d", category, (int)(len - 1));
+        LOG_INF("Notification cat=%u text len=%d", category, (int)(len - 1));
     }
 
     show_notification(category);

@@ -19,6 +19,6 @@ bool     battery_is_low(void);     /* true when SoC < LOW_BATTERY_THRESHOLD */
  * 20% either way. Uses the cached gauge reading (at most POLL_INTERVAL_S old)
  * rather than blocking the caller on I2C.
  *
- * Safe to call from a thread, not from an ISR.
+ * ISR-safe: only submits work onto the system workqueue.
  */
 void     battery_show_level(void);

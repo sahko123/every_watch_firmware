@@ -58,6 +58,44 @@ static bool seen_before(uint32_t hash)
     return false;
 }
 
+/* Flushes seen_hashes[]/dev_dist/enc_count to flash. Runs on the system
+ * workqueue, never directly on the caller of identity_on_encounter() — that
+ * caller is the Bluetooth scan callback (BT RX thread), and nvs_write() can
+ * block for a full sector garbage-collect/erase (tens of ms), not just the
+ * write itself. Blocking that thread risks dropped connection events, same
+ * reasoning as ble.c's notif_commit_work for the LED path. */
+static void nvs_flush_work_fn(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    if (!nvs_ready) {
+        return;
+    }
+
+    int rc;
+
+    rc = nvs_write(&nvs, NVS_KEY_ENC_HASHES,
+                    seen_hashes, seen_count * sizeof(uint32_t));
+    if (rc < 0) {
+        LOG_ERR("NVS write hashes failed: %d", rc);
+    }
+    rc = nvs_write(&nvs, NVS_KEY_DEV_DIST, &dev_dist, sizeof(dev_dist));
+    if (rc < 0) {
+        LOG_ERR("NVS write dev_dist failed: %d", rc);
+    }
+    rc = nvs_write(&nvs, NVS_KEY_ENC_COUNT, &enc_count, sizeof(enc_count));
+    if (rc < 0) {
+        LOG_ERR("NVS write enc_count failed: %d", rc);
+    }
+}
+static K_WORK_DEFINE(nvs_flush_work, nvs_flush_work_fn);
+
+/* In-RAM only — no flash I/O here. The actual write is batched; see
+ * identity_on_encounter(), which folds this together with dev_dist/enc_count
+ * into one nvs_flush_work dispatch every NVS_WRITE_BATCH encounters. Counter
+ * writes used to fire unbatched on every single encounter (save_counters()
+ * called unconditionally), which defeated the batching this comment always
+ * claimed applied to all of it — folded together now so it actually does. */
 static void add_seen(uint32_t hash)
 {
     if (seen_count < MAX_SEEN_HASHES) {
@@ -67,32 +105,6 @@ static void add_seen(uint32_t hash)
         memmove(seen_hashes, seen_hashes + 1,
                 (MAX_SEEN_HASHES - 1) * sizeof(uint32_t));
         seen_hashes[MAX_SEEN_HASHES - 1] = hash;
-    }
-
-    unsaved_encounters++;
-    if (nvs_ready && unsaved_encounters >= NVS_WRITE_BATCH) {
-        int rc = nvs_write(&nvs, NVS_KEY_ENC_HASHES,
-                           seen_hashes, seen_count * sizeof(uint32_t));
-        if (rc < 0) {
-            LOG_ERR("NVS write hashes failed: %d", rc);
-        }
-        unsaved_encounters = 0;
-    }
-}
-
-static void save_counters(void)
-{
-    if (!nvs_ready) {
-        return;
-    }
-    int rc;
-    rc = nvs_write(&nvs, NVS_KEY_DEV_DIST,  &dev_dist,  sizeof(dev_dist));
-    if (rc < 0) {
-        LOG_ERR("NVS write dev_dist failed: %d", rc);
-    }
-    rc = nvs_write(&nvs, NVS_KEY_ENC_COUNT, &enc_count, sizeof(enc_count));
-    if (rc < 0) {
-        LOG_ERR("NVS write enc_count failed: %d", rc);
     }
 }
 
@@ -161,7 +173,12 @@ void identity_on_encounter(uint32_t their_hash, uint8_t their_dev_dist)
         }
     }
 
-    save_counters();
+    unsaved_encounters++;
+    if (nvs_ready && unsaved_encounters >= NVS_WRITE_BATCH) {
+        unsaved_encounters = 0;
+        k_work_submit(&nvs_flush_work);
+    }
+
     LOG_INF("Encounter #%u: hash=0x%08X their_dist=%u",
             enc_count, their_hash, their_dev_dist);
 }

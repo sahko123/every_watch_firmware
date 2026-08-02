@@ -134,9 +134,13 @@ int main(void)
 	boot_indicator_start();
 
 #ifdef CONFIG_EW_SELFTEST
-	/* Runs before any application thread starts, so it has the LED matrix
-	 * to itself. Note it sets the RTC to a fixed date as part of the test —
-	 * re-sync over BLE afterwards. */
+	/* Stop the indicator first: it was still ticking on a 120ms k_timer
+	 * during selftest_run(), racing selftest.c's own LED tests (both write
+	 * LED_LAYER_BG and call led_commit()) despite selftest.h's doc comment
+	 * claiming exclusive use of the matrix. Restarted below so there's
+	 * still something on screen for the rest of boot. */
+	boot_indicator_stop();
+
 	{
 		int fails = selftest_run();
 
@@ -147,6 +151,8 @@ int main(void)
 			}
 		}
 	}
+
+	boot_indicator_start();
 #endif
 
 	/* Sand: warm amber (per-cell, no layer_color override) */
@@ -183,11 +189,20 @@ int main(void)
 
 	display_off();
 
+	/* btn_dfu and display.c's btn_l are the same physical pin (DT_ALIAS
+	 * btn_left). display_init() above already ran gpio_pin_configure_dt()
+	 * + gpio_pin_interrupt_configure_dt() on it to arm the wake/reveal
+	 * interrupt. Reconfiguring the same pin here as a plain input (as this
+	 * used to do) tears that GPIOTE trigger back down — gpio_nrfx's
+	 * pin-configure path disables and frees any existing trigger/channel
+	 * on a pin before applying a plain reconfigure. That silently broke
+	 * every short left-button press (no wake, no reveal) while the 3s
+	 * hold below kept working since it only polls the raw pin state. Only
+	 * check readiness here; do not reconfigure. */
 	bool dfu_ok = false;
 	if (!gpio_is_ready_dt(&btn_dfu)) {
 		LOG_ERR("DFU button GPIO not ready");
 	} else {
-		gpio_pin_configure_dt(&btn_dfu, GPIO_INPUT);
 		dfu_ok = true;
 	}
 

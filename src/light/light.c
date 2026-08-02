@@ -4,6 +4,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/sensor.h>
+#include <zephyr/pm/device.h>
 #include <zephyr/logging/log.h>
 
 LOG_MODULE_REGISTER(light, LOG_LEVEL_INF);
@@ -42,6 +43,16 @@ static uint8_t lux_to_brightness(uint32_t lux)
         {10000,   255},   /* direct sunlight — everything it has               */
     };
 
+    /* lux below the first breakpoint must clamp to its floor, not fall into
+     * the loop below: at i=1 the loop computes `lux - pts[0].lux`, and for
+     * lux < 5 that's a uint32_t underflow (e.g. lux=0 -> 0-5 wraps to
+     * 0xFFFFFFFB), producing an essentially arbitrary brightness instead of
+     * the floor — breaking the darkness floor specifically for the darkness
+     * it exists for (face-down on a table, in a pocket). */
+    if (lux <= pts[0].lux) {
+        return pts[0].brightness;
+    }
+
     for (int i = 1; i < (int)ARRAY_SIZE(pts); i++) {
         if (lux <= pts[i].lux) {
             uint32_t dl = pts[i].lux        - pts[i-1].lux;
@@ -63,24 +74,32 @@ static void light_work_fn(struct k_work *work)
         return;
     }
 
+    /* Resume/suspend around the read rather than leaving the sensor
+     * powered continuously between on-demand samples — mirrors imu.c's
+     * pattern for the BMI270. Whether this has any real effect depends on
+     * the BH1750 Zephyr driver actually implementing PM_DEVICE actions;
+     * unverified here, same caveat as imu.c's equivalent calls. */
+    (void)pm_device_action_run(bh, PM_DEVICE_ACTION_RESUME);
+
     int err = sensor_sample_fetch(bh);
-    if (err) {
+
+    if (!err) {
+        struct sensor_value lux_val;
+
+        if (sensor_channel_get(bh, SENSOR_CHAN_LIGHT, &lux_val)) {
+            LOG_WRN("BH1750 channel read failed");
+        } else {
+            uint32_t lux = (uint32_t)lux_val.val1;
+            uint8_t  br  = lux_to_brightness(lux);
+
+            led_brightness = br;
+            LOG_DBG("Light: %u lux → brightness %u", lux, br);
+        }
+    } else {
         LOG_WRN("BH1750 fetch failed: %d", err);
-        return;
     }
 
-    struct sensor_value lux_val;
-    if (sensor_channel_get(bh, SENSOR_CHAN_LIGHT, &lux_val)) {
-        LOG_WRN("BH1750 channel read failed");
-        return;
-    }
-
-    uint32_t lux = (uint32_t)lux_val.val1;
-    uint8_t  br  = lux_to_brightness(lux);
-
-    led_brightness = br;
-
-    LOG_DBG("Light: %u lux → brightness %u", lux, br);
+    (void)pm_device_action_run(bh, PM_DEVICE_ACTION_SUSPEND);
 }
 
 static K_WORK_DEFINE(light_work, light_work_fn);

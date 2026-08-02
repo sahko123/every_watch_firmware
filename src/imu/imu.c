@@ -92,7 +92,11 @@ static struct sand_gravity accel_to_gravity(const struct sensor_value *ax,
 
 #define IMU_STACK_SIZE 1024
 #define IMU_PRIORITY   4
-#define IMU_PERIOD_MS  20  /* 50 Hz */
+/* Matches sand.c's 30 Hz tick — sand_set_gravity()'s only consumer. Was
+ * 20 ms (50 Hz): over a third of those reads were overwritten before the
+ * sand thread ever looked at them, pure wasted I2C traffic and wakeups on
+ * a board targeting <10 uA idle. */
+#define IMU_PERIOD_MS  33  /* ~30 Hz */
 
 static K_THREAD_STACK_DEFINE(imu_stack, IMU_STACK_SIZE);
 static struct k_thread imu_thread_data;
@@ -166,5 +170,5 @@ void imu_init(void)
 	k_thread_name_set(&imu_thread_data, "imu");
 	imu_ready = true;
 
-	LOG_INF("IMU started (50 Hz)");
+	LOG_INF("IMU started (30 Hz)");
 }

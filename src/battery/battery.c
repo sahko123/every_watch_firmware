@@ -154,6 +154,11 @@ static void level_paint(void)
 {
     struct led_rgb base = level_base_color(level_pct, level_wave);
 
+    /* led_color[] shares build_buffers()'s lock contract with led_mask[] —
+     * see led_matrix.h. This used to write it unlocked, racing the
+     * compositor every 60 ms for the whole duration of a charging session. */
+    k_mutex_lock(&led_mask_mutex, K_FOREVER);
+
     for (int c = 0; c < LED_COLS; c++) {
         struct led_rgb px = base;
 
@@ -173,6 +178,8 @@ static void level_paint(void)
             led_color[r][c] = px;
         }
     }
+
+    k_mutex_unlock(&led_mask_mutex);
 }
 
 static void wave_work_fn(struct k_work *work)
@@ -313,14 +320,32 @@ static void level_show_for(uint32_t show_ms)
             pct, battery_voltage_mv(), chrg ? "charging" : "discharging");
 }
 
-void battery_show_level(void)
+/* Runs the actual check-and-show on the system workqueue — the same context
+ * that owns charging_mode/level_pct/level_wave/wave_phase everywhere else
+ * (battery_work_fn, wave_work_fn, level_clear_work_fn). battery_show_level()
+ * used to run this check-then-act directly on the calling (main) thread,
+ * which was a second, unsynchronized writer of that state: a right-button
+ * hold landing in the same instant as a plug-in (battery_work_fn fires
+ * immediately off the SGM41524 edge) could read charging_mode as false right
+ * before battery_work_fn set it true and called level_show_for(0), then
+ * proceed to call level_show_for(LEVEL_SHOW_MS) anyway — silently imposing a
+ * 3 s dismiss timer on what's supposed to be a persistent charging view. */
+static void show_level_work_fn(struct k_work *work)
 {
+    ARG_UNUSED(work);
+
     /* Already up and will keep refreshing itself every poll — a hold here
      * would just impose a 3 s dismiss timer on a view meant to persist. */
     if (charging_mode) {
         return;
     }
     level_show_for(LEVEL_SHOW_MS);
+}
+static K_WORK_DEFINE(show_level_work, show_level_work_fn);
+
+void battery_show_level(void)
+{
+    k_work_submit(&show_level_work);
 }
 
 static void battery_work_fn(struct k_work *work)
@@ -345,7 +370,8 @@ static void battery_work_fn(struct k_work *work)
 
     uint8_t  pct  = (uint8_t)soc.val1;
     uint32_t mv   = (uint32_t)(volt.val1 * 1000 + volt.val2 / 1000);
-    /* BQ27441 current: val1 = mA integer part, val2 = µA fractional part.
+    /* BQ27441 current: val1 = mA integer part, val2 = millionths of mA
+     * (Zephyr's sensor_value convention — not µA directly).
      * val1 > 0 alone misses charge currents below 1 mA (val1=0, val2>0). */
     bool     chrg = (current.val1 > 0) ||
                     (current.val1 == 0 && current.val2 > 0);

@@ -21,11 +21,20 @@ struct led_rgb {
 	uint8_t r, g, b;
 };
 
-/* Per-cell color, used by layers that don't have a layer_color override (e.g. sand). */
+/* Per-cell color, used by layers that don't have a layer_color override (e.g. sand).
+ *
+ * LOCKING: same contract as led_mask[] below — all writes must hold
+ * led_mask_mutex. build_buffers() reads led_mask[], led_color[] and
+ * led_layer_color[] together under one lock acquisition, so a writer that
+ * only guards led_mask[] and not this array is still racing the compositor.
+ * Use led_color_fill() below for a solid fill; it takes the lock internally
+ * (safe to call whether or not the caller already holds led_mask_mutex —
+ * Zephyr's k_mutex is safely re-entrant for the owning thread). */
 extern struct led_rgb led_color[LED_ROWS][LED_COLS];
 
 /* Per-layer solid color override. When non-zero, all lit pixels in that layer
- * use this color instead of led_color[row][col]. Set to {0,0,0} to disable. */
+ * use this color instead of led_color[row][col]. Set to {0,0,0} to disable.
+ * Same locking contract as led_color[] above. */
 extern struct led_rgb led_layer_color[LED_LAYER_COUNT];
 
 /* Mask layers: non-zero = pixel active at this cell.
@@ -34,7 +43,8 @@ extern struct led_rgb led_layer_color[LED_LAYER_COUNT];
  * LOCKING: all writes to led_mask[] from any context must hold led_mask_mutex.
  * Writers: render() in sand.c, render_time() in time_display.c, display_off()
  * in display.c, show_notification() in ble.c, show_low_battery_indicator() in
- * battery.c. build_buffers() acquires the mutex for its reads. */
+ * battery.c. build_buffers() acquires the mutex for its reads — of this array
+ * and of led_color[]/led_layer_color[] together, see above. */
 extern uint8_t led_mask[LED_LAYER_COUNT][LED_ROWS][LED_COLS];
 
 /* Mutex protecting all led_mask[] accesses (writes from workqueue/BT thread,
@@ -118,7 +128,9 @@ static inline void led_mask_clear_all(void)
 
 static inline void led_color_fill(uint8_t r, uint8_t g, uint8_t b)
 {
+	k_mutex_lock(&led_mask_mutex, K_FOREVER);
 	for (int row = 0; row < LED_ROWS; row++)
 		for (int col = 0; col < LED_COLS; col++)
 			led_color[row][col] = (struct led_rgb){r, g, b};
+	k_mutex_unlock(&led_mask_mutex);
 }

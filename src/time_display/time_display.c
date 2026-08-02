@@ -114,6 +114,17 @@ static void time_work_fn(struct k_work *work)
 {
 	ARG_UNUSED(work);
 
+	/* Leave the digit layer alone unless a reveal session is live, and not
+	 * mid-reveal or while another screen owns the display. Checked before
+	 * the RTC read, not after: this tick runs forever at 1 Hz regardless
+	 * of display state, and reading over I2C for a result that's about to
+	 * be thrown away is a real, easily-avoided cost against this board's
+	 * idle-current target — it used to happen on every tick, every
+	 * second, for the device's entire life on battery. */
+	if (!active || revealing || paused) {
+		return;
+	}
+
 	int h, m;
 
 	if (!read_time(&h, &m)) {
@@ -121,12 +132,8 @@ static void time_work_fn(struct k_work *work)
 		return;
 	}
 
-	/* Leave the digit layer alone unless a reveal session is live, and not
-	 * mid-reveal or while another screen owns the display. */
-	if (active && !revealing && !paused) {
-		build_bitmap(h, m);
-		publish_digits();
-	}
+	build_bitmap(h, m);
+	publish_digits();
 }
 
 K_WORK_DEFINE(time_work, time_work_fn);
@@ -149,7 +156,18 @@ K_TIMER_DEFINE(time_timer, time_timer_cb, NULL);
  * as it thins out. */
 static void on_curtain_peak(void)
 {
-	publish_digits();
+	/* Guard against a stale reveal: display_off() suspends the sand
+	 * thread mid-animation rather than cancelling it (see
+	 * time_display_deactivate() below), so a curtain that was mid-flight
+	 * when the display went off can still reach its peak later, once
+	 * something unrelated (e.g. a battery-screen wake) resumes sand.
+	 * Without this check that silently painted time into LED_LAYER_DIGITS
+	 * with no explicit reveal — the exact bug the `active` flag exists to
+	 * prevent, just reached through this callback instead of the 1 Hz
+	 * tick above. */
+	if (active) {
+		publish_digits();
+	}
 }
 
 static void on_curtain_done(void)
@@ -251,6 +269,19 @@ void time_display_resume(void)
 void time_display_deactivate(void)
 {
 	active = false;
+
+	/* A reveal still in flight when the display goes off must be
+	 * cancelled outright, not just left to freeze with the sand thread
+	 * (display_off() suspends sand right before calling this). Otherwise
+	 * it silently resumes animating — visibly, in LED_LAYER_SAND — the
+	 * next time anything unrelated resumes sand, even though on_curtain_
+	 * peak() above is now guarded against actually publishing digits from
+	 * it. sand_set_target(NULL) forces mode back to free regardless of
+	 * whether the reveal was rain or constrained. */
+	if (revealing) {
+		time_display_stop_reveal();
+		led_color_fill(255, 160, 20);
+	}
 }
 
 void time_display_init(const struct device *dev)

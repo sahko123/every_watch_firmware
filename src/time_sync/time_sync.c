@@ -10,6 +10,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/rtc.h>
 #include <zephyr/shell/shell.h>
+#include <errno.h>
 #include <stdlib.h>
 
 static const struct device *const rtc_dev = DEVICE_DT_GET(DT_ALIAS(rtc0));
@@ -58,10 +59,23 @@ static int cmd_settime(const struct shell *sh, size_t argc, char **argv)
     }
 
     char *end;
+
+    errno = 0;
     long long epoch = strtoll(argv[1], &end, 10);
 
-    if (*end != '\0' || epoch < 0) {
+    /* strtoll() silently clamps to LLONG_MAX/MIN and sets errno on overflow
+     * rather than failing outright — an unchecked errno here let a numeral
+     * too large to represent sail through both the *end and epoch<0 checks,
+     * get truncated into epoch_to_rtc_time()'s tm_year computation, and get
+     * written to the RTC as an arbitrary wrapped date while reporting
+     * success. Also reject anything past a sane range: the RTC/UI have no
+     * business representing a date this firmware will never see. */
+    if (*end != '\0' || epoch < 0 || errno == ERANGE) {
         shell_error(sh, "usage: settime <unix-epoch-seconds>");
+        return -EINVAL;
+    }
+    if (epoch > 4102444800LL) {  /* 2100-01-01T00:00:00Z */
+        shell_error(sh, "epoch out of range (must be before year 2100)");
         return -EINVAL;
     }
 

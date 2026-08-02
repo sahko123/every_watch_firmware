@@ -263,19 +263,26 @@ than bring-up.
 Things to check with a scope or meter on first hardware, all flagged in the
 source:
 
-- **WS2812B T1H is marginally out of spec.** SPI at 2 MHz gives a 1000 ns high
-  pulse for a `1`; the datasheet says 800 ns ±150. Genuine parts usually
-  tolerate it, clones often do not. Scope P0.29 early
-- **Row 6 locks interrupts for ~585 µs per frame.** It is bit-banged on P0.03
-  because SPIM0 is unavailable (it shares hardware with TWIM0). At 30 fps this
-  is very likely to disturb BLE connection events. The fix is PWM0 + EasyDMA —
-  see the TODO in `led_matrix.c`
+- **~~WS2812B T1H marginally out of spec~~ — resolved.** The LED matrix moved
+  from SPI to PWM0-3 + EasyDMA (see `led_matrix.c`); T1H is now 812.5 ns,
+  comfortably mid-spec (datasheet 800 ns ±150). Left here as a record in case
+  the driver ever regresses, not as an open item.
+- **~~Row 6 locks interrupts for ~585 µs per frame~~ — resolved.** Row 6 now
+  runs on PWM3 (P0.03) alongside the other three lines, same as the item
+  above — no more bit-banging, no more interrupt lock.
+- **BMI270 IMU fails its chip-ID check on the current bench unit.** Consistent
+  on repeated resets (reads chip ID 0x27, expects 0x24) — suspected signal
+  integrity issue given this board has no external I2C pull-ups, but not
+  confirmed. Wrist-tilt wake and sand-mode gravity are both non-functional
+  until this is resolved. Not caused by firmware — the fault happens at
+  driver-init time before any application code runs.
 - **LFXO not confirmed.** The DTS assumes the internal RC oscillator. If a
   32.768 kHz crystal is populated, enable it (`&clock { lf-clk-src = <1>; }`)
   for better BLE timing and lower power
 - **Fuel gauge capacity is a placeholder.** `design-capacity = <300>` in the DTS
   must match the real cell or state-of-charge readings will be wrong
 - **IMU axis signs are unverified.** Tilting right should push sand right
+  (moot until the chip-ID fault above is resolved)
 - **No deep sleep yet.** `CONFIG_PM=y` is set but nothing drives it; BLE scans
   and advertises continuously. The power figures in FIRMWARE_PLAN.md are targets,
   not measurements
