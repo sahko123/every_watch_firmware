@@ -1,8 +1,6 @@
 #include <zephyr/kernel.h>
-#include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/rtc.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/sys/reboot.h>
 
 #include "led_matrix/led_matrix.h"
 #include "sand/sand.h"
@@ -14,6 +12,8 @@
 #include "battery/battery.h"
 #include "light/light.h"
 #include "watchdog/watchdog.h"
+#include "buttons/buttons.h"
+#include "ui/ui.h"
 
 #ifdef CONFIG_EW_SELFTEST
 #include "selftest/selftest.h"
@@ -23,17 +23,24 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 static const struct device *rtc = DEVICE_DT_GET(DT_ALIAS(rtc0));
 
-/* Hold left button for 3 seconds to enter DFU mode. sys_reboot() hands control
- * back to MCUboot, which then waits indefinitely for a USB DFU transfer — no
- * cable check (this PCB has no VBUS sense), so holding without USB plugged in
- * strands the watch in DFU until either a transfer arrives or the battery
- * runs down; see child_image/mcuboot.conf's "TRADE-OFF, deliberate" note. */
-static const struct gpio_dt_spec btn_dfu = GPIO_DT_SPEC_GET(DT_ALIAS(btn_left), gpios);
+/*
+ * Button gestures all go to the UI, which owns the display and decides what
+ * each one means. DFU is bound there too (both buttons held) rather than
+ * being special-cased here — it is just another page, and one that happens
+ * to reboot on entry.
+ *
+ * Ambient light is sampled here rather than in ui.c because it must happen
+ * while the LEDs are still off: the sensor sits under the same glass, so a
+ * reading taken after the display wakes measures the display.
+ */
+static void on_button(enum btn_event ev)
+{
+	if (!display_is_on()) {
+		light_sample_now();
+	}
 
-/* Hold right button for 3 seconds to show the battery percentage. Polled in
- * the same loop as the DFU hold rather than off the GPIO interrupt in
- * display.c, because a hold is a duration and the ISR only sees the edge. */
-static const struct gpio_dt_spec btn_batt = GPIO_DT_SPEC_GET(DT_ALIAS(btn_right), gpios);
+	ui_handle_button(ev);
+}
 
 /*
  * Boot indicator — one blinking pixel, top-left.
@@ -87,39 +94,6 @@ static void boot_indicator_stop(void)
 	k_mutex_unlock(&led_mask_mutex);
 }
 
-/*
- * Paint a "waiting for firmware" pattern, then let the reset happen.
- *
- * WS2812B latch the last frame they received and hold it for as long as they
- * have power — nothing refreshes them. So a frame committed here survives the
- * reset and stays lit through MCUboot's entire DFU window, even though the
- * bootloader never touches the LEDs. That would otherwise be impossible:
- * MCUboot's own CONFIG_MCUBOOT_INDICATION_LED drives a plain GPIO, and it has
- * no room for a WS2812B driver.
- *
- * It also outlives a failed update. If a DFU transfer dies partway the image
- * is invalid, MCUboot halts, and this pattern is still on screen — so a watch
- * in that state says "I am waiting for firmware" instead of looking dead.
- *
- * Blue along the top edge: distinct from the red low-battery row at the
- * bottom, and not something any normal mode draws.
- */
-static void show_dfu_pattern(void)
-{
-	k_mutex_lock(&led_mask_mutex, K_FOREVER);
-	led_mask_clear_all();
-	for (int col = 0; col < LED_COLS; col++) {
-		led_mask[LED_LAYER_NOTIFICATION][0][col] = 1;
-	}
-	led_layer_color[LED_LAYER_NOTIFICATION] = (struct led_rgb){0, 80, 200};
-	k_mutex_unlock(&led_mask_mutex);
-
-	led_commit();
-
-	/* led_commit() already waits for the transfer and the latch delay, but
-	 * give the frame a little margin before the reset tears the PWM down. */
-	k_msleep(30);
-}
 
 int main(void)
 {
@@ -198,41 +172,24 @@ int main(void)
 	battery_init();
 	light_init();
 
-	/* Boot finished: stop the indicator, blank everything and drop to idle.
-	 * The watch shows nothing until a button asks it to — pressing left runs
-	 * the reveal. */
+	/* Boot finished. ui_init() parks the sand thread, blanks every layer
+	 * and drops the display — the watch shows nothing until a button asks
+	 * it to. Nothing above this point should have drawn: that was the
+	 * cause of the boot flash, where time_display_init() published the
+	 * clock into the digit layer while the sand thread was already
+	 * committing at 30 Hz, so it was visibly pushed to the LEDs for the
+	 * rest of init before finally being blanked. */
 	boot_indicator_stop();
+	ui_init();
 
-	k_mutex_lock(&led_mask_mutex, K_FOREVER);
-	led_mask_clear_all();
-	k_mutex_unlock(&led_mask_mutex);
-	led_commit();
+	buttons_init(on_button);
 
-	display_off();
-
-	/* btn_dfu and display.c's btn_l are the same physical pin (DT_ALIAS
-	 * btn_left). display_init() above already ran gpio_pin_configure_dt()
-	 * + gpio_pin_interrupt_configure_dt() on it to arm the wake/reveal
-	 * interrupt. Reconfiguring the same pin here as a plain input (as this
-	 * used to do) tears that GPIOTE trigger back down — gpio_nrfx's
-	 * pin-configure path disables and frees any existing trigger/channel
-	 * on a pin before applying a plain reconfigure. That silently broke
-	 * every short left-button press (no wake, no reveal) while the 3s
-	 * hold below kept working since it only polls the raw pin state. Only
-	 * check readiness here; do not reconfigure. */
-	bool dfu_ok = false;
-	if (!gpio_is_ready_dt(&btn_dfu)) {
-		LOG_ERR("DFU button GPIO not ready");
-	} else {
-		dfu_ok = true;
-	}
-
-	bool batt_ok = false;
-	if (!gpio_is_ready_dt(&btn_batt)) {
-		LOG_ERR("Battery button GPIO not ready");
-	} else {
-		gpio_pin_configure_dt(&btn_batt, GPIO_INPUT);
-		batt_ok = true;
+	/* Bench/demo only, default off — see CONFIG_EW_SAND_DEMO_AT_BOOT.
+	 * Goes through the UI rather than seeding directly, so the sand page
+	 * owns the display like any other. */
+	if (CONFIG_EW_SAND_DEMO_AT_BOOT > 0) {
+		ui_goto(UI_PAGE_SAND);
+		LOG_INF("Sand demo page opened at boot");
 	}
 
 	LOG_INF("Every Watch starting");
@@ -240,47 +197,19 @@ int main(void)
 	/* With CONFIG_SINGLE_APPLICATION_SLOT=y, MCUboot has no secondary slot
 	 * and no revert mechanism. boot_write_img_confirmed() is not needed. */
 
-	int32_t held_ms      = 0;
-	int32_t batt_held_ms = 0;
-	bool    batt_fired   = false;
-
+	/*
+	 * Idle. Input is interrupt-driven in buttons.c and pages are driven by
+	 * ui.c, so there is nothing to poll — this loop exists only to feed
+	 * the watchdog.
+	 *
+	 * It remains the right liveness point: it runs on the main thread at
+	 * the lowest priority in the system, so if it stops being scheduled
+	 * something has gone badly wrong regardless of which subsystem caused
+	 * it. Deliberately slower than the old 50 ms poll, since it no longer
+	 * has any input latency to service — see watchdog.h for the margin.
+	 */
 	while (true) {
-		k_sleep(K_MSEC(50));
-
-		/* Liveness for the watchdog — see watchdog.h. This loop is the
-		 * chosen heartbeat because it is what services the DFU hold
-		 * below: if it stops running, the on-device route back to a
-		 * reflash is gone, which is exactly when a reset is wanted. */
 		watchdog_alive();
-
-		if (dfu_ok && gpio_pin_get_dt(&btn_dfu)) {
-			held_ms = MIN(held_ms + 50, 5000);
-			if (held_ms >= 3000) {
-				LOG_INF("DFU: rebooting into bootloader");
-				show_dfu_pattern();
-				sys_reboot(SYS_REBOOT_COLD);
-			}
-		} else {
-			held_ms = 0;
-		}
-
-		/* Latched on batt_fired so the readout appears once per hold. The
-		 * DFU branch above needs no equivalent because it never returns. */
-		if (batt_ok && gpio_pin_get_dt(&btn_batt)) {
-			if (batt_held_ms == 0) {
-				/* Just pressed: sample light now, with the display
-				 * still off, rather than reading whatever the timer
-				 * last happened to catch. */
-				light_sample_now();
-			}
-			batt_held_ms = MIN(batt_held_ms + 50, 5000);
-			if (batt_held_ms >= 3000 && !batt_fired) {
-				batt_fired = true;
-				battery_show_level();
-			}
-		} else {
-			batt_held_ms = 0;
-			batt_fired   = false;
-		}
+		k_sleep(K_MSEC(500));
 	}
 }

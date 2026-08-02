@@ -53,6 +53,26 @@ config EW_SELFTEST_HALT_ON_FAIL
 	  check failed. During bring-up you usually want the opposite: see the
 	  failures but still get a running watch to poke at.
 
+config EW_SAND_DEMO_AT_BOOT
+	int "Seed the sand simulation at boot with this fill percentage"
+	default 0
+	range 0 60
+	help
+	  0 disables. Any other value seeds that percentage of the grid with
+	  randomly coloured grains at the end of boot and leaves the display on,
+	  so the sand simulation is running and visible without needing a
+	  trigger.
+
+	  Exists because the interactive `sand fill` shell command needs RTT
+	  shell input, and OpenOCD's RTT server does not reliably deliver
+	  writes to the target's down-buffer — the up-channel (log output)
+	  works, the down-channel does not. This gives a way to see the
+	  simulation on hardware regardless.
+
+	  For bench and demo use. Leave at 0 for anything shipping: it holds
+	  the display on indefinitely, which is neither the intended UX nor
+	  kind to the battery.
+
 config EW_IMU_ANYMOTION_WAKE
 	bool "Arm the IMU any-motion trigger for wrist-tilt wake"
 	default n

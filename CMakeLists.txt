@@ -32,6 +32,8 @@ else()
         src/ble/ble.c
         src/battery/battery.c
         src/light/light.c
+        src/buttons/buttons.c
+        src/ui/ui.c
     )
 
     # Guarded: watchdog.c's DEVICE_DT_GET(DT_ALIAS(watchdog0)) fails to link

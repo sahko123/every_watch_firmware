@@ -703,17 +703,36 @@ int sand_count(void)
 
 void sand_suspend(void)
 {
-	/* Take sand_mutex first so the thread can only be frozen between
-	 * ticks, never mid-critical-section holding it. Without this, a
-	 * caller elsewhere (e.g. battery.c's level_show_for() -> sand_clear())
-	 * that tries to lock sand_mutex while the suspended thread is still
-	 * holding it would block forever — display_on()/sand_resume() being
-	 * the only thing that could ever unblock it creates a real deadlock
-	 * path, not just a lock-ordering nicety. Mirrors display.c's own
-	 * led_commit_mutex handshake for the same reason. */
+	/*
+	 * Both mutexes, in this order, and the order matters.
+	 *
+	 * led_commit_mutex first: the sand thread releases sand_mutex *before*
+	 * calling led_commit(), so it can be sitting inside a DMA transfer
+	 * holding led_commit_mutex while sand_mutex is free. Suspending it
+	 * there freezes the thread still holding led_commit_mutex, and the
+	 * next caller to want it blocks forever — sand_resume() being the only
+	 * thing that could release it. Zephyr's priority inheritance makes
+	 * taking it here wait for the in-flight commit to finish instead.
+	 *
+	 * sand_mutex second: same argument one level down, so the thread is
+	 * never frozen mid-tick holding it, which would deadlock anything
+	 * calling sand_clear() or sand_count().
+	 *
+	 * Held here rather than left to callers because getting it wrong is
+	 * invisible until it hangs: this was originally display_off()'s
+	 * private handshake, and the first caller that did not know about it
+	 * (ui_init()) hung the boot solid.
+	 *
+	 * Lock order across the codebase is led_commit_mutex -> sand_mutex ->
+	 * led_mask_mutex; nothing acquires them in the opposite direction.
+	 */
+	k_mutex_lock(&led_commit_mutex, K_FOREVER);
 	k_mutex_lock(&sand_mutex, K_FOREVER);
+
 	k_thread_suspend(&sand_thread_data);
+
 	k_mutex_unlock(&sand_mutex);
+	k_mutex_unlock(&led_commit_mutex);
 }
 
 void sand_resume(void)
@@ -732,7 +751,7 @@ void sand_resume(void)
 #ifdef CONFIG_SHELL
 
 #include <zephyr/shell/shell.h>
-#include "display/display.h"
+#include "ui/ui.h"
 
 static int cmd_sand_fill(const struct shell *sh, size_t argc, char **argv)
 {
@@ -742,9 +761,11 @@ static int cmd_sand_fill(const struct shell *sh, size_t argc, char **argv)
 		pct = (uint8_t)strtoul(argv[1], NULL, 0);
 	}
 
-	/* Wake the display first: the sand thread is suspended while it is
-	 * off, so seeding without this fills a grid nothing is ticking. */
-	display_on();
+	/* Go through the UI so the sand page owns the display like any other,
+	 * rather than this poking display_on() behind the arbiter's back. The
+	 * page seeds at its own configured fill; the argument here overrides
+	 * it afterwards for experimenting with density. */
+	ui_goto(UI_PAGE_SAND);
 	sand_fill_random(pct);
 
 	shell_print(sh, "seeded ~%u%% of %d cells with random hues; "

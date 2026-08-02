@@ -190,10 +190,11 @@ static void wave_work_fn(struct k_work *work)
         return;
     }
 
-    /* This only ticks while charging, so it doubles as the thing keeping the
-     * display's own 10 s auto-off timeout from firing between battery polls
-     * (which are up to 15 s apart) while the persistent charging view is up. */
-    display_reset_timeout();
+    /* No longer needs to hold the display awake: page lifetime is the UI's
+     * business now, and the battery page carries its own timeout. This used
+     * to call display_reset_timeout() every tick purely to stop the old
+     * global 10 s auto-off firing between battery polls (up to 15 s apart)
+     * while the persistent charging view was up. */
 
     wave_phase += 4;
     level_paint();

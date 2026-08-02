@@ -3,95 +3,31 @@
 #include "sand/sand.h"
 #include "imu/imu.h"
 #include "time_display/time_display.h"
-#include "light/light.h"
 #include "battery/battery.h"
 
 #include <zephyr/kernel.h>
-#include <zephyr/drivers/gpio.h>
 #include <zephyr/logging/log.h>
 #include <string.h>
 
 LOG_MODULE_REGISTER(display, LOG_LEVEL_INF);
 
-static bool is_on;
-
-/* -------------------------------------------------------------------------
- * Work items — button ISR and timer callback run in ISR context, so they
- * can't call k_thread_suspend/resume directly. Defer to the system work queue.
- * ------------------------------------------------------------------------- */
-
-static void on_work_fn(struct k_work *w);
-static void off_work_fn(struct k_work *w);
-
-K_WORK_DEFINE(on_work,  on_work_fn);
-K_WORK_DEFINE(off_work, off_work_fn);
-
-/* -------------------------------------------------------------------------
- * Auto-off timer
- * ------------------------------------------------------------------------- */
-
-static void timeout_cb(struct k_timer *t)
-{
-	ARG_UNUSED(t);
-	k_work_submit(&off_work);
-}
-
-K_TIMER_DEFINE(display_timer, timeout_cb, NULL);
-
-/* -------------------------------------------------------------------------
- * Button interrupts
- * ------------------------------------------------------------------------- */
-
-static const struct gpio_dt_spec btn_l = GPIO_DT_SPEC_GET(DT_ALIAS(btn_left),  gpios);
-
-static struct gpio_callback btn_l_cb;
-
-/* Left button wakes the display and starts the time reveal. Deferred to the
- * work queue like everything else here: the reveal reads the RTC over I2C,
- * which must not happen in ISR context.
+/*
+ * Panel power only.
  *
- * The right button deliberately has no press handler here. It used to also
- * wake the display, but time_display.c republishes the current time into the
- * digit layer every second regardless of display state — so waking on a bare
- * right press showed the time instantly with no reveal, which read as a
- * separate, unintended "instant time" mode. The right button's own behaviour
- * (the 3 s hold for the battery readout, polled in main.c) already wakes the
- * display itself once it fires. */
-static void reveal_work_fn(struct k_work *w)
-{
-	ARG_UNUSED(w);
-	time_display_reveal();
-}
+ * This module used to be the whole UI: it owned a left-button interrupt, its
+ * own idea of what a press meant, and a 10 s auto-off timer. All three have
+ * moved — input to buttons.c, page lifetime and arbitration to ui.c — leaving
+ * this with one job: turn the display on and off, and park or start the
+ * threads that drive it.
+ *
+ * Callers are expected to be on a thread or the system workqueue. Nothing
+ * here is ISR-safe; it suspends threads and blocks on DMA.
+ */
 
-K_WORK_DEFINE(reveal_work, reveal_work_fn);
-
-void display_wake_and_reveal(void)
-{
-	/* Sample ambient light before anything below turns the LEDs on — the
-	 * system workqueue runs these in submission order, so this reading is
-	 * still taken with the display off. */
-	light_sample_now();
-
-	k_work_submit(&on_work);
-	k_work_submit(&reveal_work);
-}
-
-static void btn_isr(const struct device *port, struct gpio_callback *cb, uint32_t pins)
-{
-	ARG_UNUSED(port); ARG_UNUSED(cb); ARG_UNUSED(pins);
-
-	display_wake_and_reveal();
-}
-
-/* -------------------------------------------------------------------------
- * State transitions
- * ------------------------------------------------------------------------- */
+static bool is_on;
 
 void display_on(void)
 {
-	/* Always reset the timeout, even if already on */
-	k_timer_start(&display_timer, K_SECONDS(DISPLAY_TIMEOUT_S), K_NO_WAIT);
-
 	if (is_on) {
 		return;
 	}
@@ -109,24 +45,17 @@ void display_off(void)
 	}
 
 	is_on = false;
-	k_timer_stop(&display_timer);
 
-	/* Acquire the commit mutex before suspending the sand thread. Zephyr's
-	 * k_mutex has priority inheritance: if the sand thread holds the mutex
-	 * mid-DMA, it gets elevated to our priority and completes before we
-	 * proceed. Once we hold it, sand cannot start a new commit.
-	 * sand_suspend() itself now also takes sand_mutex (see sand.c) so the
-	 * thread can't be frozen mid-tick holding it either. */
-	k_mutex_lock(&led_commit_mutex, K_FOREVER);
+	/* sand_suspend() takes led_commit_mutex and sand_mutex itself, so it
+	 * cannot freeze the sand thread mid-DMA or mid-tick — see the comment
+	 * on it. This used to be done here, which meant every other caller had
+	 * to know about the handshake and one of them didn't. */
 	sand_suspend();
-	k_mutex_unlock(&led_commit_mutex);
-
-	/* Outside led_commit_mutex on purpose: this mutex exists solely to
-	 * stop sand suspending mid-DMA, and imu_suspend() has nothing to do
-	 * with that — it just needs to run after sand is safely stopped. */
 	imu_suspend();
 
-	/* Sand is suspended; push one blank frame to clear the LEDs */
+	/* Sand is suspended; push one blank frame to clear the LEDs. ui.c
+	 * blanks before every transition too, but display_off() is also
+	 * reachable directly and must not leave pixels lit. */
 	k_mutex_lock(&led_mask_mutex, K_FOREVER);
 	memset(led_mask, 0, sizeof(led_mask));
 	k_mutex_unlock(&led_mask_mutex);
@@ -152,72 +81,15 @@ bool display_is_on(void)
 	return is_on;
 }
 
-void display_reset_timeout(void)
-{
-	if (is_on) {
-		k_timer_start(&display_timer, K_SECONDS(DISPLAY_TIMEOUT_S), K_NO_WAIT);
-	}
-}
-
-static void on_work_fn(struct k_work *w)  { ARG_UNUSED(w); display_on(); }
-
-static void off_work_fn(struct k_work *w)
-{
-	ARG_UNUSED(w);
-
-	/* off_work and on_work/reveal_work are both queued from independent
-	 * ISRs (the auto-off timer, the button) onto the same FIFO system
-	 * workqueue with no ordering between them. If the timeout fires in
-	 * the same instant as a fresh button press, off_work can end up
-	 * behind on_work/reveal_work in the queue — and by the time it runs,
-	 * display_on() has already reset display_timer with a fresh 10s
-	 * countdown. Trust the timer's current state over the fact that this
-	 * stale work item exists at all, or a press can be immediately
-	 * undone by the timeout that raced it. */
-	if (k_timer_remaining_get(&display_timer) > 0) {
-		return;
-	}
-
-	display_off();
-}
-
-/* -------------------------------------------------------------------------
- * Init
- * ------------------------------------------------------------------------- */
-
 void display_init(void)
 {
-	if (!gpio_is_ready_dt(&btn_l)) {
-		LOG_ERR("display button GPIO not ready — display permanently off");
-		/* is_on is still false here (never set true), so a later
-		 * display_off() call would early-return and skip suspending
-		 * sand/imu — leaving both running at full rate forever despite
-		 * this log claiming "permanently off". Suspend them directly. */
-		sand_suspend();
-		imu_suspend();
-		return;
-	}
-
-	int rc;
-
-	rc  = gpio_pin_configure_dt(&btn_l, GPIO_INPUT);
-	rc |= gpio_pin_interrupt_configure_dt(&btn_l, GPIO_INT_EDGE_TO_ACTIVE);
-
-	gpio_init_callback(&btn_l_cb, btn_isr, BIT(btn_l.pin));
-	rc |= gpio_add_callback(btn_l.port, &btn_l_cb);
-
-	if (rc) {
-		LOG_ERR("display button GPIO setup failed — display permanently off");
-		sand_suspend();
-		imu_suspend();
-		return;
-	}
-
-	/* Set is_on directly: sand and IMU threads already start running from
-	 * sand_init()/imu_init() in main(), so imu_resume()/sand_resume() are
-	 * not needed here. */
+	/*
+	 * is_on starts true because sand_init()/imu_init() have already started
+	 * their threads by the time this runs. ui_init() then blanks and calls
+	 * display_off(), which is what actually parks them — starting false
+	 * would make that call a no-op and leave both running forever.
+	 */
 	is_on = true;
-	k_timer_start(&display_timer, K_SECONDS(DISPLAY_TIMEOUT_S), K_NO_WAIT);
 
-	LOG_INF("Display state machine ready (%d s timeout)", DISPLAY_TIMEOUT_S);
+	LOG_INF("Display ready");
 }

@@ -3,6 +3,7 @@
 #include "led_matrix/led_matrix.h"
 #include "display/display.h"
 #include "battery/battery.h"
+#include "ui/ui.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/bluetooth/bluetooth.h>
@@ -263,48 +264,53 @@ static const struct led_rgb notif_colors[] = {
     [3] = {255,   0,  0 },  /* alarm    — red   */
 };
 
-/* Wake the display and push the frame from the system work queue.
- * led_commit() blocks ~1-3 ms in DMA; doing that directly on the BT RX
- * thread starves the controller and risks dropped connection events. */
-static void notif_commit_fn(struct k_work *w)
+/*
+ * Notifications are a UI page, not a direct display write.
+ *
+ * This used to paint LED_LAYER_NOTIFICATION straight from the BT RX thread
+ * and then commit from a work item, which meant it could silently clobber
+ * whatever battery.c had on that same layer — and battery.c would carry on
+ * believing it still owned the screen. Now the category is stashed, the UI
+ * is asked for the notification page, and the page draws it. ui_goto()
+ * blanks first, so there is nothing left of the previous page to fight with.
+ *
+ * Still deferred to the workqueue: ui_goto() blanks, commits and may suspend
+ * threads, none of which belongs on the BT RX thread — that starves the
+ * controller and risks dropped connection events.
+ */
+static uint8_t pending_category;
+
+static void notif_show_fn(struct k_work *w)
 {
     ARG_UNUSED(w);
-
-    /* show_notification() below already overwrote LED_LAYER_NOTIFICATION
-     * directly (it runs on the BT RX thread, before this work item gets a
-     * chance to run) — if battery.c's percentage/charging screen was using
-     * that same layer for its own content, it's already been clobbered
-     * without battery.c knowing. Tear its screen state down properly here
-     * (rather than leaving level_showing/charging_mode/its timers all
-     * still believing they own a layer that no longer shows what they
-     * think it shows) — same treatment time_display_reveal() gets. This
-     * must happen here, not in show_notification(), because battery.c's
-     * state is only ever touched from system-workqueue context, and
-     * show_notification() runs on the BT RX thread. */
-    battery_screen_dismiss();
-
-    display_on();
-    led_commit();
+    ui_goto(UI_PAGE_NOTIFICATION);
 }
-static K_WORK_DEFINE(notif_commit_work, notif_commit_fn);
+static K_WORK_DEFINE(notif_show_work, notif_show_fn);
 
-static void show_notification(uint8_t category)
+/* Called by the notification page once ui_goto() has blanked and is ready
+ * for content. Runs on the workqueue, so plain mutex use is fine. */
+void ble_paint_notification(void)
 {
+    uint8_t category = pending_category;
+
     if (category >= ARRAY_SIZE(notif_colors)) {
         category = 0;
     }
 
-    /* Runs on BT RX thread — must hold led_mask_mutex before writing led_mask */
     k_mutex_lock(&led_mask_mutex, K_FOREVER);
-    memset(led_mask[LED_LAYER_NOTIFICATION], 0,
-           sizeof(led_mask[LED_LAYER_NOTIFICATION]));
     for (int col = 0; col < LED_COLS; col++) {
         led_mask[LED_LAYER_NOTIFICATION][0][col] = 1;
     }
     led_layer_color[LED_LAYER_NOTIFICATION] = notif_colors[category];
     k_mutex_unlock(&led_mask_mutex);
 
-    k_work_submit(&notif_commit_work);
+    led_commit();
+}
+
+static void show_notification(uint8_t category)
+{
+    pending_category = category;
+    k_work_submit(&notif_show_work);
 }
 
 static ssize_t on_notif_write(struct bt_conn *conn,

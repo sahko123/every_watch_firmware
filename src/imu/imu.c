@@ -1,6 +1,7 @@
 #include "imu.h"
 #include "sand/sand.h"
 #include "display/display.h"
+#include "ui/ui.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/sensor.h>
@@ -59,8 +60,10 @@ static void motion_trigger_handler(const struct device *dev,
 	LOG_INF("any-motion trigger fired (display %s)",
 		display_is_on() ? "on" : "off");
 
+	/* Only wake from rest: once a page is up, ordinary wrist movement
+	 * during use must not keep yanking the display back to the clock. */
 	if (!display_is_on()) {
-		display_wake_and_reveal();
+		ui_goto(UI_PAGE_CLOCK);
 	}
 }
 
