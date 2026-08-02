@@ -76,7 +76,7 @@ static void light_work_fn(struct k_work *work)
 
     /* Resume/suspend around the read rather than leaving the sensor
      * powered continuously between on-demand samples — mirrors imu.c's
-     * pattern for the BMI270. Whether this has any real effect depends on
+     * pattern for the BMI260. Whether this has any real effect depends on
      * the BH1750 Zephyr driver actually implementing PM_DEVICE actions;
      * unverified here, same caveat as imu.c's equivalent calls. */
     (void)pm_device_action_run(bh, PM_DEVICE_ACTION_RESUME);

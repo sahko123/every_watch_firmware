@@ -14,8 +14,8 @@ static const struct device *bmi = DEVICE_DT_GET(DT_NODELABEL(bmi260));
 static bool imu_ready;
 
 /* -------------------------------------------------------------------------
- * Wrist-tilt wake — BMI270 any-motion feature on INT1 (hardware, independent
- * of the 50 Hz poll thread below; keeps firing even while that thread is
+ * Wrist-tilt wake — BMI260 any-motion feature on INT1 (hardware, independent
+ * of the 30 Hz poll thread below; keeps firing even while that thread is
  * suspended with the display off). Mirrors the plan's "wrist tilt wakes the
  * display" transition, so it only acts while the display is off — once it's
  * on, motion from normal wrist movement during sand mode must not keep
@@ -46,7 +46,7 @@ static int motion_trigger_init(void)
 	rc |= sensor_attr_set(bmi, SENSOR_CHAN_ACCEL_XYZ,
 			       SENSOR_ATTR_SLOPE_DUR, &dur);
 	if (rc) {
-		LOG_ERR("BMI270 any-motion attr config failed: %d", rc);
+		LOG_ERR("BMI260 any-motion attr config failed: %d", rc);
 		return rc;
 	}
 
@@ -57,7 +57,7 @@ static int motion_trigger_init(void)
 
 	rc = sensor_trigger_set(bmi, &trig, motion_trigger_handler);
 	if (rc) {
-		LOG_ERR("BMI270 any-motion trigger set failed: %d", rc);
+		LOG_ERR("BMI260 any-motion trigger set failed: %d", rc);
 		return rc;
 	}
 
@@ -65,7 +65,7 @@ static int motion_trigger_init(void)
 }
 
 /*
- * Convert BMI270 sensor_value accelerometer reading to a Q8 sand gravity vector.
+ * Convert BMI260 sensor_value accelerometer reading to a Q8 sand gravity vector.
  * GRAVITY_Q8_1G (256) = 1g. Scale factor: GRAVITY_Q8_1G / 9.8 ≈ 26.
  *
  * sensor_value: val1 = integer m/s², val2 = fractional µm/s² (millionths).
@@ -109,7 +109,7 @@ static void imu_thread(void *p1, void *p2, void *p3)
 		int err = sensor_sample_fetch(bmi);
 
 		if (err) {
-			LOG_WRN("BMI270 fetch failed: %d", err);
+			LOG_WRN("BMI260 fetch failed: %d", err);
 			k_msleep(IMU_PERIOD_MS);
 			continue;
 		}
@@ -136,7 +136,7 @@ void imu_suspend(void)
 	k_thread_suspend(&imu_thread_data);
 	int rc = pm_device_action_run(bmi, PM_DEVICE_ACTION_SUSPEND);
 	if (rc) {
-		LOG_ERR("BMI270 suspend failed: %d", rc);
+		LOG_ERR("BMI260 suspend failed: %d", rc);
 	}
 }
 
@@ -147,17 +147,64 @@ void imu_resume(void)
 	}
 	int rc = pm_device_action_run(bmi, PM_DEVICE_ACTION_RESUME);
 	if (rc) {
-		LOG_ERR("BMI270 resume failed: %d", rc);
+		LOG_ERR("BMI260 resume failed: %d", rc);
 	}
 	k_thread_resume(&imu_thread_data);
+}
+
+/*
+ * Power up and configure the accelerometer.
+ *
+ * This is not optional setup — the driver deliberately leaves init with the
+ * sensor in advanced power save and the accelerometer OFF, and the only thing
+ * that switches it on is setting the sampling frequency (set_accel_odr_osr()
+ * is what writes PWR_CTRL_ACC_EN). Without this the driver reports ready,
+ * sample_fetch and channel_get all succeed, and every axis reads exactly
+ * 0.00 — which is precisely how this presented before it was found.
+ *
+ * Order matters and is prescribed by the driver: full scale and oversampling
+ * first, sampling frequency LAST, because that call also selects the power
+ * mode. Zephyr's own bmi270 sample carries the same warning.
+ *
+ * The gyroscope is deliberately left powered down. Nothing in this firmware
+ * uses it — sand gravity needs the accelerometer only — and on a coin cell
+ * the gyro is by far the more expensive of the two to run.
+ */
+static int accel_config(void)
+{
+	/* 2g: this only ever measures gravity to derive a tilt direction, so
+	 * the smallest range gives the most resolution where it matters. */
+	struct sensor_value full_scale  = {.val1 = 2,  .val2 = 0};
+	struct sensor_value oversampling = {.val1 = 1, .val2 = 0}; /* normal */
+	/* 50 Hz against a 30 Hz consumer: comfortably above the poll rate
+	 * without paying for bandwidth nothing reads. */
+	struct sensor_value sampling_freq = {.val1 = 50, .val2 = 0};
+	int rc;
+
+	rc  = sensor_attr_set(bmi, SENSOR_CHAN_ACCEL_XYZ,
+			      SENSOR_ATTR_FULL_SCALE, &full_scale);
+	rc |= sensor_attr_set(bmi, SENSOR_CHAN_ACCEL_XYZ,
+			      SENSOR_ATTR_OVERSAMPLING, &oversampling);
+	rc |= sensor_attr_set(bmi, SENSOR_CHAN_ACCEL_XYZ,
+			      SENSOR_ATTR_SAMPLING_FREQUENCY, &sampling_freq);
+
+	if (rc) {
+		LOG_ERR("accel config failed: %d — axes will read zero", rc);
+	}
+
+	return rc;
 }
 
 void imu_init(void)
 {
 	if (!device_is_ready(bmi)) {
-		LOG_ERR("BMI270 not ready");
+		LOG_ERR("BMI260 not ready");
 		return;
 	}
+
+	/* Before the trigger: any-motion watches the accelerometer, so it has
+	 * to be running first. */
+	(void)accel_config();
 
 	/* Non-fatal: worst case is losing wrist-tilt wake, gravity-driven sand
 	 * mode still works off the poll thread below. */

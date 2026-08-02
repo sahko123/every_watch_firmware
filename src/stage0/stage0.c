@@ -45,7 +45,7 @@ static const struct i2c_expect expected[] = {
 	{0x23, "BH1750   ambient light"},
 	{0x32, "FRTC8900 real-time clock"},
 	{0x55, "BQ27441  fuel gauge"},
-	{0x68, "BMI270   IMU"},
+	{0x68, "BMI260   IMU"},
 };
 
 /* Zero-length write. ACK means something is holding SDA low for that address. */
@@ -162,7 +162,7 @@ int main(void)
 	printk("\n----------------------------------------------------------\n");
 	printk(" Shell is live on RTT buffer 1. Useful commands:\n");
 	printk("   i2c scan i2c@40003000\n");
-	printk("   i2c read i2c@40003000 0x68 0x00 1     (BMI270 chip id, expect 0x24)\n");
+	printk("   i2c read i2c@40003000 0x68 0x00 1     (BMI260 chip id, expect 0x27)\n");
 	printk("   i2c read i2c@40003000 0x23 0x00 1     (BH1750)\n");
 	printk("   device list\n");
 	printk("   kernel uptime\n");

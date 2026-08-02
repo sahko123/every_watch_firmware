@@ -75,7 +75,7 @@ static const struct i2c_expect expected[] = {
 	{0x23, "BH1750   ambient light"},
 	{0x32, "FRTC8900 real-time clock"},
 	{0x55, "BQ27441  fuel gauge"},
-	{0x68, "BMI270   IMU"},
+	{0x68, "BMI260   IMU"},
 };
 
 /* Zero-length write — the standard I2C presence probe. ACK means a device
@@ -190,13 +190,44 @@ static void test_rtc(void)
 
 static void test_imu(void)
 {
-	printk("\n-- BMI270 IMU --------------------------------------------\n");
+	printk("\n-- BMI260 IMU --------------------------------------------\n");
 
 	if (!device_is_ready(imu_dev)) {
 		check("IMU", "driver ready", false);
 		return;
 	}
 	check("IMU", "driver ready", true);
+
+	/*
+	 * Power the accelerometer up before reading it. The driver leaves init
+	 * with the sensor in advanced power save and the accelerometer OFF —
+	 * setting the sampling frequency is what actually enables it. Without
+	 * this every axis reads exactly 0.00 while sample_fetch and
+	 * channel_get both cheerfully report success, so the test looked like
+	 * it was passing right up until the magnitude check.
+	 *
+	 * Done here rather than relying on imu_init(), because selftest_run()
+	 * deliberately runs before the application subsystems start — a
+	 * hardware test that depends on app init having already happened isn't
+	 * testing the hardware. Order is prescribed: frequency last, since it
+	 * also selects the power mode.
+	 */
+	struct sensor_value fs   = {.val1 = 2,  .val2 = 0};
+	struct sensor_value osr  = {.val1 = 1,  .val2 = 0};
+	struct sensor_value freq = {.val1 = 50, .val2 = 0};
+	int cfg_rc;
+
+	cfg_rc  = sensor_attr_set(imu_dev, SENSOR_CHAN_ACCEL_XYZ,
+				  SENSOR_ATTR_FULL_SCALE, &fs);
+	cfg_rc |= sensor_attr_set(imu_dev, SENSOR_CHAN_ACCEL_XYZ,
+				  SENSOR_ATTR_OVERSAMPLING, &osr);
+	cfg_rc |= sensor_attr_set(imu_dev, SENSOR_CHAN_ACCEL_XYZ,
+				  SENSOR_ATTR_SAMPLING_FREQUENCY, &freq);
+	check("IMU", "configure accel (2g, 50 Hz)", cfg_rc == 0);
+
+	/* The accelerometer needs a moment after power-up before its output
+	 * registers hold a real conversion rather than zeros. */
+	k_msleep(50);
 
 	if (sensor_sample_fetch(imu_dev) != 0) {
 		check("IMU", "sample fetch", false);
