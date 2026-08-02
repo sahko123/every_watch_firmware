@@ -24,12 +24,27 @@ unreachable on this hardware no matter what's enabled via Kconfig.
 - **`zephyr-usb_dfu-watchdog-feed.patch`** (`zephyr`) — `wait_for_usb_dfu()`
   had zero feed calls anywhere inside it, so arming the watchdog above would
   otherwise reset the board while it's just waiting for a human to plug in a
-  USB cable. Adds progress-gated feeding instead: keeps feeding as long as a
-  DFU block has arrived within the last 5 minutes, stops on purpose once
-  nothing has for that long, so the short 30 s hardware timeout catches up
-  and forces a reset — turning "wedged forever, only SWD gets you out" (this
-  board has no VBUS sense, so unplugging the cable doesn't reset the chip)
-  into "self-heals within a few minutes."
+  USB cable. Adds feeding that distinguishes "idle, waiting on a human" from
+  "stuck mid-transfer":
+  - While `appIDLE`/`dfuIDLE`, feed unconditionally. That state is allowed to
+    last forever by design (commit `d4b4585` replaced a 5 s DFU window with a
+    persistent hold precisely so there's no timeout to race while sorting out
+    cables and Zadig drivers) — putting any ceiling on it would quietly undo
+    that.
+  - In any other state, feed only while a download block has actually been
+    written to flash within the last 5 minutes. Once nothing has, stop
+    feeding on purpose so the 30 s hardware timeout catches up and resets —
+    turning "wedged forever, only SWD gets you out" (this board has no VBUS
+    sense, so unplugging the cable doesn't reset the chip) into "self-heals
+    within a few minutes."
+
+  Progress is tracked with a dedicated `dfu_progress_ctr`, bumped in
+  `dfu_flash_write()`. **Do not be tempted to use `dfu_data.block_nr` for
+  this** — it is only incremented on the `DFU_UPLOAD` (device→host) path,
+  which this build doesn't even enable, so it stays zero for an entire
+  firmware download. An earlier version of this patch made exactly that
+  mistake, which would have reset the board 5 minutes into *every* DFU
+  session including healthy ones, potentially mid-flash-write.
 
 ## Reapplying after `west update` or a fresh workspace
 

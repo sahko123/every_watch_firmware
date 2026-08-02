@@ -154,8 +154,14 @@ int main(void)
 
 		if (IS_ENABLED(CONFIG_EW_SELFTEST_HALT_ON_FAIL) && fails > 0) {
 			LOG_ERR("Self-test failed (%d) — halting before app start", fails);
+			/* Keep signalling liveness: this halt is deliberate (an
+			 * end-of-line manufacturing test stopping so an operator
+			 * can read the report), not a hang. Without this the
+			 * watchdog would starve and reset-loop the board, wiping
+			 * the very report this state exists to show. */
 			while (true) {
-				k_sleep(K_FOREVER);
+				watchdog_alive();
+				k_sleep(K_SECONDS(1));
 			}
 		}
 	}
@@ -240,6 +246,12 @@ int main(void)
 
 	while (true) {
 		k_sleep(K_MSEC(50));
+
+		/* Liveness for the watchdog — see watchdog.h. This loop is the
+		 * chosen heartbeat because it is what services the DFU hold
+		 * below: if it stops running, the on-device route back to a
+		 * reflash is gone, which is exactly when a reset is wanted. */
+		watchdog_alive();
 
 		if (dfu_ok && gpio_pin_get_dt(&btn_dfu)) {
 			held_ms = MIN(held_ms + 50, 5000);

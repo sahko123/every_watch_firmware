@@ -1,5 +1,5 @@
 diff --git a/subsys/usb/device/class/dfu/usb_dfu.c b/subsys/usb/device/class/dfu/usb_dfu.c
-index db1706de1d6..7c91308b297 100644
+index db1706de1d6..0518e5fbd61 100644
 --- a/subsys/usb/device/class/dfu/usb_dfu.c
 +++ b/subsys/usb/device/class/dfu/usb_dfu.c
 @@ -53,6 +53,15 @@
@@ -18,39 +18,88 @@ index db1706de1d6..7c91308b297 100644
  #include <zephyr/logging/log.h>
  LOG_MODULE_REGISTER(usb_dfu, CONFIG_USB_DEVICE_LOG_LEVEL);
  
-@@ -941,22 +950,77 @@ static bool is_dfu_started(void)
+@@ -372,10 +381,24 @@ static void dfu_reset_counters(void)
+ 	}
+ }
+ 
++#ifdef CONFIG_BOOT_WATCHDOG_FEED
++/* every_watch local patch — bumped on every download block actually written
++ * to flash, so wait_for_usb_dfu()'s watchdog gating below has a signal that
++ * genuinely tracks download progress. dfu_data.block_nr is NOT usable for
++ * this: it is only incremented on the DFU_UPLOAD path (device->host), which
++ * this build does not even enable (CONFIG_USB_DFU_ENABLE_UPLOAD=n), so it
++ * is permanently zero during a normal firmware download. */
++static uint32_t dfu_progress_ctr;
++#endif
++
+ static void dfu_flash_write(uint8_t *data, size_t len)
+ {
+ 	bool flush = false;
+ 
++#ifdef CONFIG_BOOT_WATCHDOG_FEED
++	dfu_progress_ctr++;
++#endif
++
+ 	if (!len) {
+ 		/* Download completed */
+ 		flush = true;
+@@ -941,22 +964,111 @@ static bool is_dfu_started(void)
   *
   * @return  N/A
   */
 +#ifdef CONFIG_BOOT_WATCHDOG_FEED
 +/* every_watch local patch — MCUBOOT_WATCHDOG_SETUP() (mcuboot_config.h)
 + * arms a short (30s) hardware timeout meant to catch a genuine hang, but
-+ * this function itself never fed it upstream: not while waiting for a
-+ * human to start a transfer, not while one is in progress (the k_poll
-+ * below can block for the whole rest of a large transfer). Feeding
-+ * unconditionally on every loop iteration would defeat the point — a
-+ * confused-but-still-scheduling DFU state would keep this loop running
-+ * forever and never starve the watchdog. Feeding is instead gated on
-+ * genuine DFU progress (dfu_data.block_nr incrementing): as long as
-+ * something happened within the last DFU_WDT_PROGRESS_TIMEOUT_MS, keep
-+ * feeding; once nothing has for that long, stop on purpose, so the short
-+ * hardware timeout catches up and forces a reset shortly after — turning
-+ * "wedged indefinitely, no VBUS sense means unplugging doesn't reset the
-+ * chip, only SWD gets you out" into "self-heals within a few minutes".
++ * this function never fed it upstream: not while waiting for a human to
++ * start a transfer, not while one is in progress (the k_poll below can
++ * block for the whole rest of a large transfer). Feeding unconditionally
++ * on every loop iteration would defeat the point — a confused-but-still-
++ * scheduling DFU state would keep this loop running forever and never
++ * starve the watchdog.
 + *
-+ * The two timeouts are deliberately different orders of magnitude: this
-+ * one has to be generous enough that a human taking their time to plug in
-+ * a cable, or a slow/large transfer that's still genuinely progressing,
-+ * is never mistaken for "stuck".
++ * So: feed freely while genuinely idle, and only apply a starvation clock
++ * once a transfer is actually underway.
++ *
++ *   idle (appIDLE/dfuIDLE) -> always feed. This is the "held the button,
++ *       now go find the right USB cable / sort out Zadig drivers" state,
++ *       and it is deliberately allowed to last indefinitely (see
++ *       child_image/mcuboot.conf, and commit d4b4585 which replaced a 5s
++ *       DFU window with a persistent hold precisely so there is no
++ *       timeout to race here). Putting any ceiling on this state would
++ *       quietly reintroduce exactly what that change removed.
++ *
++ *   anything else (dfuDNBUSY/dfuDNLOAD_IDLE mid-transfer, dfuERROR, ...)
++ *       -> feed only while dfu_progress_ctr has moved within the last
++ *       DFU_WDT_PROGRESS_TIMEOUT_MS. Once it hasn't, stop feeding on
++ *       purpose so the 30s hardware timeout catches up and resets —
++ *       turning "wedged mid-transfer, and with no VBUS sense on this
++ *       board unplugging the cable doesn't reset the chip either, so
++ *       only SWD gets you out" into "self-heals in a few minutes".
++ *
++ * The progress window is deliberately generous relative to the hardware
++ * timeout: it only has to be longer than the worst-case gap between two
++ * consecutive flash writes of a healthy transfer, and being wrong in the
++ * tight direction resets a device mid-write, which is far worse than
++ * taking a few extra minutes to recover a wedged one.
 + */
 +#define DFU_WDT_PROGRESS_TIMEOUT_MS (5 * 60 * 1000)
 +
-+static void dfu_watchdog_tick(int64_t *last_progress, uint16_t *last_block)
++static void dfu_watchdog_tick(int64_t *last_progress, uint32_t *last_ctr)
 +{
-+	if (dfu_data.block_nr != *last_block) {
-+		*last_block = dfu_data.block_nr;
++	if (dfu_progress_ctr != *last_ctr) {
++		*last_ctr = dfu_progress_ctr;
 +		*last_progress = k_uptime_get();
 +	}
++
++	/* Idle means "waiting on a human", not "hung" — never let the
++	 * starvation clock run here. Also re-arm it, so a transfer that
++	 * starts after a long idle wait gets its full window. */
++	if (dfu_data.state == appIDLE || dfu_data.state == dfuIDLE) {
++		*last_progress = k_uptime_get();
++		MCUBOOT_WATCHDOG_FEED();
++		return;
++	}
++
 +	if (k_uptime_get() - *last_progress < DFU_WDT_PROGRESS_TIMEOUT_MS) {
 +		MCUBOOT_WATCHDOG_FEED();
 +	}
@@ -62,7 +111,7 @@ index db1706de1d6..7c91308b297 100644
  	k_timepoint_t end = sys_timepoint_calc(delay);
 +#ifdef CONFIG_BOOT_WATCHDOG_FEED
 +	int64_t last_progress = k_uptime_get();
-+	uint16_t last_block = dfu_data.block_nr;
++	uint32_t last_ctr = dfu_progress_ctr;
 +#endif
  
  	/* Wait for a prescribed duration of time. If DFU hasn't started within
@@ -70,7 +119,7 @@ index db1706de1d6..7c91308b297 100644
  	 */
  	while (!sys_timepoint_expired(end)) {
 +#ifdef CONFIG_BOOT_WATCHDOG_FEED
-+		dfu_watchdog_tick(&last_progress, &last_block);
++		dfu_watchdog_tick(&last_progress, &last_ctr);
 +#endif
  		if (is_dfu_started()) {
  			k_poll_event_init(&dfu_event, K_POLL_TYPE_SIGNAL,
@@ -82,9 +131,19 @@ index db1706de1d6..7c91308b297 100644
 +			 * specifically so there's a recurring point to feed
 +			 * from while a transfer is actively in progress. */
 +			while (true) {
-+				dfu_watchdog_tick(&last_progress, &last_block);
-+				if (k_poll(&dfu_event, 1,
-+					   K_MSEC(INTERMITTENT_CHECK_DELAY)) == 0) {
++				int rc;
++
++				dfu_watchdog_tick(&last_progress, &last_ctr);
++				rc = k_poll(&dfu_event, 1,
++					    K_MSEC(INTERMITTENT_CHECK_DELAY));
++				if (rc == 0) {
++					break;
++				}
++				if (rc != -EAGAIN) {
++					/* -EAGAIN is the expected per-iteration
++					 * timeout; anything else is a real error,
++					 * and spinning on it would busy-loop. */
++					LOG_DBG("USB DFU Error");
 +					break;
 +				}
 +			}

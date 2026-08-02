@@ -24,8 +24,11 @@ else()
         src/ble/ble.c
         src/battery/battery.c
         src/light/light.c
-        src/watchdog/watchdog.c
     )
+
+    # Guarded: watchdog.c's DEVICE_DT_GET(DT_ALIAS(watchdog0)) fails to link
+    # (undefined __device_dts_ord_N) under any config without the driver.
+    target_sources_ifdef(CONFIG_WATCHDOG app PRIVATE src/watchdog/watchdog.c)
 
     # Hardware self-test — only in bring-up / manufacturing builds.
     target_sources_ifdef(CONFIG_EW_SELFTEST app PRIVATE src/selftest/selftest.c)
