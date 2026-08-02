@@ -121,6 +121,16 @@
 	 * Restore I2C_BITRATE_FAST once 2.2k-4.7k resistors are fitted. */
 	clock-frequency = <I2C_BITRATE_STANDARD>;
 
+	/* The BMI260 driver uploads its 8 KB feature-engine config blob in
+	 * 256-byte bursts, and the nRF TWIM driver has to prepend the register
+	 * address to each one. It merges them through an internal concatenation
+	 * buffer that defaults to 16 bytes, so every chunk was rejected with
+	 * "internal driver buffer ... insufficient (1 + 256 > 16)" and nothing
+	 * ever reached the sensor — leaving it stuck short of INIT_OK. 257 is
+	 * the true minimum; 264 rounds up for headroom. Costs this much RAM
+	 * permanently, which is why it is not simply set large. */
+	zephyr,concat-buf-size = <264>;
+
 	frtc8900: frtc8900@32 {
 		compatible = "nyfea,frtc8900";
 		reg = <0x32>;
@@ -128,8 +138,8 @@
 		int-gpios = <&gpio0 0 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
 	};
 
-	bmi270: bmi270@68 {
-		compatible = "bosch,bmi270";
+	bmi260: bmi260@68 {
+		compatible = "bosch,bmi260";
 		reg = <0x68>;
 		irq-gpios = <&gpio0 30 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>,
 		            <&gpio0 31 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;

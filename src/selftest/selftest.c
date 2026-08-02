@@ -54,7 +54,7 @@ static void print_sv(const char *label, const struct sensor_value *v, const char
 
 static const struct device *const i2c0_dev = DEVICE_DT_GET(DT_NODELABEL(i2c0));
 static const struct device *const rtc_dev  = DEVICE_DT_GET(DT_ALIAS(rtc0));
-static const struct device *const imu_dev  = DEVICE_DT_GET(DT_NODELABEL(bmi270));
+static const struct device *const imu_dev  = DEVICE_DT_GET(DT_NODELABEL(bmi260));
 static const struct device *const lgt_dev  = DEVICE_DT_GET(DT_ALIAS(light0));
 static const struct device *const bat_dev  = DEVICE_DT_GET(DT_ALIAS(batt0));
 

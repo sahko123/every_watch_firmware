@@ -1,0 +1,22 @@
+# Copyright (c) 2021, Bosch Sensortec GmbH
+# Copyright (c) 2022, Nordic Semiconductor ASA
+# Copyright (c) 2026, Every Watch
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+    The BMI260 is a 6-axis inertial measurement unit. See more info at:
+    https://www.bosch-sensortec.com/en/products/motion-sensors/imus/bmi260
+
+    Pin- and register-compatible with the BMI270, but NOT interchangeable in
+    firmware: it reports chip ID 0x27 rather than 0x24, and needs its own
+    feature-engine config blob. Use the bosch,bmi270 driver for that part.
+
+include: sensor-device.yaml
+
+compatible: "bosch,bmi260"
+
+properties:
+  irq-gpios:
+    type: phandle-array
+    description: |
+      The INT1 and (optional) INT2 signal connections.

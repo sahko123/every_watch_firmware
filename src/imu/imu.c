@@ -10,7 +10,7 @@
 
 LOG_MODULE_REGISTER(imu, LOG_LEVEL_INF);
 
-static const struct device *bmi = DEVICE_DT_GET(DT_NODELABEL(bmi270));
+static const struct device *bmi = DEVICE_DT_GET(DT_NODELABEL(bmi260));
 static bool imu_ready;
 
 /* -------------------------------------------------------------------------

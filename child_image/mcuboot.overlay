@@ -24,7 +24,7 @@
 
 &i2c0 {
 	/delete-node/ frtc8900@32;
-	/delete-node/ bmi270@68;
+	/delete-node/ bmi260@68;
 	/delete-node/ bh1750@23;
 	/delete-node/ bq27441@55;
 };

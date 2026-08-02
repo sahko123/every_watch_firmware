@@ -2,6 +2,14 @@ cmake_minimum_required(VERSION 3.20.0)
 # Register the boards/ directory inside this repo as a board root so that
 # the every_watch board definition is visible to Zephyr's CMake machinery.
 list(APPEND BOARD_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
+
+# In-repo Zephyr module: BMI260 IMU driver. Neither Zephyr nor NCS ships one
+# (checked upstream too — zero mentions of bmi260 anywhere in the tree), and
+# the BMI270 driver rejects this part on its chip ID. Kept in-repo rather than
+# as a west module so it survives a workspace rebuild without a second repo to
+# keep in sync — see modules/bmi260/README.md.
+list(APPEND ZEPHYR_EXTRA_MODULES ${CMAKE_CURRENT_SOURCE_DIR}/modules/bmi260)
+
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(every_watch)
 
