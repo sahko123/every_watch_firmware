@@ -23,10 +23,18 @@
  *
  *   sha256 cf0527e2a34aaf3acfdf5ca539cfb47c2381693d064b49d1479ebcfab0cca377
  *
- * Sourced from github.com/justinweiss/bmi260 (a BMI260 Linux driver), which
- * carries the Bosch BSD-3-Clause header reproduced above. Only one upstream
- * copy of this blob has been located — the check that it is correct for this
- * part is empirical: a wrong blob is expected to fail the INIT_OK handshake.
+ * Provenance: Bosch -> Chromium OS EC (third_party/bmi260/) -> the Linux
+ * BMI260 drivers that redistribute it. Verified byte-identical (same sha256
+ * above) between github.com/justinweiss/bmi260 and github.com/hhd-dev/bmi260,
+ * the latter of which names the ChromeOS origin explicitly:
+ *   chromium.googlesource.com/chromiumos/platform/ec/+/2adede0/third_party/
+ *   bmi260/accelgyro_bmi260_config_tbin.h
+ * Both carry the Bosch BSD-3-Clause header reproduced above, and hhd-dev's
+ * README independently confirms the split: driver code GPL-2.0 (inherited
+ * from the kernel's BMI160 driver it was based on), blob BSD-3-Clause.
+ *
+ * Confirmed correct on hardware: the feature engine reports INIT_OK and the
+ * accelerometer returns a plausible 1 g magnitude.
  */
 
 #ifndef ZEPHYR_DRIVERS_SENSOR_BMI260_CONFIG_FILE_H_
