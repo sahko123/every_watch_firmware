@@ -1,8 +1,8 @@
 # Flash layout — nRF52833 (512 KB internal flash)
 # Single-slot MCUboot: no secondary slot, no swap.
 #
-# DFU: hold left button 3 s -> app calls sys_reboot() -> MCUboot opens
-#      5-second USB DFU window -> dfu-util -d 2fe3:0100 -a 0 -D app_update.bin
+# DFU: hold left button 3 s -> app calls sys_reboot() -> MCUboot waits
+#      indefinitely in USB DFU -> dfu-util -d 2fe3:ffff -a 0 -D app_update.bin
 #
 #   0x00000 – 0x0BFFF  MCUboot (48 KB)          — bootloader + USB DFU WAIT mode
 #   0x0C000 – 0x0C1FF  mcuboot_pad (512 B)       — MCUboot image header

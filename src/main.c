@@ -22,9 +22,11 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 static const struct device *rtc = DEVICE_DT_GET(DT_ALIAS(rtc0));
 
-/* Hold left button for 3 seconds while USB is plugged in to enter DFU mode.
- * sys_reboot() hands control back to MCUboot, which opens a 5-second USB DFU
- * window. Works from battery: plug in USB first, then hold the button. */
+/* Hold left button for 3 seconds to enter DFU mode. sys_reboot() hands control
+ * back to MCUboot, which then waits indefinitely for a USB DFU transfer — no
+ * cable check (this PCB has no VBUS sense), so holding without USB plugged in
+ * strands the watch in DFU until either a transfer arrives or the battery
+ * runs down; see child_image/mcuboot.conf's "TRADE-OFF, deliberate" note. */
 static const struct gpio_dt_spec btn_dfu = GPIO_DT_SPEC_GET(DT_ALIAS(btn_left), gpios);
 
 /* Hold right button for 3 seconds to show the battery percentage. Polled in
@@ -40,8 +42,9 @@ static const struct gpio_dt_spec btn_batt = GPIO_DT_SPEC_GET(DT_ALIAS(btn_right)
  * rather than the notification layer so it cannot collide with the low-battery
  * warning, which comes up during init.
  *
- * Note this only covers the application. MCUboot's USB DFU window runs for five
- * seconds before any of this, and the display is dark for all of it.
+ * Note this only covers the application. When MCUboot enters USB DFU (button
+ * held at boot) it runs before any of this, and the display is dark for all
+ * of it — however long the wait, since that mode has no timeout either.
  */
 static void boot_blink_fn(struct k_work *w)
 {
