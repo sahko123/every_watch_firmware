@@ -28,4 +28,7 @@ else()
 
     # Hardware self-test — only in bring-up / manufacturing builds.
     target_sources_ifdef(CONFIG_EW_SELFTEST app PRIVATE src/selftest/selftest.c)
+
+    # `settime <epoch>` shell command — only where a shell exists.
+    target_sources_ifdef(CONFIG_SHELL app PRIVATE src/time_sync/time_sync.c)
 endif()
