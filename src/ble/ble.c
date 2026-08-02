@@ -71,6 +71,10 @@ static const struct bt_le_adv_param adv_slow_param =
 static void adv_slow_fn(struct k_work *w);
 static K_WORK_DELAYABLE_DEFINE(adv_slow_work, adv_slow_fn);
 
+/* Tracks which param set is currently active, so adv_update_work_fn() below
+ * can restart advertising in place without forcing a return to fast mode. */
+static bool adv_is_slow;
+
 static void start_adv(void)
 {
     build_mfr_data();
@@ -82,6 +86,7 @@ static void start_adv(void)
         return;
     }
     atomic_set(&adv_running, 1);
+    adv_is_slow = false;
     k_work_reschedule(&adv_slow_work, K_MSEC(ADV_FAST_DURATION_MS));
 }
 
@@ -99,21 +104,41 @@ static void adv_slow_fn(struct k_work *w)
     if (rc) {
         LOG_ERR("slow adv_start failed: %d", rc);
         atomic_set(&adv_running, 0);
+        return;
     }
+    adv_is_slow = true;
 }
 
-/* adv_update_work: restart advertising from workqueue context.
+/* adv_update_work: rebuild mfr_data and restart advertising from workqueue
+ * context, in whichever param set (fast or slow) is currently active.
  * Called via k_work_submit from parse_adv (BT scan callback) — never call
- * bt_le_adv_stop/start directly from the BT RX thread. */
+ * bt_le_adv_stop/start directly from the BT RX thread.
+ *
+ * Deliberately does NOT go through start_adv(): that always restarts in
+ * fast mode and reschedules adv_slow_work a fresh ADV_FAST_DURATION_MS out.
+ * This fires on every new unique encounter (ble_update_adv() -> here), so a
+ * busy encounter event — several watches seen in quick succession — used to
+ * pin advertising in the fast, higher-power interval indefinitely as long
+ * as new encounters kept landing within any 30s window, silently defeating
+ * the whole point of the fast->slow backoff this file otherwise implements
+ * carefully (see the 10% scan duty cycle comment in bt_ready()). */
 static void adv_update_work_fn(struct k_work *w)
 {
     ARG_UNUSED(w);
     if (!atomic_get(&adv_running)) {
         return;
     }
+
     bt_le_adv_stop();
-    atomic_set(&adv_running, 0);
-    start_adv();
+    build_mfr_data();
+
+    const struct bt_le_adv_param *param = adv_is_slow ? &adv_slow_param : BT_LE_ADV_CONN;
+    int rc = bt_le_adv_start(param, adv_data, ARRAY_SIZE(adv_data),
+                             scan_rsp, ARRAY_SIZE(scan_rsp));
+    if (rc) {
+        LOG_ERR("adv restart failed: %d", rc);
+        atomic_set(&adv_running, 0);
+    }
 }
 static K_WORK_DEFINE(adv_update_work, adv_update_work_fn);
 

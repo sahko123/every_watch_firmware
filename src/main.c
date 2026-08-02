@@ -170,8 +170,15 @@ int main(void)
 	 * sitting in the bottom rows underneath the time, permanently. */
 	sand_init();
 
-	display_init();
+	/* imu_init() before display_init(): display_init()'s GPIO-failure
+	 * paths call imu_suspend() to make good on their "display permanently
+	 * off" log line, but imu_suspend() early-returns as a no-op until
+	 * imu_ready is set — which only happens once imu_init() has actually
+	 * run. In the old order that made those failure paths silently leave
+	 * the IMU polling at full rate forever despite the log claiming
+	 * otherwise. */
 	imu_init();
+	display_init();
 	identity_init();
 	ble_init();
 	battery_init();

@@ -1,6 +1,7 @@
 #include "time_display.h"
 #include "led_matrix/led_matrix.h"
 #include "sand/sand.h"
+#include "battery/battery.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/rtc.h>
@@ -192,6 +193,14 @@ void time_display_reveal(void)
 
 	build_bitmap(h, m);
 
+	/* Tear down a battery screen first if one is up — otherwise its
+	 * timers (wave_timer repainting led_color[] every 60ms, level_timer)
+	 * keep running underneath the reveal, and its call into
+	 * time_display_pause() would leave `paused` stuck true for the rest
+	 * of a charging session since nothing but level_dismiss() ever clears
+	 * it. */
+	battery_screen_dismiss();
+
 	/* Blank the whole display, not just the digits. Anything left over —
 	 * settled sand, a battery warning on the notification layer — would sit
 	 * there through the reveal, and the point is that the curtain arrives on
@@ -225,6 +234,7 @@ void time_display_reveal_fill(void)
 	}
 
 	build_bitmap(h, m);
+	battery_screen_dismiss();
 	clear_digits();
 	sand_clear();
 	sand_set_target(bitmap);

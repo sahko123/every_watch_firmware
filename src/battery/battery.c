@@ -250,6 +250,47 @@ static void level_clear_work_fn(struct k_work *work)
     level_dismiss();
 }
 
+/* Called by time_display_reveal() before it takes over the whole screen.
+ * Without this, a button press or wrist-tilt during the battery percentage
+ * peek — or worse, during the persistent charging view — left level_showing/
+ * charging_mode/wave_timer/level_timer all still live while the reveal wiped
+ * the mask out from under them: wave_timer kept firing every 60ms, repainting
+ * led_color[] over whatever the reveal had just drawn, and time_display's
+ * `paused` flag (only ever cleared by level_dismiss()'s time_display_resume()
+ * call) stayed stuck true for the rest of the charging session, freezing the
+ * clock. Safe to call unconditionally from workqueue context: every caller of
+ * time_display_reveal() (button ISR -> reveal_work, wrist-tilt trigger, both
+ * via display_wake_and_reveal()) runs on the system workqueue, the same
+ * thread every other battery.c state mutation runs on. */
+void battery_screen_dismiss(void)
+{
+    if (level_showing) {
+        level_dismiss();
+    }
+
+    /* charging_mode means "the persistent view is (meant to be) up", which
+     * is no longer true once the reveal has taken over. Self-heals on the
+     * next poll or charge-indicator edge: if still actually charging,
+     * battery_work_fn() puts the view right back. */
+    charging_mode = false;
+}
+
+/* Called by display.c's display_off(). The low-battery stripe on
+ * LED_LAYER_NOTIFICATION is wiped along with everything else when the
+ * display goes dark, but low_shown is edge-triggered specifically so it
+ * doesn't re-assert on every poll — with nothing resetting it here, that
+ * meant the warning could be shown at most once per low-battery episode: the
+ * next redraw only happened if voltage recovered above the clear threshold
+ * and dropped low again, or on reboot. Resetting it lets the next poll (up
+ * to POLL_INTERVAL_S later) re-assert it if voltage is still low, so a
+ * critically low battery keeps getting a periodic reminder instead of one
+ * warning that silently stops meaning anything the moment the screen times
+ * out. */
+void battery_notify_display_off(void)
+{
+    low_shown = false;
+}
+
 static void level_show_for(uint32_t show_ms)
 {
     uint8_t pct  = battery_percent();

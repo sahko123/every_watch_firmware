@@ -33,6 +33,17 @@ static uint8_t  unsaved_encounters;
 static struct nvs_fs nvs;
 static bool nvs_ready;
 
+/* Guards dev_dist/enc_count/seen_hashes/seen_count/unsaved_encounters.
+ * identity_on_encounter() (BT RX thread) mutates them; nvs_flush_work_fn()
+ * (system workqueue) reads them to write to flash. Deferring the flash
+ * write off the BT RX thread (so it can't block Bluetooth connection
+ * events on a sector garbage-collect) introduced real cross-thread
+ * concurrency here that didn't exist when everything ran synchronously on
+ * one thread — a flush mid-flight reading seen_hashes[] while a new
+ * encounter's add_seen() mutates the same array (including its ring-buffer
+ * memmove once full) would read/write torn data. */
+static K_MUTEX_DEFINE(identity_mutex);
+
 /* FNV-1a 32-bit over two 32-bit words */
 static uint32_t fnv1a_2x32(uint32_t a, uint32_t b)
 {
@@ -72,18 +83,34 @@ static void nvs_flush_work_fn(struct k_work *work)
         return;
     }
 
+    /* Snapshot under the lock, then do the actual (slow) flash I/O
+     * unlocked — nvs_write() blocking for a sector GC must not also block
+     * identity_on_encounter() on the BT RX thread from updating RAM state
+     * for the next encounter. */
+    uint32_t hashes_copy[MAX_SEEN_HASHES];
+    uint8_t  count_copy;
+    uint8_t  dist_copy;
+    uint16_t enc_copy;
+
+    k_mutex_lock(&identity_mutex, K_FOREVER);
+    memcpy(hashes_copy, seen_hashes, sizeof(hashes_copy));
+    count_copy = seen_count;
+    dist_copy  = dev_dist;
+    enc_copy   = enc_count;
+    k_mutex_unlock(&identity_mutex);
+
     int rc;
 
     rc = nvs_write(&nvs, NVS_KEY_ENC_HASHES,
-                    seen_hashes, seen_count * sizeof(uint32_t));
+                    hashes_copy, count_copy * sizeof(uint32_t));
     if (rc < 0) {
         LOG_ERR("NVS write hashes failed: %d", rc);
     }
-    rc = nvs_write(&nvs, NVS_KEY_DEV_DIST, &dev_dist, sizeof(dev_dist));
+    rc = nvs_write(&nvs, NVS_KEY_DEV_DIST, &dist_copy, sizeof(dist_copy));
     if (rc < 0) {
         LOG_ERR("NVS write dev_dist failed: %d", rc);
     }
-    rc = nvs_write(&nvs, NVS_KEY_ENC_COUNT, &enc_count, sizeof(enc_count));
+    rc = nvs_write(&nvs, NVS_KEY_ENC_COUNT, &enc_copy, sizeof(enc_copy));
     if (rc < 0) {
         LOG_ERR("NVS write enc_count failed: %d", rc);
     }
@@ -156,7 +183,15 @@ void identity_on_encounter(uint32_t their_hash, uint8_t their_dev_dist)
     if (their_hash == own_hash) {
         return;  /* ignore own reflection */
     }
+
+    /* Whole read-modify-write as one critical section, not just the
+     * individual field updates: seen_before()'s check and add_seen()'s
+     * mutation must happen atomically together, or two rapid calls for
+     * the same hash could both pass the check before either adds it. */
+    k_mutex_lock(&identity_mutex, K_FOREVER);
+
     if (seen_before(their_hash)) {
+        k_mutex_unlock(&identity_mutex);
         return;
     }
 
@@ -173,9 +208,19 @@ void identity_on_encounter(uint32_t their_hash, uint8_t their_dev_dist)
         }
     }
 
+    bool flush = false;
+
     unsaved_encounters++;
     if (nvs_ready && unsaved_encounters >= NVS_WRITE_BATCH) {
         unsaved_encounters = 0;
+        flush = true;
+    }
+
+    k_mutex_unlock(&identity_mutex);
+
+    /* Outside the lock: k_work_submit() is fine to call unlocked, and
+     * nvs_flush_work_fn() takes its own snapshot under the same lock. */
+    if (flush) {
         k_work_submit(&nvs_flush_work);
     }
 
@@ -183,7 +228,22 @@ void identity_on_encounter(uint32_t their_hash, uint8_t their_dev_dist)
             enc_count, their_hash, their_dev_dist);
 }
 
-uint32_t identity_hash(void)          { return own_hash; }
-uint8_t  identity_dev_distance(void)  { return dev_dist; }
-uint16_t identity_encounter_count(void) { return enc_count; }
-bool     identity_is_dev(void)        { return dev_dist == 0; }
+uint32_t identity_hash(void) { return own_hash; }  /* set once at boot, never mutated after */
+
+uint8_t identity_dev_distance(void)
+{
+    k_mutex_lock(&identity_mutex, K_FOREVER);
+    uint8_t d = dev_dist;
+    k_mutex_unlock(&identity_mutex);
+    return d;
+}
+
+uint16_t identity_encounter_count(void)
+{
+    k_mutex_lock(&identity_mutex, K_FOREVER);
+    uint16_t c = enc_count;
+    k_mutex_unlock(&identity_mutex);
+    return c;
+}
+
+bool identity_is_dev(void) { return identity_dev_distance() == 0; }

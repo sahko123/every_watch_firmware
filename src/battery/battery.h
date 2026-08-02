@@ -22,3 +22,20 @@ bool     battery_is_low(void);     /* true when SoC < LOW_BATTERY_THRESHOLD */
  * ISR-safe: only submits work onto the system workqueue.
  */
 void     battery_show_level(void);
+
+/*
+ * Tear down whatever battery screen is currently up (percentage peek or the
+ * persistent charging view), if any. Call before anything else takes over
+ * the whole display — currently only time_display_reveal(). Must be called
+ * from workqueue context, not an ISR (calls level_dismiss(), which touches
+ * timers and led_mask directly).
+ */
+void     battery_screen_dismiss(void);
+
+/*
+ * Tell battery.c the display just went fully dark (called by
+ * display.c's display_off()), so an active low-battery warning can
+ * re-assert itself on the next poll instead of being shown at most once
+ * per low-battery episode.
+ */
+void     battery_notify_display_off(void);

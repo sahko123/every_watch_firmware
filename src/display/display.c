@@ -4,6 +4,7 @@
 #include "imu/imu.h"
 #include "time_display/time_display.h"
 #include "light/light.h"
+#include "battery/battery.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
@@ -135,6 +136,13 @@ void display_off(void)
 	 * check, a low-battery blip) must not bring time back on its own — only
 	 * a fresh reveal should. */
 	time_display_deactivate();
+
+	/* The low-battery stripe on the notification layer was just wiped by
+	 * the memset above along with everything else; let battery.c know so
+	 * it can re-assert the warning on its next poll if still low, rather
+	 * than the edge-triggered flag leaving it shown at most once per
+	 * episode. */
+	battery_notify_display_off();
 
 	LOG_INF("Display off");
 }
