@@ -194,41 +194,59 @@ started by the bootloader is inherited by the application as something it must
 feed or die, covering driver init and everything else before `main()`.
 
 MCUboot already has the hook: `MCUBOOT_WATCHDOG_SETUP()` at `main.c:450`, ahead
-of every recovery check. **On nRF it currently expands to nothing:**
+of every recovery check. **Status: implemented, not yet hardware-verified**
+(SWD and USB DFU were both unreliable on the bench at the time this was
+written — see "Proving it works" below for what's still owed). Two things
+about the original plan above turned out to be wrong once actually checked
+against the driver source, not assumed from it:
 
-- `BOOT_WATCHDOG_FEED` defaults `y` on Nordic and `imply`s `NRFX_WDT`
-- the `CONFIG_NRFX_WDT` branch of `mcuboot_config.h` defines only
-  `MCUBOOT_WATCHDOG_FEED()`
-- the branch defining `MCUBOOT_WATCHDOG_SETUP()` as `wdt_setup()` is the
-  generic-driver `#elif`, which is therefore never taken
-- `mcuboot_config.h:381` then supplies an empty fallback definition
-
-So today MCUboot faithfully feeds a watchdog that nothing ever started.
-
-To get the real behaviour, force the generic driver path in MCUboot:
-
-```
-CONFIG_WATCHDOG=y
-CONFIG_WDT_NRFX=y
-CONFIG_NRFX_WDT=n     # override the imply so the nrfx branch is not taken
-```
-
-plus a `watchdog0` devicetree alias pointing at `&wdt0`.
-
-**Unverified:** MCUboot's macro calls `wdt_setup(wdt, 0)` with no preceding
-`wdt_install_timeout()`. Whether that arms a channel on the nrfx driver needs
-checking on hardware; if it does not, MCUboot needs a small `SYS_INIT` that
-installs a timeout and starts the watchdog itself.
+- **The "generic driver" path is unreachable on this SoC, full stop —
+  `CONFIG_NRFX_WDT=n` was never a viable override.** `CONFIG_WDT_NRFX` (the
+  only nRF watchdog driver that exists) unconditionally selects
+  `CONFIG_NRFX_WDT0`, which itself unconditionally selects `CONFIG_NRFX_WDT`
+  (see `modules/hal_nordic/nrfx/Kconfig`) — so `mcuboot_config.h`'s
+  `CONFIG_NRFX_WDT` branch is *always* the one taken, regardless of what's
+  enabled. `CONFIG_NRFX_WDT` also has no Kconfig prompt on this NCS version,
+  so it can't be assigned directly anyway (confirmed by a hard CMake error
+  when tried). Fixed with a small local patch to MCUboot's own
+  `mcuboot_config.h` instead — see `patches/README.md` — adding a real
+  `MCUBOOT_WATCHDOG_SETUP()` to the branch that's actually reachable, rather
+  than trying to force Kconfig into the unreachable one.
+- **The "unverified" `wdt_setup()`-without-`wdt_install_timeout()` gap above
+  was real, confirmed by reading `wdt_nrfx.c` directly** — `wdt_setup()`
+  only applies whatever timeout was previously installed; skip that call and
+  the reload value defaults to 0 with zero allocated channels. The patch
+  installs a timeout first.
+- **The app does not get to pick its own timeout, contrary to what "Watchdog
+  trade-offs" below assumed.** The nRF52's reload value can only be
+  configured before the peripheral starts, and MCUboot is what starts it —
+  so whatever timeout MCUboot's `wdt_install_timeout()` installs (currently
+  30 s, chosen to comfortably exceed anything MCUboot itself legitimately
+  does) is what the app is stuck with for the rest of that power-on session,
+  not a separate value the app can renegotiate. `src/watchdog/watchdog.c`
+  feeds every ~10 s to stay well inside it.
+- **USB DFU needed its own fix, not just MCUboot's.** `wait_for_usb_dfu()`
+  (`subsys/usb/device/class/dfu/usb_dfu.c`) had zero feed calls anywhere
+  inside it — arming the watchdog without also patching this would have
+  reset the board while it was just waiting for a human to plug in a cable.
+  Also patched (`patches/zephyr-usb_dfu-watchdog-feed.patch`) to feed only
+  while a DFU block has arrived within the last 5 minutes, and stop
+  on purpose once nothing has for that long — the short 30 s hardware
+  timeout then catches up and forces a reset, turning "wedged forever, only
+  SWD gets you out" (no VBUS sense on this board, so unplugging the cable
+  doesn't reset the chip) into "self-heals within a few minutes."
 
 ### Watchdog trade-offs
 
 - **Deep sleep.** A deadlocked Zephyr system does not spin — it drops into the
   idle thread and sleeps. The watchdog therefore has to keep counting through
-  sleep, which means waking periodically to feed it. That works against the
-  <10 µA idle target. The nRF52 watchdog can time out up to ~36 hours, so a
-  30-60 s window keeps the wake cost small.
-- **Debugger halts.** Get `CONFIG.HALT` right or the watchdog fires while the
-  CPU is stopped at a breakpoint during bring-up.
+  sleep, which means waking periodically to feed it. In practice this costs
+  nothing extra here: BLE scanning/advertising already wakes the CPU far more
+  often (500 ms scan interval) than the app's ~10 s feed cadence, so the feed
+  timer adds no new wake source against the <10 µA idle target.
+- **Debugger halts.** Handled — `MCUBOOT_WATCHDOG_SETUP()`'s patch passes
+  `WDT_OPT_PAUSE_HALTED_BY_DBG`, so the watchdog pauses while the CPU is
+  halted at a breakpoint over SWD instead of resetting the target mid-debug.
 
 ### Proving it works
 
@@ -258,6 +276,13 @@ same virtual COM port, different command.
 ## Things to verify on hardware
 
 - Whether the watchdog survives and behaves across the MCUboot → app handoff
+- That a genuinely wedged USB DFU session (reproduce: interrupt a transfer
+  mid-download, retry against the same session without power-cycling) really
+  does self-heal via reset within the ~30s-after-5-minutes-idle window,
+  rather than needing SWD as it did before this fix
+- That a healthy, actively-progressing DFU transfer of the real image size
+  (~370 KB) never trips the 30s hard-hang timeout — confirm the per-block
+  progress feed in `wait_for_usb_dfu()` is actually keeping up
 - That the left button reads correctly in MCUboot before the app has configured
   any GPIO
 - That USB enumerates when running from a flat battery on USB power alone

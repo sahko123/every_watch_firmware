@@ -24,6 +24,7 @@ else()
         src/ble/ble.c
         src/battery/battery.c
         src/light/light.c
+        src/watchdog/watchdog.c
     )
 
     # Hardware self-test — only in bring-up / manufacturing builds.

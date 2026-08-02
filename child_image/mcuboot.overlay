@@ -16,9 +16,9 @@
 		 * in USB DFU indefinitely, released = boot normally with no delay. */
 		mcuboot-button0 = &button_left;
 
-		/* EXPERIMENTAL — feasibility test, see RECOVERY.md "The watchdog
-		 * must start in MCUboot". Not wired to anything yet. */
-		watchdog0 = &wdt0;
+		/* watchdog0 is now defined in the shared board devicetree
+		 * (every_watch_nrf52833.dts) instead of duplicated here, since
+		 * the app needs the same alias to feed what MCUboot starts. */
 	};
 };
 

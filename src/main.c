@@ -13,6 +13,7 @@
 #include "ble/ble.h"
 #include "battery/battery.h"
 #include "light/light.h"
+#include "watchdog/watchdog.h"
 
 #ifdef CONFIG_EW_SELFTEST
 #include "selftest/selftest.h"
@@ -122,6 +123,13 @@ static void show_dfu_pattern(void)
 
 int main(void)
 {
+	/* First thing, before anything that could plausibly block for close
+	 * to MCUboot's fixed 30s hardware timeout — the interactive self-test
+	 * below in particular (button waits alone can run up to 30s) would
+	 * blow through that window entirely if the feed timer weren't already
+	 * running by the time it starts. */
+	watchdog_init();
+
 	if (!device_is_ready(rtc)) {
 		LOG_ERR("RTC device not ready — continuing in degraded mode");
 		/* Do NOT return: the DFU button loop below is the only recovery

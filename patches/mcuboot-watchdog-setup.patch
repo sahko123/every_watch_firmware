@@ -1,0 +1,59 @@
+diff --git a/boot/zephyr/include/mcuboot_config/mcuboot_config.h b/boot/zephyr/include/mcuboot_config/mcuboot_config.h
+index 7ef0ae11..914c3cc9 100644
+--- a/boot/zephyr/include/mcuboot_config/mcuboot_config.h
++++ b/boot/zephyr/include/mcuboot_config/mcuboot_config.h
+@@ -309,6 +309,54 @@
+ #if CONFIG_BOOT_WATCHDOG_FEED
+ #if CONFIG_NRFX_WDT
+ #include <nrfx_wdt.h>
++#include <zephyr/device.h>
++#include <zephyr/drivers/watchdog.h>
++
++/*
++ * every_watch local patch — this branch upstream only ever defined
++ * MCUBOOT_WATCHDOG_FEED(), never MCUBOOT_WATCHDOG_SETUP(); the generic-
++ * driver #elif further down (DT_NODE_HAS_STATUS(watchdog0, okay)) is the
++ * one that defines a real setup, but on this SoC it is unreachable: the
++ * only nRF watchdog driver (CONFIG_WDT_NRFX) unconditionally selects
++ * CONFIG_NRFX_WDT0, which itself unconditionally selects CONFIG_NRFX_WDT
++ * (see modules/hal_nordic/nrfx/Kconfig), so this branch is always the one
++ * taken regardless of what's enabled. Without a SETUP definition here,
++ * MCUBOOT_WATCHDOG_SETUP() falls through to the empty fallback at the
++ * bottom of this file and nothing ever arms the watchdog.
++ *
++ * The generic-driver branch's own SETUP is also incomplete as written —
++ * it calls wdt_setup() with no preceding wdt_install_timeout(), and per
++ * wdt_nrfx.c, wdt_setup() only applies whatever timeout was previously
++ * installed; with none installed the reload value defaults to 0 with
++ * zero allocated channels. This definition installs a timeout first.
++ *
++ * WDT_OPT_PAUSE_HALTED_BY_DBG matters specifically for this project: it's
++ * developed and recovered over SWD, and without that flag the watchdog
++ * keeps counting down in real time while the CPU is halted at a
++ * breakpoint or mid-flash, resetting the target out from under an active
++ * debug session.
++ *
++ * 30 s is generous relative to anything this bootloader legitimately
++ * does (SHA-256 + ECDSA-P256 verify over a ~365 KB image and the flash
++ * writes involved are each well under a second on this part) — this
++ * timeout exists to catch a genuine hang (deadlock, hard fault), not to
++ * bound normal operation. See usb_dfu.c's wait_for_usb_dfu() for the
++ * separate, much longer ceiling that governs how long USB DFU is allowed
++ * to sit with no transfer progress before this is allowed to expire.
++ */
++#define MCUBOOT_WATCHDOG_SETUP()                                            \
++    do {                                                                   \
++        const struct device *wdt = DEVICE_DT_GET(DT_ALIAS(watchdog0));     \
++        if (device_is_ready(wdt)) {                                       \
++            struct wdt_timeout_cfg wdt_cfg = {                            \
++                .flags = WDT_FLAG_RESET_SOC,                              \
++                .window.min = 0,                                          \
++                .window.max = 30000,                                      \
++            };                                                            \
++            wdt_install_timeout(wdt, &wdt_cfg);                           \
++            wdt_setup(wdt, WDT_OPT_PAUSE_HALTED_BY_DBG);                   \
++        }                                                                 \
++    } while (0)
+ 
+ #define FEED_WDT_INST(id)                                    \
+     do {                                                     \

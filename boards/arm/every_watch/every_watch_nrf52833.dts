@@ -57,6 +57,12 @@
 		rtc0      = &frtc8900;
 		batt0     = &bq27441;
 		light0    = &bh1750;
+		/* MCUboot starts this watchdog (see child_image/mcuboot.conf)
+		 * and the app must feed it or the board resets every ~30s —
+		 * see src/watchdog/watchdog.c. Shared here (not just in
+		 * child_image/mcuboot.overlay) so the app build resolves
+		 * DT_ALIAS(watchdog0) too. */
+		watchdog0 = &wdt0;
 	};
 };
 

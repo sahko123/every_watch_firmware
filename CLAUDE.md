@@ -44,6 +44,13 @@ This project builds through the legacy child_image path
 that used to warn about this has been removed entirely, so there's nothing
 left to accidentally invoke.
 
+**Two files outside this repo, at `C:\ewdev\zephyr` and
+`C:\ewdev\bootloader\mcuboot`, are hand-patched** to make MCUboot's watchdog
+actually work on this SoC (see `patches/README.md`). A `west update` or a
+fresh workspace checkout loses them silently — run `sh patches/apply.sh
+/c/ewdev` afterward, or the watchdog silently goes back to being inert
+plumbing with no error to notice by.
+
 ## Flashing over USB DFU
 
 `/c/ewdev/flash_usb.sh` handles the runtime→DFU PID switch automatically
