@@ -39,9 +39,10 @@ west build -b every_watch/nrf52833 every_watch_firmware -d build_bringup -- -DEX
 ```
 
 Other build variants (production, USB-CDC console, stage0) are in README.md.
-Do not pass `--sysbuild` — `sysbuild/mcuboot.conf` is stale and disagrees with
-`child_image/mcuboot.conf` on single-slot and USB DFU settings; the
-child_image path is the live one.
+This project builds through the legacy child_image path
+(`child_image/mcuboot.conf`), not sysbuild — the stale `sysbuild/` config
+that used to warn about this has been removed entirely, so there's nothing
+left to accidentally invoke.
 
 ## Flashing over USB DFU
 

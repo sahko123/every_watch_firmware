@@ -2,6 +2,7 @@
 #include "identity/identity.h"
 #include "led_matrix/led_matrix.h"
 #include "display/display.h"
+#include "battery/battery.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/bluetooth/bluetooth.h>
@@ -268,6 +269,20 @@ static const struct led_rgb notif_colors[] = {
 static void notif_commit_fn(struct k_work *w)
 {
     ARG_UNUSED(w);
+
+    /* show_notification() below already overwrote LED_LAYER_NOTIFICATION
+     * directly (it runs on the BT RX thread, before this work item gets a
+     * chance to run) — if battery.c's percentage/charging screen was using
+     * that same layer for its own content, it's already been clobbered
+     * without battery.c knowing. Tear its screen state down properly here
+     * (rather than leaving level_showing/charging_mode/its timers all
+     * still believing they own a layer that no longer shows what they
+     * think it shows) — same treatment time_display_reveal() gets. This
+     * must happen here, not in show_notification(), because battery.c's
+     * state is only ever touched from system-workqueue context, and
+     * show_notification() runs on the BT RX thread. */
+    battery_screen_dismiss();
+
     display_on();
     led_commit();
 }

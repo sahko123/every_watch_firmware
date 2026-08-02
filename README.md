@@ -84,9 +84,11 @@ Approximate sizes (slot is 450,048 B):
 | Bring-up, RTT | 353 KB (78%) | 52 KB (40%) |
 | Bring-up, USB CDC | 373 KB (83%) | 59 KB (45%) |
 
-> Do **not** pass `--sysbuild`. This app builds through the legacy child-image
-> path, and `sysbuild/mcuboot.conf` is stale — it is missing the single-slot and
-> USB DFU settings that `pm_static.yml` and the in-app DFU trigger depend on.
+> This app builds through the legacy child-image path
+> (`child_image/mcuboot.conf`), not sysbuild. The stale `sysbuild/` config
+> that used to disagree with it on single-slot/USB DFU settings has been
+> removed — there's no `--sysbuild` flag to avoid anymore, it just isn't
+> wired up.
 
 **Stage 0** — the minimal first-power-on image. No sensor drivers, no RTC
 driver, no SPI, no BLE, no LED matrix: nothing that can hang during driver init
@@ -297,7 +299,6 @@ source:
 ```
 boards/arm/every_watch/   board definition, pinctrl, flash partitions
 child_image/mcuboot.conf  MCUboot config (single-slot + USB DFU) — the live one
-sysbuild/                 stale, unused — see the --sysbuild warning above
 pm_static.yml             static flash layout
 src/led_matrix/           WS2812B encoding, compositor, parallel DMA commit
 src/sand/                 falling-sand cellular automaton, 30 Hz
