@@ -53,6 +53,25 @@ config EW_SELFTEST_HALT_ON_FAIL
 	  check failed. During bring-up you usually want the opposite: see the
 	  failures but still get a running watch to poke at.
 
+config EW_IMU_ANYMOTION_WAKE
+	bool "Arm the IMU any-motion trigger for wrist-tilt wake"
+	default n
+	help
+	  Off because it does not work on this hardware. The BMI260 was tested
+	  on 2026-08-02: with the display off and the board being shaken for
+	  50 seconds the trigger fired zero times, while a stationary control
+	  run was also zero. The driver reports success writing the feature
+	  registers, so either the BMI260's microcode has no any-motion feature
+	  or it lives at different addresses than the BMI270's page 1 0x3C/0x3E
+	  that the code inherited — Bosch treats the per-part feature list as
+	  NDA material, so the two cannot be distinguished from outside.
+
+	  Arming it anyway costs a GPIO interrupt and some register writes for
+	  a callback that never fires, and makes the boot log look like a
+	  working wake path. Turn on only if the correct BMI260 feature-register
+	  addresses are ever established — see src/imu/imu.c for what would
+	  replace it (tap-to-wake, or software tilt detection).
+
 endmenu
 
 source "Kconfig.zephyr"

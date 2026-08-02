@@ -33,6 +33,24 @@ void sand_set_gravity(struct sand_gravity g);
  * Clamped to the grid capacity (140 cells). Thread-safe. */
 void sand_add_particles(int n);
 
+/*
+ * Fill the grid with randomly placed, randomly coloured grains and switch to
+ * free physics (gravity from the accelerometer).
+ *
+ * Unlike the reveal modes, nothing here drains off the edges — free-mode
+ * physics treats out-of-bounds as impassable, so grains pile against the
+ * screen edges and the count stays constant. Tilt the watch and the whole
+ * pile flows to whichever edge is now downhill.
+ *
+ * Each grain keeps its own colour as it moves. Around 20-30% fill reads best:
+ * enough grains to see flow, enough space for them to actually move. Above
+ * roughly half the grid it packs solid and stops looking like sand.
+ *
+ * Clamped to SAND_FILL_MAX_PCT. Thread-safe.
+ */
+#define SAND_FILL_MAX_PCT 60
+void sand_fill_random(uint8_t percent);
+
 /* Remove all particles. Thread-safe. */
 void sand_clear(void);
 

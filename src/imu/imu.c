@@ -14,18 +14,50 @@ static const struct device *bmi = DEVICE_DT_GET(DT_NODELABEL(bmi260));
 static bool imu_ready;
 
 /* -------------------------------------------------------------------------
- * Wrist-tilt wake — BMI260 any-motion feature on INT1 (hardware, independent
- * of the 30 Hz poll thread below; keeps firing even while that thread is
- * suspended with the display off). Mirrors the plan's "wrist tilt wakes the
- * display" transition, so it only acts while the display is off — once it's
- * on, motion from normal wrist movement during sand mode must not keep
- * restarting the reveal.
+ * Wrist-tilt wake — DOES NOT WORK ON THIS HARDWARE. Kept, disarmed, because
+ * the code is correct for a BMI270 and is the starting point for whatever
+ * replaces it.
+ *
+ * Tested on hardware 2026-08-02: with the display off and the board being
+ * actively moved and shaken for 50 s, the trigger fired exactly zero times.
+ * A control run with the board stationary was likewise zero. sensor_attr_set()
+ * and sensor_trigger_set() both return success, so the driver does write the
+ * registers — there is simply nothing behind them on this part.
+ *
+ * Either the BMI260's feature-engine microcode does not implement any-motion,
+ * or it implements it at different feature-register addresses than the
+ * BMI270's page 1 0x3C/0x3E that this inherited. Bosch treats the per-part
+ * feature list as NDA material (their own community forum says so), so the
+ * two cannot be told apart from outside — and it does not matter, because
+ * both mean this cannot be made to work as written.
+ *
+ * Replacements, in rough order of preference:
+ *   - tap-to-wake. Bosch's own bmi2_defs.h documents a wake-up feature
+ *     specifically "for bmi260" (single/double/triple tap), so unlike
+ *     any-motion it is known to exist on this part. Different gesture, but
+ *     hardware-accelerated and it still wakes the CPU from sleep.
+ *   - detect the raise in software from raw accel. Works for certain, but
+ *     needs the accelerometer polling while the display is off — imu_suspend()
+ *     currently stops it entirely — so it costs idle current against the
+ *     <10 uA target.
  * ------------------------------------------------------------------------- */
 
 static void motion_trigger_handler(const struct device *dev,
 				    const struct sensor_trigger *trig)
 {
 	ARG_UNUSED(dev); ARG_UNUSED(trig);
+
+	/* Logged unconditionally, and before the display check, so the trigger
+	 * can be observed firing regardless of display state. This is the only
+	 * way to confirm the BMI260's microcode actually implements any-motion:
+	 * sensor_trigger_set() succeeding only proves the driver wrote the
+	 * feature registers, not that anything is behind them on this part —
+	 * the anymo_1/anymo_2 addresses are inherited from the BMI270 and Bosch
+	 * treats the BMI260 feature list as NDA material. If this never appears
+	 * while the board is being moved, any-motion is not implemented here
+	 * and wrist-tilt wake needs doing in software instead. */
+	LOG_INF("any-motion trigger fired (display %s)",
+		display_is_on() ? "on" : "off");
 
 	if (!display_is_on()) {
 		display_wake_and_reveal();
@@ -206,9 +238,17 @@ void imu_init(void)
 	 * to be running first. */
 	(void)accel_config();
 
-	/* Non-fatal: worst case is losing wrist-tilt wake, gravity-driven sand
-	 * mode still works off the poll thread below. */
-	motion_trigger_init();
+	/* Not called: verified non-functional on the BMI260 — see the block
+	 * comment above motion_trigger_handler(). Arming it configured a GPIO
+	 * interrupt and wrote feature registers for a trigger that can never
+	 * fire, which is worse than not trying: it looks like a working wake
+	 * path in the code and in the boot log. Left compiled (referenced
+	 * here) so it does not rot, and so it is ready if the correct BMI260
+	 * feature-register addresses ever turn up.
+	 */
+	if (IS_ENABLED(CONFIG_EW_IMU_ANYMOTION_WAKE)) {
+		motion_trigger_init();
+	}
 
 	k_thread_create(&imu_thread_data, imu_stack,
 			K_THREAD_STACK_SIZEOF(imu_stack),

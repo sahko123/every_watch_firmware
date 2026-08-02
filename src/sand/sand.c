@@ -31,6 +31,25 @@ static uint32_t rand32(void)
 static uint8_t grid[LED_ROWS][LED_COLS]; /* 1 = particle, 0 = empty */
 
 /*
+ * Per-grain hue, parallel to grid[] and moved with the particle.
+ *
+ * led_color[] is indexed by cell, not by particle, so writing colours there
+ * directly would leave a fixed colour field with grains sliding through it —
+ * a grain would change colour as it fell. Carrying the hue alongside the
+ * particle and only converting to RGB at publish time keeps each grain its
+ * own colour for its whole life. 140 bytes.
+ *
+ * Only meaningful where grid[][] is set; stale entries in empty cells are
+ * harmless and get overwritten when a particle next lands there.
+ */
+static uint8_t grain_hue[LED_ROWS][LED_COLS];
+
+/* True once sand_fill_random() has seeded coloured grains, so publish_mask()
+ * knows to paint per-grain colour rather than leaving led_color[] to whatever
+ * the rest of the app last set (normally the flat amber from main.c). */
+static bool grain_colored;
+
+/*
  * Simulation mode.
  *
  *   SAND_FREE        normal falling sand, gravity from the accelerometer
@@ -151,6 +170,8 @@ static void tick(void)
 			if (passable(nc, nr)) {
 				grid[row][col] = 0;
 				grid[nr][nc]   = 1;
+				/* Hue travels with the grain — see grain_hue[]. */
+				grain_hue[nr][nc] = grain_hue[row][col];
 				continue;
 			}
 
@@ -192,6 +213,7 @@ static void tick(void)
 
 			grid[row][col]             = 0;
 			grid[chosen_row][chosen_col] = 1;
+			grain_hue[chosen_row][chosen_col] = grain_hue[row][col];
 		}
 	}
 }
@@ -363,12 +385,30 @@ static void paint_rainbow(void)
 	}
 }
 
+/* Paint each occupied cell from its grain's own hue. Same locking rule as
+ * paint_rainbow() — writes led_color[], so the caller must hold
+ * led_mask_mutex. Empty cells are left alone: the sand mask is zero there so
+ * the compositor never reads them. */
+static void paint_grains(void)
+{
+	for (int row = 0; row < LED_ROWS; row++) {
+		for (int col = 0; col < LED_COLS; col++) {
+			if (grid[row][col]) {
+				led_color[row][col] =
+					led_color_wheel(grain_hue[row][col]);
+			}
+		}
+	}
+}
+
 static void publish_mask(void)
 {
 	k_mutex_lock(&led_mask_mutex, K_FOREVER);
 
 	if (mode == SAND_RAIN) {
 		paint_rainbow();
+	} else if (grain_colored) {
+		paint_grains();
 	}
 
 	for (int row = 0; row < LED_ROWS; row++) {
@@ -596,10 +636,54 @@ bool sand_target_complete(void)
 	return done;
 }
 
+void sand_fill_random(uint8_t percent)
+{
+	percent = MIN(percent, SAND_FILL_MAX_PCT);
+
+	k_mutex_lock(&sand_mutex, K_FOREVER);
+
+	memset(grid, 0, sizeof(grid));
+
+	int target_count = (LED_ROWS * LED_COLS * percent) / 100;
+	int placed = 0;
+
+	/*
+	 * Rejection sampling, but with a hard attempt cap rather than looping
+	 * until the target is met. At the fill levels this is used for, the
+	 * cap is never reached — but an uncapped "keep trying until placed ==
+	 * target" loop would spin forever if the target ever exceeded grid
+	 * capacity, and this runs with sand_mutex held on a system with a
+	 * watchdog. Cheap insurance against a future caller passing something
+	 * silly. Under-filling slightly is invisible; hanging is not.
+	 */
+	for (int attempt = 0; attempt < target_count * 8 && placed < target_count;
+	     attempt++) {
+		int row = rand32() % LED_ROWS;
+		int col = rand32() % LED_COLS;
+
+		if (!grid[row][col]) {
+			grid[row][col]      = 1;
+			grain_hue[row][col] = (uint8_t)rand32();
+			placed++;
+		}
+	}
+
+	grain_colored = true;
+	mode          = SAND_FREE;
+
+	k_mutex_unlock(&sand_mutex);
+
+	LOG_INF("Sand: seeded %d/%d cells (%u%%), random hues",
+		placed, LED_ROWS * LED_COLS, percent);
+}
+
 void sand_clear(void)
 {
 	k_mutex_lock(&sand_mutex, K_FOREVER);
 	memset(grid, 0, sizeof(grid));
+	/* Drop back to whatever colour the rest of the app is using; leaving
+	 * this set would keep repainting led_color[] from stale hues. */
+	grain_colored = false;
 	k_mutex_unlock(&sand_mutex);
 }
 
@@ -636,3 +720,67 @@ void sand_resume(void)
 {
 	k_thread_resume(&sand_thread_data);
 }
+
+/* --------------------------------------------------------------------------
+ * Shell commands — drive the sand simulation from the bench
+ *
+ * Free-mode sand has no trigger of its own in the application (the reveal
+ * modes are what normally put particles on screen), so without these there is
+ * no way to actually look at it on hardware.
+ * -------------------------------------------------------------------------- */
+
+#ifdef CONFIG_SHELL
+
+#include <zephyr/shell/shell.h>
+#include "display/display.h"
+
+static int cmd_sand_fill(const struct shell *sh, size_t argc, char **argv)
+{
+	uint8_t pct = 25;
+
+	if (argc == 2) {
+		pct = (uint8_t)strtoul(argv[1], NULL, 0);
+	}
+
+	/* Wake the display first: the sand thread is suspended while it is
+	 * off, so seeding without this fills a grid nothing is ticking. */
+	display_on();
+	sand_fill_random(pct);
+
+	shell_print(sh, "seeded ~%u%% of %d cells with random hues; "
+			"tilt the watch to make it flow",
+		    MIN(pct, SAND_FILL_MAX_PCT), LED_ROWS * LED_COLS);
+	return 0;
+}
+
+static int cmd_sand_clear(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc); ARG_UNUSED(argv);
+
+	sand_clear();
+	shell_print(sh, "grid cleared");
+	return 0;
+}
+
+static int cmd_sand_count(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc); ARG_UNUSED(argv);
+
+	int n = sand_count();
+
+	shell_print(sh, "%d / %d cells occupied (%d%%)",
+		    n, LED_ROWS * LED_COLS, (n * 100) / (LED_ROWS * LED_COLS));
+	return 0;
+}
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sand_sub,
+	SHELL_CMD_ARG(fill,  NULL, "Seed random coloured grains: sand fill [percent]",
+		      cmd_sand_fill,  1, 1),
+	SHELL_CMD_ARG(clear, NULL, "Remove all grains",  cmd_sand_clear, 1, 0),
+	SHELL_CMD_ARG(count, NULL, "How many grains are live", cmd_sand_count, 1, 0),
+	SHELL_SUBCMD_SET_END
+);
+
+SHELL_CMD_REGISTER(sand, &sand_sub, "Sand simulation", NULL);
+
+#endif /* CONFIG_SHELL */
