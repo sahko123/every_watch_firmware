@@ -4,7 +4,7 @@ NRF52833-qdaa-r7
 
 ## i2c connects to
 the i2c lines are on P0.04 for SCL and P0.01 for SDA
-BMI270 @ 0x68
+BMI260 @ 0x68
 FRTC8900 @ 0x32
 BH1750 @ 0x23
 BQ27441 @ 0x55

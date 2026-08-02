@@ -1,5 +1,15 @@
 # Every Watch — Firmware Plan
 
+> **Note on the IMU:** this document was written against a BMI270 and the
+> remaining BMI270 references below are stale. The BOM has always specified a
+> **BMI260** (a parts-availability decision). The two are BMI2-family siblings
+> with near-identical register maps, but they are not drop-in: the BMI260
+> reports chip ID `0x27` vs the BMI270's `0x24`, and each needs its own
+> feature-engine config blob. Zephyr/NCS ship no BMI260 driver, so the IMU is
+> currently non-functional — see README.md's "Known open items". Treat the
+> BMI270-specific detail below (driver name, `CONFIG_BMI270`, step-counter
+> assumptions) as a description of the original plan, not of the hardware.
+
 ## Hardware Summary
 
 **MCU:** nRF52833-QDAA-R7 (ARM Cortex-M4F @ 64MHz, 512KB flash, 128KB RAM)
@@ -8,7 +18,7 @@
 
 | Device | Address | Role | Interrupt pin |
 |---|---|---|---|
-| BMI270 | 0x68 | 6-axis IMU, step counter | INT1: P0.30, INT2: P0.31 |
+| BMI260 | 0x68 | 6-axis IMU, step counter | INT1: P0.30, INT2: P0.31 |
 | FRTC8900 | 0x32 | Real-time clock | P0.00 |
 | BH1750 | 0x23 | Ambient light sensor | — |
 | BQ27441 | 0x55 | Battery fuel gauge | BIN: P0.11, GPOUT: P1.09 |
