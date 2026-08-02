@@ -15,6 +15,10 @@
 		 * it. MCUboot samples this pin before booting the app: held = stay
 		 * in USB DFU indefinitely, released = boot normally with no delay. */
 		mcuboot-button0 = &button_left;
+
+		/* EXPERIMENTAL — feasibility test, see RECOVERY.md "The watchdog
+		 * must start in MCUboot". Not wired to anything yet. */
+		watchdog0 = &wdt0;
 	};
 };
 
@@ -23,6 +27,14 @@
 	/delete-node/ bmi270@68;
 	/delete-node/ bh1750@23;
 	/delete-node/ bq27441@55;
+};
+
+/* On-die temperature sensor — MCUboot has no use for it, but the node is
+ * enabled by default in the SoC devicetree, which pulls in a driver
+ * (drivers/sensor/nordic/temp) for 302 bytes of dead weight in a partition
+ * that's nearly full. Found via `ninja rom_report` on the mcuboot subimage. */
+&temp {
+	status = "disabled";
 };
 
 /* USB stays enabled — MCUboot uses it for USB DFU mode */
