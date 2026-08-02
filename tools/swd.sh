@@ -88,6 +88,15 @@ cmd_flash() {
 		exit 1
 	fi
 
+	# openocd is a native Windows binary and cannot open MSYS-style
+	# /c/... paths — bash's own -f test above passes on them, so this
+	# only surfaces as "couldn't open <file>" from openocd itself.
+	if command -v cygpath >/dev/null 2>&1; then
+		IMAGE_OCD="$(cygpath -m "$IMAGE")"
+	else
+		IMAGE_OCD="$(echo "$IMAGE" | sed 's|^/\([a-zA-Z]\)/|\1:/|')"
+	fi
+
 	echo "Flashing $IMAGE ($(stat -c %s "$IMAGE") bytes) at ${SPEED} kHz ..."
 	echo "Note: merged.hex contains MCUboot + app; app_update.bin does NOT and"
 	echo "      is for USB DFU, not for this path."
@@ -96,7 +105,7 @@ cmd_flash() {
 	ocd -c "init" \
 	    -c "targets" \
 	    -c "reset init" \
-	    -c "flash write_image erase $IMAGE" \
+	    -c "flash write_image erase $IMAGE_OCD" \
 	    -c "reset run" \
 	    -c "shutdown"
 
