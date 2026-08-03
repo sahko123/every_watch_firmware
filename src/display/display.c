@@ -4,6 +4,7 @@
 #include "imu/imu.h"
 #include "time_display/time_display.h"
 #include "battery/battery.h"
+#include "light/light.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -35,6 +36,13 @@ void display_on(void)
 	is_on = true;
 	imu_resume();
 	sand_resume();
+
+	/* Someone is using the watch — have the light sampler poll quickly for
+	 * the next minute so the reading behind the next wake is current. It
+	 * costs nothing while the display is up: those polls see is_on and
+	 * return before touching the sensor. */
+	light_notify_activity();
+
 	LOG_INF("Display on");
 }
 
@@ -72,6 +80,18 @@ void display_off(void)
 	 * than the edge-triggered flag leaving it shown at most once per
 	 * episode. */
 	battery_notify_display_off();
+
+	/*
+	 * Sample ambient light now, after the blanking commit above has actually
+	 * darkened the LEDs. The sensor sits under the same glass, so this is the
+	 * only moment it can see the room rather than the display — and it is
+	 * reached on every timeout and every dismiss, so the reading backing the
+	 * next wake is never older than the last time the watch was used.
+	 *
+	 * Ordering matters: submitted before led_commit() this would race the
+	 * transfer and read a still-lit panel.
+	 */
+	light_sample_now();
 
 	LOG_INF("Display off");
 }
