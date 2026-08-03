@@ -92,6 +92,27 @@ config EW_IMU_ANYMOTION_WAKE
 	  addresses are ever established — see src/imu/imu.c for what would
 	  replace it (tap-to-wake, or software tilt detection).
 
+config EW_IMU_AXIS_DEBUG
+	bool "Log accelerometer axes, and keep the IMU alive with the display off"
+	default n
+	help
+	  Bring-up aid for establishing the IMU_COL_AXIS / IMU_ROW_AXIS mapping
+	  and their signs in src/imu/imu.c. Which way round the sensor sits on
+	  the PCB cannot be derived from the source, and hardwarer_spec.md
+	  records only the I2C address and the two interrupt pins, so the only
+	  way to settle it is to hold the board in a known orientation and read
+	  the vector back.
+
+	  Two things happen when this is on. The raw vector and the sand
+	  direction it produces are logged at 2 Hz, at INFO so no log-level
+	  juggling is needed. And imu_suspend() stops parking the sensor when
+	  the display goes off — otherwise a reading depends on getting a page
+	  up first, which drags button handling and the display state machine
+	  into what should be a direct measurement.
+
+	  That second part means the accelerometer runs continuously, which is
+	  exactly what the <10 uA idle target rules out. Bring-up only.
+
 endmenu
 
 source "Kconfig.zephyr"

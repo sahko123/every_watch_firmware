@@ -18,6 +18,16 @@
 struct sand_gravity {
 	int16_t col; /* +col = right */
 	int16_t row; /* +row = down  */
+
+	/*
+	 * How hard the watch is being moved, Q8, 0 = held still.
+	 *
+	 * Gravity is always 1 g, so the in-plane components above carry tilt
+	 * direction and nothing else. This carries the rest: how far |a|
+	 * departs from 1 g, which is the part of the reading that is not
+	 * gravity at all. Shaking scatters the grains in proportion to it.
+	 */
+	uint16_t shake;
 };
 
 /*
@@ -53,6 +63,24 @@ void sand_fill_random(uint8_t percent);
 
 /* Remove all particles. Thread-safe. */
 void sand_clear(void);
+
+/*
+ * Keep a slow rainbow drifting through led_color[] once the curtain has gone.
+ *
+ * The digit layer has no layer_color, so it reads led_color[] per cell — this
+ * is what keeps the revealed time moving instead of frozen on whatever phase
+ * the curtain stopped at. Roughly one full hue cycle every 8.5 s.
+ *
+ * Grains do NOT drift with it. Switching this on snapshots the curtain's colour
+ * onto every particle still on the grid, and those hues then travel with the
+ * particles as normal, so the wave only shows through where no grain covers it.
+ * Sand keeps one colour per pixel; only the clock moves.
+ *
+ * Costs nothing extra to run: the simulation thread is already compositing and
+ * committing at 30 Hz for any page that needs sand. Turning it off drops the
+ * frozen hues again. Thread-safe.
+ */
+void sand_set_hue_wave(bool on);
 
 /* Number of live particles currently in the simulation. */
 int sand_count(void);

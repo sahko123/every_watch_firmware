@@ -29,7 +29,16 @@ struct led_rgb {
  * only guards led_mask[] and not this array is still racing the compositor.
  * Use led_color_fill() below for a solid fill; it takes the lock internally
  * (safe to call whether or not the caller already holds led_mask_mutex —
- * Zephyr's k_mutex is safely re-entrant for the owning thread). */
+ * Zephyr's k_mutex is safely re-entrant for the owning thread).
+ *
+ * OWNERSHIP: exactly one thing may animate this at a time, and the UI page is
+ * what decides which. Two animators exist and they must never overlap —
+ * sand.c's hue wave rewrites the whole field every 33 ms, and battery.c's
+ * readout shimmer rewrites it every 60 ms. Nothing arbitrates between them at
+ * this level; they stay apart because the battery page declares needs_sand =
+ * false, which parks the sand thread, and time_display_deactivate() drops the
+ * wave whenever the clock goes away. Adding a third animator, or giving the
+ * battery page sand, breaks that without any warning louder than flicker. */
 extern struct led_rgb led_color[LED_ROWS][LED_COLS];
 
 /* Per-layer solid color override. When non-zero, all lit pixels in that layer
@@ -63,10 +72,36 @@ extern struct k_mutex led_commit_mutex;
  * the sensor and driving themselves brighter. */
 extern uint8_t led_brightness;
 
-/* The brightest any single pixel is ever driven, 0-255. Default 64 (~25%).
- * This is a perceptual ceiling; led_current_budget below is the one that
- * protects the battery. */
+/* The brightest any single pixel is ever driven, 0-255.
+ *
+ * Defaults to 255 — i.e. off — and you probably want to leave it there. It sat
+ * at 32 (~12%) for a long time and that turned out to be the main thing eating
+ * colour resolution at low brightness: it crushed every frame to a twelfth of
+ * range *before* the current limiter looked at it, so on sparse content (a
+ * clock face, a few sand grains) the limiter never engaged and the range was
+ * given up for nothing. Sand amber (255,160,20) came out as (31,20,2) at full
+ * ambient — two levels of blue left, and the hue visibly drifted orange as it
+ * dimmed further.
+ *
+ * The other two knobs already cover both real constraints: led_brightness is
+ * the perceptual one (how bright should this be in this room) and
+ * led_current_budget is the physical one (how much may we draw). This is a
+ * third limiter overlapping both. Reach for it only if the watch is still too
+ * bright after led_brightness has bottomed out. */
 extern uint8_t led_max_brightness;
+
+/*
+ * Transition fade, 0-255. 255 is normal; 0 is black.
+ *
+ * Folded into the same single scale factor as everything else, so a fade costs
+ * no extra quantisation — it just moves the one multiply that was already
+ * happening. Deliberately separate from led_brightness, which the light sensor
+ * owns and rewrites on its own schedule: an animation borrowing that variable
+ * would fight the next ambient reading, and whichever landed last would win.
+ *
+ * Whoever ramps this is responsible for putting it back to 255.
+ */
+extern uint8_t led_fade;
 
 /* Total-current limit, expressed as a budget on the sum of every channel value
  * in the composited frame. When a frame exceeds it, all pixels are scaled down
@@ -77,9 +112,18 @@ extern uint8_t led_max_brightness;
  *   140 LEDs at full white = 140 × 3 × 255 = 107,100 sum, and draws ~8.4 A.
  *   So 1 unit of sum ≈ 8400 / 107100 ≈ 0.078 mA.
  *
- *   budget 1900  ≈ 150 mA   (default: safe on USB, ~0.4C on a 400 mAh cell)
- *   budget 45000 ≈ 3.5 A    (the old default — never engaged, so a full-screen
+ *   budget 5128  ≈ 400 mA   (default)
+ *   budget 1900  ≈ 150 mA   (the previous default — conservative, and dim in
+ *                            daylight once the per-pixel ceiling was removed)
+ *   budget 45000 ≈ 3.5 A    (the original — never engaged, so a full-screen
  *                            frame at the old 78% ceiling pulled about 2.2 A)
+ *
+ * Since build_buffers() multiplies ambient by the budget rather than MIN-ing
+ * them, this value sets what full brightness *means* — so changing it scales
+ * every ambient level, not just the bright end. Frame draw works out at
+ * roughly budget * (led_brightness / 255), which at 400 mA is ~38 mA in the
+ * dark and ~400 mA in direct sun. Raise this and the darkness floor in
+ * light.c gets brighter in proportion; the two are tuned against each other.
  *
  * Set to 0 to disable limiting entirely. Do not, unless the watch is on a
  * bench supply.
@@ -133,4 +177,21 @@ static inline void led_color_fill(uint8_t r, uint8_t g, uint8_t b)
 		for (int col = 0; col < LED_COLS; col++)
 			led_color[row][col] = (struct led_rgb){r, g, b};
 	k_mutex_unlock(&led_mask_mutex);
+}
+
+/*
+ * The resting value of led_color[] — warm amber.
+ *
+ * Anything that finishes animating the field puts it back here rather than
+ * leaving its own colours behind, so a layer that reads led_color[] without
+ * setting it first gets something visible instead of whatever the last screen
+ * happened to be using. Black would be the other obvious default and is worse:
+ * it makes such a layer silently invisible rather than obviously wrong.
+ *
+ * This existed as a bare (255, 160, 20) at three separate call sites, which is
+ * exactly the kind of constant that drifts apart one edit at a time.
+ */
+static inline void led_color_reset(void)
+{
+	led_color_fill(255, 160, 20);
 }

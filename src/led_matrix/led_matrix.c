@@ -95,8 +95,9 @@ struct led_rgb led_color[LED_ROWS][LED_COLS];
 struct led_rgb led_layer_color[LED_LAYER_COUNT]; /* zero = use led_color per cell */
 uint8_t        led_mask[LED_LAYER_COUNT][LED_ROWS][LED_COLS];
 uint8_t        led_brightness     = 255;  /* ambient scaling 0-255; set by light sensor */
-uint8_t        led_max_brightness = 32;   /* per-pixel ceiling, ~12% */
-uint32_t       led_current_budget = 1900; /* ~150 mA total — see the maths below */
+uint8_t        led_max_brightness = 255;  /* per-pixel ceiling; 255 = off, see led_matrix.h */
+uint32_t       led_current_budget = 5128; /* ~400 mA driven — see the maths below */
+uint8_t        led_fade           = 255;  /* transition fade; 255 = none */
 
 /* --------------------------------------------------------------------------
  * Shared 3x5 digit font
@@ -236,46 +237,44 @@ static struct led_rgb composite(int col, int row)
 	return (struct led_rgb){0, 0, 0};
 }
 
-/* Build all four PWM sequences from the current mask + color state.
+/*
+ * Build all four PWM sequences from the current mask + color state.
  *
- * Two-pass approach:
- *   Pass 1 — composite + clamp to effective brightness → accumulate channel sum
- *   Pass 2 — apply current-limit scale factor → encode into the sequences
+ * WS2812B is 8 bits per channel and this display runs at a small fraction of
+ * full drive, so the scarce resource is output resolution, not CPU. Two things
+ * follow, and both are why this does not look like the obvious implementation:
  *
- * Effective brightness = led_brightness * led_max_brightness / 255.
- * Current scale        = MIN(1.0, led_current_budget / total_sum).
+ * ONE QUANTISATION, NOT TWO. Ambient dimming and the current limit are folded
+ * into a single Q16 factor and applied once. Applying them in sequence — as
+ * this used to — rounded to 8 bits twice, and at these output levels the second
+ * rounding is throwing away a meaningful share of what little signal is left.
+ *
+ * ROUND, DON'T TRUNCATE. The old code used `>> 8`, which floors. On sand amber
+ * (255,160,20) at an ambient scale of 7/255 that gave (6,4,0): blue quantised
+ * to zero and the hue collapsed toward orange. Rounding gives (7,4,1) — the
+ * channel survives, and with it the colour. Truncation is what makes dim
+ * colours drift toward primaries.
  *
  * Caller (led_commit) holds led_commit_mutex; this function additionally
  * acquires led_mask_mutex for the duration of its led_mask[] reads.
  */
 static void build_buffers(void)
 {
-	/*
-	 * Ambient level scales *within* the ceiling rather than being MIN'd
-	 * against it. With MIN, every ambient value above led_max_brightness
-	 * collapsed to the same output, so the light sensor did nothing at all
-	 * once the room was brighter than a dim office — the display sat at the
-	 * ceiling almost all the time. Multiplying keeps the full range usable:
-	 * led_max_brightness is the brightest the watch ever gets, and
-	 * led_brightness picks a point below it.
-	 */
-	uint8_t br = (uint8_t)(((uint16_t)led_brightness * led_max_brightness) / 255);
-
 	k_mutex_lock(&led_mask_mutex, K_FOREVER);
 
-	/* Pass 1: composite + brightness → stash + accumulate sum */
+	/*
+	 * Pass 1: composite at full resolution and total the channels.
+	 *
+	 * Deliberately unscaled. The sum is what the current limiter needs, and
+	 * taking it before any dimming means the limiter sees the true shape of
+	 * the frame rather than an already-crushed one.
+	 */
 	static struct led_rgb composed[LED_ROWS][LED_COLS];
 	uint32_t total = 0;
 
 	for (int row = 0; row < LED_ROWS; row++) {
 		for (int col = 0; col < LED_COLS; col++) {
 			struct led_rgb c = composite(col, row);
-
-			if (br < 255) {
-				c.r = (uint8_t)(((uint16_t)c.r * br) >> 8);
-				c.g = (uint8_t)(((uint16_t)c.g * br) >> 8);
-				c.b = (uint8_t)(((uint16_t)c.b * br) >> 8);
-			}
 
 			total += c.r + c.g + c.b;
 			composed[row][col] = c;
@@ -284,25 +283,97 @@ static void build_buffers(void)
 
 	k_mutex_unlock(&led_mask_mutex);
 
-	/* Current-limit scale in Q8 fixed-point (256 = 1.0, no reduction) */
-	uint32_t scale = 256;
+	/*
+	 * Combine every reason to dim into one Q16 factor (65536 = 1.0).
+	 *
+	 * The current budget multiplies the ambient level rather than being
+	 * MIN'd against it, and the distinction matters more than it looks.
+	 * MIN means whichever limit is tighter wins outright — and on a dense
+	 * frame the budget is always the tighter one, so ambient stops doing
+	 * anything at all. Modelled on the sand page (35 grains), MIN pins the
+	 * output at (32,20,2) for every ambient level from a dim room to direct
+	 * sunlight: the light sensor may as well not be fitted. That is the same
+	 * failure the old fixed ceiling had, just relocated.
+	 *
+	 * Multiplying gives each limit its own job. The budget decides what full
+	 * brightness means for this frame's density — a 20-pixel clock may be far
+	 * brighter than a full screen for the same current — and ambient then
+	 * picks a point below it. Both are still respected: k never exceeds
+	 * budget/total, so the frame cannot exceed the budget.
+	 */
+	uint32_t k = ((uint32_t)led_brightness << 16) / 255;
+
+	if (led_max_brightness < 255) {
+		k = (k * led_max_brightness) / 255;
+	}
+
+	if (led_fade < 255) {
+		k = (k * led_fade) / 255;
+	}
+
 	uint32_t budget = led_current_budget;
 
 	if (budget > 0 && total > budget) {
-		scale = (budget << 8) / total;
+		uint32_t budget_k = (uint32_t)(((uint64_t)budget << 16) / total);
+
+		k = (uint32_t)(((uint64_t)k * budget_k) >> 16);
 	}
 
-	/* Pass 2: apply current scale → encode → PWM sequences */
+	/* Pass 2: apply the combined factor once, rounded, and encode. */
 	uint16_t *strips[4] = {seq_l1, seq_l2, seq_l3, seq_l4};
 
 	for (int row = 0; row < LED_ROWS; row++) {
 		for (int col = 0; col < LED_COLS; col++) {
 			struct led_rgb c = composed[row][col];
 
-			if (scale < 256) {
-				c.r = (uint8_t)(((uint16_t)c.r * scale) >> 8);
-				c.g = (uint8_t)(((uint16_t)c.g * scale) >> 8);
-				c.b = (uint8_t)(((uint16_t)c.b * scale) >> 8);
+			if (k < 65536) {
+				/*
+				 * +32768 rounds to nearest. Rounding up can carry
+				 * the frame slightly past the budget — bounded at
+				 * half an LSB per channel, so 0.5 * 3 * 140 = 210
+				 * sum units (~16 mA) worst case, independent of
+				 * the budget value. That is well inside the
+				 * margin this budget already carries, and it buys
+				 * the low-end colour that truncation destroys.
+				 */
+				uint8_t sr = c.r, sg = c.g, sb = c.b;
+
+				c.r = (uint8_t)(((uint32_t)sr * k + 32768) >> 16);
+				c.g = (uint8_t)(((uint32_t)sg * k + 32768) >> 16);
+				c.b = (uint8_t)(((uint32_t)sb * k + 32768) >> 16);
+
+				/*
+				 * A lit pixel must never round away to nothing.
+				 *
+				 * led_color_wheel() emits two-channel colours
+				 * summing to 255, so hues midway through a wheel
+				 * segment are roughly (127,127,0) — both live
+				 * channels land just under the 0.5 threshold and
+				 * the pixel disappears, while a pure (255,0,0)
+				 * survives. In the waterfall at full density and
+				 * the darkness floor that swallowed 18% of hues,
+				 * which reads as holes torn in the curtain rather
+				 * than as a dim curtain.
+				 *
+				 * Promote every channel within half the pixel's
+				 * peak, not just the brightest one: (128,0,127)
+				 * becomes (1,0,1) and stays magenta, where
+				 * lighting only the peak would snap it to red.
+				 * Hue survives as well as one bit can carry it.
+				 *
+				 * Costs at most 2 sum units per rescued pixel —
+				 * bounded at ~280 (~22 mA) if an entire frame
+				 * needed it, against the ~100 mA these LEDs draw
+				 * just being powered.
+				 */
+				if (!(c.r | c.g | c.b) && (sr | sg | sb)) {
+					uint8_t peak = MAX(sr, MAX(sg, sb));
+					uint8_t half = peak / 2;
+
+					c.r = (sr && sr >= half) ? 1 : 0;
+					c.g = (sg && sg >= half) ? 1 : 0;
+					c.b = (sb && sb >= half) ? 1 : 0;
+				}
 			}
 
 			int strip, pixel;
@@ -477,10 +548,19 @@ static int cmd_led_show(const struct shell *sh, size_t argc, char **argv)
 	uint8_t eff = (uint8_t)(((uint16_t)led_brightness * led_max_brightness) / 255);
 
 	shell_print(sh, "ambient        %u / 255", led_brightness);
-	shell_print(sh, "max_brightness %u / 255", led_max_brightness);
-	shell_print(sh, "effective      %u / 255  (%u%%)", eff, (eff * 100u) / 255u);
+	shell_print(sh, "max_brightness %u / 255%s", led_max_brightness,
+		    led_max_brightness == 255 ? "  (off)" : "");
+	shell_print(sh, "perceptual     %u / 255  (%u%%)", eff, (eff * 100u) / 255u);
 	shell_print(sh, "current_budget %u  (~%u mA driven)",
 		    led_current_budget, budget_to_ma(led_current_budget));
+
+	/*
+	 * The budget only bites once enough pixels are lit, so a static figure
+	 * would be misleading. Report the threshold instead — below this many
+	 * full-white pixels the frame runs at the perceptual level untouched.
+	 */
+	shell_print(sh, "               engages above ~%u full-white px",
+		    led_current_budget / (3u * 255u));
 	shell_print(sh, "note: 140 WS2812B also draw ~100 mA just being powered");
 	return 0;
 }

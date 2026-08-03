@@ -8,6 +8,7 @@
 #include <zephyr/pm/device.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/logging/log.h>
+#include <stdlib.h>
 
 LOG_MODULE_REGISTER(imu, LOG_LEVEL_INF);
 
@@ -99,30 +100,156 @@ static int motion_trigger_init(void)
 	return 0;
 }
 
+/* -------------------------------------------------------------------------
+ * Accelerometer → sand gravity
+ *
+ * AXIS MAPPING. Which physical axis points where on the PCB is not derivable
+ * from this source, and hardwarer_spec.md records only the I2C address and the
+ * two interrupt pins. These four constants are the entire mapping — establish
+ * them on hardware with the procedure below and change them here; nothing else
+ * needs touching.
+ *
+ *   Build with the imu module at LOG_LEVEL_DBG, put the sand toy up, and watch
+ *   the "accel" line while holding the watch in each orientation:
+ *
+ *     display upright, top of the screen up   → row should read +1 (sand down)
+ *     display upright, rotated 90° clockwise  → col should read -1 or +1
+ *     display flat on the bench, face up      → both should read 0
+ *
+ *   If an axis moves the sand the wrong way, flip its SIGN. If tilting left/
+ *   right moves sand vertically instead, swap COL_AXIS and ROW_AXIS.
+ * ------------------------------------------------------------------------- */
+
+enum accel_axis { AX_X = 0, AX_Y = 1, AX_Z = 2 };
+
 /*
- * Convert BMI260 sensor_value accelerometer reading to a Q8 sand gravity vector.
- * GRAVITY_Q8_1G (256) = 1g. Scale factor: GRAVITY_Q8_1G / 9.8 ≈ 26.
+ * Established on hardware 2026-08-03, holding the board in three known
+ * orientations and reading the vector back:
  *
- * sensor_value: val1 = integer m/s², val2 = fractional µm/s² (millionths).
- * For gravity direction we only need ~4% precision so the val2 term is
- * approximated (val2 / 38462 ≈ val2 * GRAVITY_Q8_1G / 9800000).
+ *   flat, display up      X +0.04  Y +0.22  Z -9.82   in-plane pull ~zero
+ *   upright, reading it   X -9.61  Y +0.13  Z +0.37   gravity toward digit feet
+ *   right edge to floor   X +0.02  Y +9.70  Z +0.07   gravity toward screen right
  *
- * Axis mapping (verify against PCB orientation at bring-up):
- *   accel.x > 0  → watch tilted right  → sand falls right  (+col)
- *   accel.x < 0  → watch tilted left   → sand falls left   (-col)
- *   accel.y > 0  → watch face up        → sand falls down   (+row)
- *   accel.y < 0  → watch face down      → sand falls up     (-row)
+ * So X is the display's VERTICAL axis and Y its horizontal one — swapped from
+ * what this code originally assumed, which had tilting the watch upright
+ * sliding the sand sideways. X additionally runs negative toward the bottom of
+ * the screen, hence the inversion; Y already increases to the right.
+ *
+ * Z is the face normal and reads negative with the display upwards, meaning
+ * the sensor's +Z points back through the board. Nothing uses that sign — Z
+ * only contributes its magnitude to the normalisation — but it is the fact
+ * that identifies the part's mounting if this ever needs revisiting.
  */
-static struct sand_gravity accel_to_gravity(const struct sensor_value *ax,
-					    const struct sensor_value *ay)
+#define IMU_COL_AXIS  AX_Y
+#define IMU_COL_SIGN  (+1)   /* +col = right */
+#define IMU_ROW_AXIS  AX_X
+#define IMU_ROW_SIGN  (-1)   /* +row = down  */
+
+/*
+ * Q8 counts per m/s². GRAVITY_Q8_1G (256) = 1 g, so 256/9.8 ≈ 26.
+ *
+ * sensor_value is val1 = whole m/s², val2 = millionths. Only a direction is
+ * wanted, so the fractional term is approximated:
+ * val2 / 38462 ≈ val2 * GRAVITY_Q8_1G / 9800000.
+ */
+static int accel_to_q8(const struct sensor_value *v)
 {
-	int col = ax->val1 * 26 + (int)(ax->val2 / 38462);
-	int row = ay->val1 * 26 + (int)(ay->val2 / 38462);
+	return v->val1 * 26 + (int)(v->val2 / 38462);
+}
+
+/* Integer square root, bit-by-bit. No FPU on this part and this runs 30 times
+ * a second, so the libm call is not worth it for a value used to one part in
+ * 256. */
+static uint32_t isqrt32(uint32_t x)
+{
+	uint32_t res = 0;
+	uint32_t bit = 1u << 30;
+
+	while (bit > x) {
+		bit >>= 2;
+	}
+	while (bit) {
+		if (x >= res + bit) {
+			x -= res + bit;
+			res = (res >> 1) + bit;
+		} else {
+			res >>= 1;
+		}
+		bit >>= 2;
+	}
+	return res;
+}
+
+/*
+ * Below this the reading carries no usable direction: free-fall, or the sensor
+ * saturating on an impact. ~0.25 g. Returning zero gravity parks the sand
+ * rather than sending it somewhere arbitrary.
+ */
+#define ACCEL_MIN_MAG_Q8 64
+
+/*
+ * All three axes, projected onto the display plane and normalised.
+ *
+ * Reading Z is what makes the other two mean anything. The sand lives in the
+ * display plane, so only the in-plane components can push it — but their
+ * *magnitude* is only interpretable relative to the whole vector. Dividing by
+ * |a| turns each into a true direction cosine: full tilt gives ±256 with the
+ * display vertical, and falls to zero as it lays flat, which is the geometry
+ * actually being modelled.
+ *
+ * Without it the raw values stood in for direction, and that breaks the moment
+ * the watch is doing anything but sitting still. A shake adds linear
+ * acceleration on top of gravity, so |a| runs to 2-3 g, the raw axis saturates
+ * against the clamp, and the sand slams to one edge and stays pinned there
+ * until the movement stops. Normalised, a shake changes the direction the sand
+ * is pulled without ever exceeding one gravity of pull.
+ */
+static struct sand_gravity accel_to_gravity(const struct sensor_value *a)
+{
+	int q8[3] = {
+		accel_to_q8(&a[AX_X]),
+		accel_to_q8(&a[AX_Y]),
+		accel_to_q8(&a[AX_Z]),
+	};
+
+	uint32_t mag2 = (uint32_t)(q8[0] * q8[0]) +
+			(uint32_t)(q8[1] * q8[1]) +
+			(uint32_t)(q8[2] * q8[2]);
+	uint32_t mag = isqrt32(mag2);
+
+	/*
+	 * Shake: how far the total departs from 1 g in either direction.
+	 *
+	 * A watch held still reads exactly one gravity however it is turned, so
+	 * anything else in |a| is the hand moving it. Taking the absolute
+	 * deviation catches both halves of a shake — the throw and the
+	 * turnaround — where reading the raw magnitude would only see one.
+	 *
+	 * Smoothed over roughly four samples (~130 ms at 30 Hz). A shake is an
+	 * oscillation that crosses 1 g twice a cycle, so the instantaneous value
+	 * keeps returning to zero mid-shake; without the filter the grains would
+	 * be kicked in stutters rather than continuously.
+	 */
+	static uint16_t shake_filt;
+	int excess = abs((int)mag - GRAVITY_Q8_1G);
+
+	shake_filt = (uint16_t)((shake_filt * 3 + excess) / 4);
+
+	if (mag < ACCEL_MIN_MAG_Q8) {
+		return (struct sand_gravity){
+			.col = 0, .row = 0, .shake = shake_filt
+		};
+	}
+
+	int col = IMU_COL_SIGN * q8[IMU_COL_AXIS] * GRAVITY_Q8_1G / (int)mag;
+	int row = IMU_ROW_SIGN * q8[IMU_ROW_AXIS] * GRAVITY_Q8_1G / (int)mag;
 
 	col = CLAMP(col, -GRAVITY_Q8_1G, GRAVITY_Q8_1G);
 	row = CLAMP(row, -GRAVITY_Q8_1G, GRAVITY_Q8_1G);
 
-	return (struct sand_gravity){.col = col, .row = row};
+	return (struct sand_gravity){
+		.col = col, .row = row, .shake = shake_filt
+	};
 }
 
 #define IMU_STACK_SIZE 1024
@@ -140,6 +267,8 @@ static void imu_thread(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 
+	int dbg_div = 0;
+
 	while (true) {
 		int err = sensor_sample_fetch(bmi);
 
@@ -149,15 +278,41 @@ static void imu_thread(void *p1, void *p2, void *p3)
 			continue;
 		}
 
-		struct sensor_value ax, ay;
+		struct sensor_value a[3];
 
-		if (sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_X, &ax) ||
-		    sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_Y, &ay)) {
+		if (sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_X, &a[AX_X]) ||
+		    sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_Y, &a[AX_Y]) ||
+		    sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_Z, &a[AX_Z])) {
 			k_msleep(IMU_PERIOD_MS);
 			continue;
 		}
 
-		sand_set_gravity(accel_to_gravity(&ax, &ay));
+		struct sand_gravity g = accel_to_gravity(a);
+
+		sand_set_gravity(g);
+
+		/*
+		 * Alignment readout — the procedure described above
+		 * accel_to_gravity(). Rate-limited to ~2 Hz because 30 Hz of
+		 * this floods RTT badly enough to stall the log backend, and a
+		 * hand tilting a watch is nowhere near that fast anyway.
+		 *
+		 * INFO, not DEBUG: bringup.conf runs the whole build at INFO,
+		 * so a DEBUG line here compiles away and the reading silently
+		 * returns nothing.
+		 */
+		if (IS_ENABLED(CONFIG_EW_IMU_AXIS_DEBUG) && (++dbg_div >= 15)) {
+			dbg_div = 0;
+			LOG_INF("accel % 3d.%02d % 3d.%02d % 3d.%02d m/s2 "
+				"-> col %+4d row %+4d  step %+d,%+d  shake %u",
+				a[AX_X].val1, abs(a[AX_X].val2) / 10000,
+				a[AX_Y].val1, abs(a[AX_Y].val2) / 10000,
+				a[AX_Z].val1, abs(a[AX_Z].val2) / 10000,
+				g.col, g.row,
+				(g.col > 64) - (g.col < -64),
+				(g.row > 64) - (g.row < -64),
+				g.shake);
+		}
 
 		k_msleep(IMU_PERIOD_MS);
 	}
@@ -168,6 +323,16 @@ void imu_suspend(void)
 	if (!imu_ready) {
 		return;
 	}
+
+	/* Axis bring-up needs a reading on demand, without first getting a page
+	 * up to keep the display awake — that would put button handling and the
+	 * display state machine in the path of what is meant to be a direct
+	 * measurement. Costs continuous accelerometer current, hence bring-up
+	 * only; see CONFIG_EW_IMU_AXIS_DEBUG. */
+	if (IS_ENABLED(CONFIG_EW_IMU_AXIS_DEBUG)) {
+		return;
+	}
+
 	k_thread_suspend(&imu_thread_data);
 	int rc = pm_device_action_run(bmi, PM_DEVICE_ACTION_SUSPEND);
 	if (rc) {

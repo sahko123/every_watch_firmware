@@ -379,23 +379,6 @@ __maybe_unused static void led_all_off(void)
 	led_commit();
 }
 
-/* Colour wheel: 0-255 around the hue circle, integer only, no floats and no
- * division. Each third of the range crossfades between two primaries. */
-__maybe_unused static struct led_rgb wheel(uint8_t pos)
-{
-	pos = 255 - pos;
-
-	if (pos < 85) {
-		return (struct led_rgb){255 - pos * 3, 0, pos * 3};
-	}
-	if (pos < 170) {
-		pos -= 85;
-		return (struct led_rgb){0, pos * 3, 255 - pos * 3};
-	}
-	pos -= 170;
-	return (struct led_rgb){pos * 3, 255 - pos * 3, 0};
-}
-
 /*
  * Diagonal rainbow scrolled across the whole grid.
  *
@@ -433,7 +416,10 @@ __maybe_unused static void test_leds_rainbow(void)
 			for (int col = 0; col < LED_COLS; col++) {
 				uint8_t hue = (uint8_t)(col * 10 + row * 18 + frame * 3);
 
-				led_color[row][col] = wheel(hue);
+				/* The shared wheel, not a local copy — this test
+				 * exists to show what the display really does, so
+				 * it has to exercise the real colour path. */
+				led_color[row][col] = led_color_wheel(hue);
 			}
 		}
 		led_commit();

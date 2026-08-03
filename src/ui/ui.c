@@ -194,6 +194,39 @@ enum ui_page ui_current(void)
  * racing the timeout, would otherwise interleave enter/exit halves. */
 static K_MUTEX_DEFINE(ui_mutex);
 
+/*
+ * Ramp everything on screen down to black before the panel cuts out.
+ *
+ * Only on the way to BLANK — that is the one transition the eye reads as the
+ * watch finishing, and snapping straight to black made a ten-second page end
+ * like a power cut. Page-to-page switches still cut, because there is new
+ * content arriving immediately to look at.
+ *
+ * Runs on the system workqueue, which is also where buttons.c samples its
+ * gesture state machine every 15 ms — so this stalls input for its duration.
+ * That is why it is this short: 100 ms is about six sample periods, and a
+ * deliberate press lasts longer than that, so nothing a user actually means is
+ * lost. Do not lengthen it without moving it off this queue.
+ *
+ * If the sand thread happens to be running it commits its own frames in
+ * between these, which is harmless — it reads the same led_fade.
+ */
+#define FADE_STEPS   5
+#define FADE_STEP_MS 20
+
+static void fade_to_black(void)
+{
+	for (int i = FADE_STEPS - 1; i >= 0; i--) {
+		led_fade = (uint8_t)((255 * i) / FADE_STEPS);
+		led_commit();
+		k_msleep(FADE_STEP_MS);
+	}
+
+	/* Restore before anything else draws. The blanking commit that follows
+	 * has an empty mask, so it is black either way. */
+	led_fade = 255;
+}
+
 static void blank_all_layers(void)
 {
 	k_mutex_lock(&led_mask_mutex, K_FOREVER);
@@ -223,6 +256,12 @@ void ui_goto(enum ui_page next)
 
 	if (from->exit) {
 		from->exit();
+	}
+
+	/* Fade out rather than cut, but only when the display is actually going
+	 * away and there is something lit to fade. */
+	if (next == UI_PAGE_BLANK && current != UI_PAGE_BLANK && display_is_on()) {
+		fade_to_black();
 	}
 
 	/*

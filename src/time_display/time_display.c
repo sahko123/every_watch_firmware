@@ -175,9 +175,33 @@ static void on_curtain_done(void)
 {
 	revealing = false;
 
-	/* Put the sand colour back — the curtain leaves led_color[] full of
-	 * rainbow, and free-mode sand should be amber again. */
-	led_color_fill(255, 160, 20);
+	/*
+	 * Deliberately leave led_color[] holding the curtain's rainbow.
+	 *
+	 * This used to led_color_fill() amber here, to put free-mode sand back
+	 * to its normal colour. The side effect was that the digits changed
+	 * colour a second or two after appearing: LED_LAYER_DIGITS has no
+	 * layer_color, so composite() reads led_color[] per cell, and the
+	 * digits were being revealed in rainbow and then repainted amber
+	 * underneath the viewer.
+	 *
+	 * Masking the fill around the digit cells would fix the visible symptom
+	 * but not the underlying one — the 1 Hz tick republishes the bitmap, so
+	 * a minute rolling over mid-view lights cells that were background a
+	 * moment ago, and those would come up amber against rainbow neighbours.
+	 * Leaving the rainbow alone keeps every digit cell the same colour
+	 * whenever it lights.
+	 *
+	 * Nothing else depends on the amber: the sand toy sets its own per-grain
+	 * hues, and the battery screen restores led_color[] when it dismisses.
+	 * The only cells this affects are grains left behind by the curtain,
+	 * which now stay the colour of the curtain they fell from.
+	 *
+	 * The wave keeps that rainbow drifting rather than freezing it on
+	 * whatever phase the curtain stopped at. It picks the phase up from
+	 * where the curtain left it, so the handover is invisible.
+	 */
+	sand_set_hue_wave(true);
 
 	LOG_INF("Time reveal complete");
 }
@@ -280,6 +304,12 @@ void time_display_deactivate(void)
 {
 	active = false;
 
+	/* Stop the drift however the page ends, not just on a completed
+	 * reveal — it rewrites led_color[] on every sand tick, so leaving it
+	 * running would bleed the clock's colours through whatever page comes
+	 * next. Harmless if it was never started. */
+	sand_set_hue_wave(false);
+
 	/* A reveal still in flight when the display goes off must be
 	 * cancelled outright, not just left to freeze with the sand thread
 	 * (display_off() suspends sand right before calling this). Otherwise
@@ -290,7 +320,7 @@ void time_display_deactivate(void)
 	 * whether the reveal was rain or constrained. */
 	if (revealing) {
 		time_display_stop_reveal();
-		led_color_fill(255, 160, 20);
+		led_color_reset();
 	}
 }
 

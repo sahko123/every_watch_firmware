@@ -86,6 +86,19 @@ static uint8_t target[LED_ROWS][LED_COLS];
 #define RAIN_HOLD_TICKS   16     /* ~0.5 s at full density */
 
 static uint16_t rain_tick;
+
+/*
+ * Random hue offset for one reveal, chosen when the curtain starts.
+ *
+ * Without it every reveal looked identical: rain_tick restarts at zero and the
+ * curtain always runs the same number of ticks, so it finished on the same
+ * phase every time and handed the clock the same colours every time.
+ *
+ * Offsetting the curtain rather than the clock is what keeps the hand-over
+ * invisible — the wave picks up exactly where the curtain left off, so both
+ * are shifted together and the reveal stays continuous into the digits.
+ */
+static uint8_t rain_phase;
 static uint8_t  rain_density;
 static bool     rain_peak_fired;
 static bool     rain_peak_pending;
@@ -97,6 +110,75 @@ static void (*rain_on_done)(void);
 /* Default gravity: straight down. GRAVITY_Q8_1G defined in sand.h. */
 static struct sand_gravity gravity = {.col = 0, .row = GRAVITY_Q8_1G};
 static K_MUTEX_DEFINE(sand_mutex);
+
+/* -------------------------------------------------------------------------
+ * Per-grain motion state
+ *
+ * Free mode used to quantise gravity to one of nine directions and step every
+ * grain exactly one cell per tick, so a 15° tilt and a 90° tilt produced
+ * identical motion and nothing carried between ticks. These give each grain a
+ * velocity that gravity accelerates and friction bleeds away, and a sub-cell
+ * position that only spills into an actual move when it crosses a cell
+ * boundary. Tilt strength then sets fall speed continuously, and because
+ * velocity persists there is something for a shake to act on.
+ *
+ * 1.1 KB across the four, indexed by cell like grain_hue[] and carried with
+ * the particle the same way.
+ * ------------------------------------------------------------------------- */
+static int16_t vel_col[LED_ROWS][LED_COLS]; /* Q8 cells per tick */
+static int16_t vel_row[LED_ROWS][LED_COLS];
+static int16_t sub_col[LED_ROWS][LED_COLS]; /* Q8 position within the cell */
+static int16_t sub_row[LED_ROWS][LED_COLS];
+
+/*
+ * Set for a cell once the grain now in it has already been stepped this tick.
+ *
+ * The scan runs against gravity so falling grains cascade without a second
+ * buffer, which works only while every grain moves the way the scan expects. A
+ * shake breaks that — a grain thrown upwards lands in a cell the scan has yet
+ * to reach and would be stepped a second time in the same tick. This makes the
+ * sim safe for motion in any direction.
+ */
+static uint8_t moved[LED_ROWS][LED_COLS];
+
+/* Gravity → velocity, Q8. Full in-plane tilt (256) adds 37 per tick.
+ *
+ * A multiplier rather than the shift this started as: a shift can only double
+ * or halve, and the useful adjustments here are finer than that. Terminal
+ * velocity scales linearly with this and nothing else does, so it is the knob
+ * for "how fast does the sand run" without touching how the motion feels —
+ * that is SAND_DAMPING below. */
+#define SAND_ACCEL_Q8 37
+
+/* Velocity surviving each tick, Q8. 230/256 ≈ 0.9, giving a terminal velocity
+ * of roughly gravity/26 — a gentle 15° lean creeps, a vertical hold pours. */
+#define SAND_DAMPING 230
+
+/* One cell per tick. The collision search below resolves a single step, so a
+ * grain must never need to cross two cells at once. */
+#define SAND_MAX_VEL 256
+
+/* Movement this small is indistinguishable from noise on the accelerometer and
+ * would have a settled pile shuffling forever. */
+#define SAND_SHAKE_DEADBAND 24
+
+/*
+ * Shake → random impulse, Q8. 256 means the impulse equals the measured
+ * excess acceleration.
+ *
+ * This was shake >> 2, and that was far too weak to see. Measured on hardware
+ * while shaking hard: |a| reaches 1.87 g, giving a peak shake of 119 — so the
+ * impulse peaked at ±29 per tick against the 37 per tick that full-tilt gravity
+ * supplies. A kick weaker than gravity, and randomly signed so it averages to
+ * nothing, simply loses; the grains kept falling as if nothing was happening.
+ *
+ * Sizing it properly: a random impulse of amplitude A against damping d settles
+ * at a velocity spread of about A / sqrt(1 - d²), which here is 2.3 A. Crossing
+ * a cell needs 256, so A has to reach roughly 110 for grains to actually jump
+ * rather than jitter in place. At 256 (impulse = shake) a hard shake gives
+ * A = 119, and the grains scatter.
+ */
+#define SAND_SHAKE_Q8 256
 
 /* -------------------------------------------------------------------------
  * Helpers
@@ -114,7 +196,9 @@ static bool passable(int col, int row)
 	return in_bounds(col, row) && !grid[row][col];
 }
 
-/* Convert Q8 gravity to primary step direction (±1 or 0 per axis). */
+/* Convert Q8 gravity to primary step direction (±1 or 0 per axis).
+ * Only the scan order and the reveal modes use this now — free-mode grains
+ * step from their own velocity, not from gravity's sign. */
 static void gravity_step(int *dcol, int *drow)
 {
 	/* Quantise: pick the dominant axis first, allow diagonal fall */
@@ -122,29 +206,72 @@ static void gravity_step(int *dcol, int *drow)
 	*drow = (gravity.row > 64) ? 1 : (gravity.row < -64) ? -1 : 0;
 }
 
+/* Carry a grain's identity and motion to the cell it just moved into. Every
+ * move site must use this — a grain that leaves its velocity behind stops
+ * dead on arrival, and one that leaves its hue behind changes colour. */
+static void move_grain(int fr, int fc, int tr, int tc)
+{
+	grid[fr][fc] = 0;
+	grid[tr][tc] = 1;
+
+	grain_hue[tr][tc] = grain_hue[fr][fc];
+	vel_col[tr][tc]   = vel_col[fr][fc];
+	vel_row[tr][tc]   = vel_row[fr][fc];
+	sub_col[tr][tc]   = sub_col[fr][fc];
+	sub_row[tr][tc]   = sub_row[fr][fc];
+
+	moved[tr][tc] = 1;
+}
+
+static void clear_motion(int row, int col)
+{
+	vel_col[row][col] = 0;
+	vel_row[row][col] = 0;
+	sub_col[row][col] = 0;
+	sub_row[row][col] = 0;
+}
+
+/* Drop all stored motion. Used whenever grains are placed or rearranged by
+ * something other than the free-mode physics — the reveal modes move grid[]
+ * directly, and their leftovers must not inherit velocities from before. */
+static void clear_all_motion(void)
+{
+	memset(vel_col, 0, sizeof(vel_col));
+	memset(vel_row, 0, sizeof(vel_row));
+	memset(sub_col, 0, sizeof(sub_col));
+	memset(sub_row, 0, sizeof(sub_row));
+}
+
 /* -------------------------------------------------------------------------
  * Simulation tick
  * -------------------------------------------------------------------------
  *
- * Classic falling-sand rules, applied in gravity-direction order so fast
- * particles don't teleport through each other:
+ * Classic falling-sand rules, but each grain steps from its own velocity
+ * rather than from a globally quantised gravity direction:
  *
- *   1. Try primary gravity step (dcol, drow).
- *   2. If blocked, try the two diagonal alternatives:
- *        (dcol ± perp, drow) or (dcol, drow ± perp) depending on gravity axis.
- *      Pick one randomly if both are free to avoid directional bias.
- *   3. If still blocked, particle stays put.
+ *   1. Gravity accelerates the grain; friction bleeds speed away; a shake
+ *      adds a random impulse. Velocity is capped at one cell per tick.
+ *   2. That velocity accumulates into a sub-cell position. Only when it
+ *      crosses a cell boundary does the grain actually try to move, so a
+ *      slight tilt gives a slow creep and a steep one a fast pour.
+ *   3. The move itself is the classic search: try the primary step, then the
+ *      two perpendicular diagonals, picking randomly when both are free.
+ *   4. Fully blocked, the grain stays and its motion is zeroed — otherwise
+ *      gravity would keep integrating into a pile that cannot move and the
+ *      whole thing would burst apart the moment a gap opened.
  *
- * Scan order is reversed along the gravity axis so particles cascade
- * without needing a second buffer: when gravity is downward we scan
- * rows bottom-to-top, so a falling particle doesn't immediately move
- * the cell we're about to process.
+ * Scan order still runs against gravity so falling grains cascade without a
+ * second buffer, but moved[] now guards the case that assumption misses: a
+ * grain thrown backwards by a shake can land somewhere the scan has not
+ * reached yet, and must not be stepped twice in one tick.
  */
 static void tick(void)
 {
 	int dcol, drow;
 
 	gravity_step(&dcol, &drow);
+
+	memset(moved, 0, sizeof(moved));
 
 	/*
 	 * Choose scan direction: iterate against gravity so we process the
@@ -160,30 +287,71 @@ static void tick(void)
 
 	for (int row = row_start; row != row_end; row += row_inc) {
 		for (int col = col_start; col != col_end; col += col_inc) {
-			if (!grid[row][col]) {
+			if (!grid[row][col] || moved[row][col]) {
 				continue;
 			}
 
-			int nr = row + drow;
-			int nc = col + dcol;
+			/* --- integrate this grain's motion ------------------ */
+
+			int vc = vel_col[row][col] +
+				 ((gravity.col * SAND_ACCEL_Q8) >> 8);
+			int vr = vel_row[row][col] +
+				 ((gravity.row * SAND_ACCEL_Q8) >> 8);
+
+			if (gravity.shake > SAND_SHAKE_DEADBAND) {
+				int imp = (gravity.shake * SAND_SHAKE_Q8) >> 8;
+
+				vc += (int)(rand32() % (2 * imp + 1)) - imp;
+				vr += (int)(rand32() % (2 * imp + 1)) - imp;
+			}
+
+			vc = (vc * SAND_DAMPING) >> 8;
+			vr = (vr * SAND_DAMPING) >> 8;
+
+			vc = CLAMP(vc, -SAND_MAX_VEL, SAND_MAX_VEL);
+			vr = CLAMP(vr, -SAND_MAX_VEL, SAND_MAX_VEL);
+
+			int sc = sub_col[row][col] + vc;
+			int sr = sub_row[row][col] + vr;
+
+			/* C truncates toward zero, which is what is wanted here:
+			 * -200/256 is 0 (no move yet), -300/256 is -1. */
+			int step_col = CLAMP(sc / GRAVITY_Q8_1G, -1, 1);
+			int step_row = CLAMP(sr / GRAVITY_Q8_1G, -1, 1);
+
+			vel_col[row][col] = (int16_t)vc;
+			vel_row[row][col] = (int16_t)vr;
+
+			if (step_col == 0 && step_row == 0) {
+				/* Still crossing this cell — bank the progress. */
+				sub_col[row][col] = (int16_t)sc;
+				sub_row[row][col] = (int16_t)sr;
+				continue;
+			}
+
+			/* Boundary crossed: spend it and attempt the move. */
+			sub_col[row][col] = (int16_t)(sc - step_col * GRAVITY_Q8_1G);
+			sub_row[row][col] = (int16_t)(sr - step_row * GRAVITY_Q8_1G);
+
+			int nr = row + step_row;
+			int nc = col + step_col;
 
 			if (passable(nc, nr)) {
-				grid[row][col] = 0;
-				grid[nr][nc]   = 1;
-				/* Hue travels with the grain — see grain_hue[]. */
-				grain_hue[nr][nc] = grain_hue[row][col];
+				move_grain(row, col, nr, nc);
 				continue;
 			}
 
 			/*
 			 * Primary path blocked — try the two perpendicular diagonals.
-			 * For downward gravity: left-down and right-down.
-			 * For sideways gravity: the two vertical diagonals.
+			 * For downward motion: left-down and right-down.
+			 * For sideways motion: the two vertical diagonals.
 			 *
-			 * "perp" is the axis perpendicular to gravity.
+			 * "perp" is the axis perpendicular to this grain's step, so
+			 * it comes from the step and not from global gravity — under
+			 * a shake the two can point different ways.
 			 */
-			int perp_col = (drow != 0) ? 1 : 0;
-			int perp_row = (dcol != 0) ? 1 : 0;
+			int perp_col = (step_row != 0) ? 1 : 0;
+			int perp_row = (step_col != 0) ? 1 : 0;
 
 			bool left_free  = passable(nc - perp_col, nr - perp_row);
 			bool right_free = passable(nc + perp_col, nr + perp_row);
@@ -207,13 +375,19 @@ static void tick(void)
 				chosen_col += perp_col;
 				chosen_row += perp_row;
 			} else {
-				/* Fully blocked — stay */
+				/*
+				 * Fully blocked. Kill the motion rather than
+				 * leaving it to integrate: a grain resting at the
+				 * bottom of a pile is still being accelerated by
+				 * gravity every tick, and without this it banks
+				 * speed indefinitely and shoots away the instant
+				 * anything below it moves.
+				 */
+				clear_motion(row, col);
 				continue;
 			}
 
-			grid[row][col]             = 0;
-			grid[chosen_row][chosen_col] = 1;
-			grain_hue[chosen_row][chosen_col] = grain_hue[row][col];
+			move_grain(row, col, chosen_row, chosen_col);
 		}
 	}
 }
@@ -339,6 +513,11 @@ static void tick_rain(void)
 {
 	if (!rain_step_envelope()) {
 		mode = SAND_FREE;
+		/* The curtain moved these grains by writing grid[] directly, so
+		 * whatever velocities they carried in are meaningless now. Free
+		 * physics takes over on the next tick and must start them from
+		 * rest, not from state left over before the reveal. */
+		clear_all_motion();
 		rain_done_pending = true;
 		return;
 	}
@@ -374,16 +553,32 @@ static void tick_rain(void)
  * time, so the falling sheet is a moving rainbow rather than a flat wash.
  * Writes led_color[], so the caller must hold led_mask_mutex — the compositor
  * reads it under that lock. */
-static void paint_rainbow(void)
+static void paint_rainbow(uint8_t phase)
 {
 	for (int row = 0; row < LED_ROWS; row++) {
 		for (int col = 0; col < LED_COLS; col++) {
-			uint8_t hue = (uint8_t)(row * 26 + col * 5 + rain_tick * 3);
+			uint8_t hue = (uint8_t)(row * 26 + col * 5 + phase);
 
 			led_color[row][col] = led_color_wheel(hue);
 		}
 	}
 }
+
+/*
+ * Slow hue drift, kept running after the curtain has gone.
+ *
+ * The digit layer has no layer_color, so it reads led_color[] per cell — the
+ * same field the curtain paints. Leaving this on means the revealed time keeps
+ * the rainbow moving through it instead of freezing on whatever phase the
+ * curtain happened to stop at.
+ *
+ * One hue step per 30 Hz tick puts a full cycle at about 8.5 s, against the
+ * curtain's three-steps-per-tick (~2.8 s). The curtain is brief and busy and
+ * can carry that; a clock face sitting still for ten seconds cannot, and at
+ * curtain speed it reads as a strobe rather than a drift.
+ */
+static bool    hue_wave;
+static uint8_t wave_phase;
 
 /* Paint each occupied cell from its grain's own hue. Same locking rule as
  * paint_rainbow() — writes led_color[], so the caller must hold
@@ -406,9 +601,22 @@ static void publish_mask(void)
 	k_mutex_lock(&led_mask_mutex, K_FOREVER);
 
 	if (mode == SAND_RAIN) {
-		paint_rainbow();
-	} else if (grain_colored) {
-		paint_grains();
+		paint_rainbow((uint8_t)(rain_tick * 3 + rain_phase));
+	} else {
+		/*
+		 * Order matters, and these are not alternatives. The wave lays
+		 * a moving rainbow across the whole field, then the grains
+		 * stamp their own fixed hues back over the cells they occupy.
+		 * That way only what the grains do *not* cover — the digits —
+		 * actually drifts. A grain whose colour shifted while it sat
+		 * still reads as noise rather than as sand.
+		 */
+		if (hue_wave) {
+			paint_rainbow(wave_phase++);
+		}
+		if (grain_colored) {
+			paint_grains();
+		}
 	}
 
 	for (int row = 0; row < LED_ROWS; row++) {
@@ -582,6 +790,10 @@ void sand_set_target(const uint8_t t[LED_ROWS][LED_COLS])
 		mode = SAND_FREE;
 	}
 
+	/* Either direction is a hand-off between physics that tracks velocity
+	 * and physics that does not, so nothing may carry across. */
+	clear_all_motion();
+
 	k_mutex_unlock(&sand_mutex);
 }
 
@@ -591,6 +803,9 @@ void sand_rain_start(void (*on_peak)(void), void (*on_done)(void))
 
 	memset(grid, 0, sizeof(grid));
 	rain_tick         = 0;
+	/* Fresh entry point into the hue wheel for this reveal — see rain_phase.
+	 * The full range, so consecutive glances land nowhere near each other. */
+	rain_phase        = (uint8_t)rand32();
 	rain_density      = 0;
 	rain_peak_fired   = false;
 	rain_peak_pending = false;
@@ -671,6 +886,10 @@ void sand_fill_random(uint8_t percent)
 	grain_colored = true;
 	mode          = SAND_FREE;
 
+	/* Fresh grains start from rest, wherever the previous occupants of
+	 * those cells happened to be going. */
+	clear_all_motion();
+
 	k_mutex_unlock(&sand_mutex);
 
 	LOG_INF("Sand: seeded %d/%d cells (%u%%), random hues",
@@ -681,9 +900,52 @@ void sand_clear(void)
 {
 	k_mutex_lock(&sand_mutex, K_FOREVER);
 	memset(grid, 0, sizeof(grid));
+	clear_all_motion();
 	/* Drop back to whatever colour the rest of the app is using; leaving
 	 * this set would keep repainting led_color[] from stale hues. */
 	grain_colored = false;
+	k_mutex_unlock(&sand_mutex);
+}
+
+void sand_set_hue_wave(bool on)
+{
+	k_mutex_lock(&sand_mutex, K_FOREVER);
+
+	if (on && !hue_wave) {
+		/* Pick the phase up where the curtain left it. Starting from
+		 * zero would snap every cell to a different colour at the
+		 * handover, which is exactly the visible jump this is meant to
+		 * replace. */
+		wave_phase = (uint8_t)(rain_tick * 3 + rain_phase);
+
+		/*
+		 * Freeze the curtain's colours onto the grains it left behind,
+		 * so they hold still while the digits drift. The hue is
+		 * recomputed from the same expression paint_rainbow() uses
+		 * rather than recovered from led_color[] — the cell already
+		 * holds the RGB, but hue is what travels with a grain when it
+		 * moves, and RGB cannot be turned back into it.
+		 */
+		for (int row = 0; row < LED_ROWS; row++) {
+			for (int col = 0; col < LED_COLS; col++) {
+				if (grid[row][col]) {
+					grain_hue[row][col] = (uint8_t)
+						(row * 26 + col * 5 + wave_phase);
+				}
+			}
+		}
+		grain_colored = true;
+	}
+
+	if (!on && hue_wave) {
+		/* Those frozen hues belonged to this reveal. The sand toy
+		 * reseeds its own on entry, so dropping the flag here cannot
+		 * strand it without colours. */
+		grain_colored = false;
+	}
+
+	hue_wave = on;
+
 	k_mutex_unlock(&sand_mutex);
 }
 

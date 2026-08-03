@@ -231,7 +231,7 @@ static void level_dismiss(void)
 
     /* The readout painted led_color[] to drive the wave. Put the sand amber
      * back, or free-mode sand comes back green/blue. */
-    led_color_fill(255, 160, 20);
+    led_color_reset();
 
     time_display_resume();
 

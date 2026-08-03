@@ -29,16 +29,19 @@ static const struct device *rtc = DEVICE_DT_GET(DT_ALIAS(rtc0));
  * being special-cased here — it is just another page, and one that happens
  * to reboot on entry.
  *
- * Ambient light is sampled here rather than in ui.c because it must happen
- * while the LEDs are still off: the sensor sits under the same glass, so a
- * reading taken after the display wakes measures the display.
+ * Ambient light is NOT sampled here. It used to be, and it could never have
+ * worked: this runs on the system workqueue (buttons.c dispatches from a work
+ * item), and light_sample_now() submitted to that same queue — so the read
+ * could not begin until this function had returned and ui_handle_button()
+ * below had already lit the display. The sampler's own "skip if the display is
+ * on" guard then threw the reading away, every time, leaving led_brightness at
+ * its power-on default permanently.
+ *
+ * Sampling now happens on the way down instead, in display_off(), where the
+ * LEDs are definitively dark. See light.c.
  */
 static void on_button(enum btn_event ev)
 {
-	if (!display_is_on()) {
-		light_sample_now();
-	}
-
 	ui_handle_button(ev);
 }
 
@@ -143,11 +146,19 @@ int main(void)
 	boot_indicator_start();
 #endif
 
-	/* Sand: warm amber (per-cell, no layer_color override) */
-	led_color_fill(255, 160, 20);
+	/* Resting per-cell colour for any layer without a layer_color override. */
+	led_color_reset();
 
-	/* Digits: cool white — revealed beneath sand as particles clear */
-	led_layer_color[LED_LAYER_DIGITS] = (struct led_rgb){220, 220, 255};
+	/*
+	 * The digit layer deliberately has NO layer_color, so it reads
+	 * led_color[] per cell — that is what lets the clock come up in the
+	 * curtain's rainbow and keep drifting with the hue wave.
+	 *
+	 * A {220, 220, 255} cool white used to be set here. It never reached the
+	 * display: ui_init() below calls blank_all_layers(), which zeroes every
+	 * layer colour, and so does every ui_goto() after it. It read as the
+	 * digits' colour while being nothing of the sort.
+	 */
 
 	if (rtc) {
 		time_display_init(rtc);
