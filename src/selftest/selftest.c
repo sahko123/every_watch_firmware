@@ -330,8 +330,13 @@ static void test_battery(void)
 		check("BATT", "read state of charge", false);
 	}
 
-	printk("       NOTE: design-capacity in the DTS is 300 mAh - correct it\n");
-	printk("             to the real cell or SoC readings will be wrong.\n");
+	/* Read the value rather than restating it. This was a hardcoded "300 mAh"
+	 * that stayed behind when the devicetree was corrected to 400, so every
+	 * boot reported a fault that had already been fixed — and sent at least
+	 * one person off to correct a value that was right. */
+	printk("       design-capacity in the DTS is %d mAh - confirm it matches\n",
+	       DT_PROP(DT_NODELABEL(bq27441), design_capacity));
+	printk("             the cell actually fitted, or SoC readings will be wrong.\n");
 }
 
 static void test_gpio(void)

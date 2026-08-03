@@ -4,6 +4,7 @@
 #include "display/display.h"
 #include "battery/battery.h"
 #include "ui/ui.h"
+#include "time_sync/time_sync.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/bluetooth/bluetooth.h>
@@ -18,7 +19,11 @@
 #include <zephyr/settings/settings.h>
 #include <string.h>
 
-LOG_MODULE_REGISTER(ble, LOG_LEVEL_ERR);
+/* INF, matching every other module. At ERR this reported only failures, so the
+ * radio's entire working state — advertising, connections, pairing — was
+ * invisible, and "no output" meant either healthy or dead with no way to tell.
+ * Production caps the global level anyway, so this costs nothing there. */
+LOG_MODULE_REGISTER(ble, LOG_LEVEL_INF);
 
 /* ── Company ID ─────────────────────────────────────────────────────────────
  * 0xFFFF is reserved for internal/test use in the Bluetooth spec.
@@ -64,6 +69,30 @@ static atomic_t adv_running = ATOMIC_INIT(0);
 /* Switch to slow advertising after this many ms of fast advertising */
 #define ADV_FAST_DURATION_MS 30000
 
+/*
+ * BT_LE_ADV_OPT_USE_IDENTITY is not optional here, and leaving it off the fast
+ * parameters meant this watch never advertised at all.
+ *
+ * bt_ready() starts the scanner before advertising, and the controller cannot
+ * hold two different random addresses at once — so with a scan running, an
+ * advertiser that wants its own private address is refused with -EACCES. The
+ * slow parameters below always had the flag; the fast path used the stock
+ * BT_LE_ADV_CONN, which does not. bt_le_adv_start() failed on every attempt,
+ * and because start_adv() returns early on failure it never set adv_running
+ * or scheduled the slow-advertising work either, so the parameter set that
+ * would have worked was unreachable. Nothing on air, ever.
+ *
+ * The cost is that the watch advertises from its identity address rather than
+ * a rotating one. That was already true for slow advertising, and the payload
+ * carries a stable identity hash regardless, so there is no privacy left to
+ * protect by using an RPA for the first thirty seconds.
+ */
+static const struct bt_le_adv_param adv_fast_param =
+    BT_LE_ADV_PARAM_INIT(BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_USE_IDENTITY,
+                         BT_GAP_ADV_FAST_INT_MIN_2, /* 100 ms */
+                         BT_GAP_ADV_FAST_INT_MAX_2, /* 150 ms */
+                         NULL);
+
 static const struct bt_le_adv_param adv_slow_param =
     BT_LE_ADV_PARAM_INIT(BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_USE_IDENTITY,
                          BT_GAP_ADV_SLOW_INT_MIN,   /* 1000 ms */
@@ -80,7 +109,7 @@ static bool adv_is_slow;
 static void start_adv(void)
 {
     build_mfr_data();
-    int rc = bt_le_adv_start(BT_LE_ADV_CONN,
+    int rc = bt_le_adv_start(&adv_fast_param,
                              adv_data, ARRAY_SIZE(adv_data),
                              scan_rsp, ARRAY_SIZE(scan_rsp));
     if (rc) {
@@ -90,6 +119,12 @@ static void start_adv(void)
     atomic_set(&adv_running, 1);
     adv_is_slow = false;
     k_work_reschedule(&adv_slow_work, K_MSEC(ADV_FAST_DURATION_MS));
+
+    /* Log the success, not just the failure. Silence on this path used to mean
+     * either "advertising fine" or "never got here", which is the wrong place
+     * to start from when a phone cannot see the watch. */
+    LOG_INF("Advertising as '%s' (fast, %d s then slow)",
+            CONFIG_BT_DEVICE_NAME, ADV_FAST_DURATION_MS / 1000);
 }
 
 static void adv_slow_fn(struct k_work *w)
@@ -109,6 +144,10 @@ static void adv_slow_fn(struct k_work *w)
         return;
     }
     adv_is_slow = true;
+
+    /* Worth its own line: from here a scan can take seconds to turn the watch
+     * up, which reads as "not advertising" if you do not know it happened. */
+    LOG_INF("Advertising slowed to 1-1.28 s interval (still connectable)");
 }
 
 /* adv_update_work: rebuild mfr_data and restart advertising from workqueue
@@ -134,7 +173,10 @@ static void adv_update_work_fn(struct k_work *w)
     bt_le_adv_stop();
     build_mfr_data();
 
-    const struct bt_le_adv_param *param = adv_is_slow ? &adv_slow_param : BT_LE_ADV_CONN;
+    /* Both sets carry USE_IDENTITY — see adv_fast_param. Restarting into
+     * BT_LE_ADV_CONN here would fail the same way start_adv() did. */
+    const struct bt_le_adv_param *param = adv_is_slow ? &adv_slow_param
+                                                      : &adv_fast_param;
     int rc = bt_le_adv_start(param, adv_data, ARRAY_SIZE(adv_data),
                              scan_rsp, ARRAY_SIZE(scan_rsp));
     if (rc) {
@@ -163,6 +205,8 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
     phone_conn = bt_conn_ref(conn);
     atomic_set(&adv_running, 0);
     k_work_cancel_delayable(&adv_slow_work);
+
+    LOG_INF("Phone connected — advertising stopped until disconnect");
 }
 
 static void on_disconnected(struct bt_conn *conn, uint8_t reason)
@@ -221,6 +265,37 @@ static bool parse_adv(struct bt_data *data, void *user_data)
 static void on_scan_recv(const struct bt_le_scan_recv_info *info,
                          struct net_buf_simple *buf)
 {
+    /*
+     * Antenna health readout — see CONFIG_EW_BLE_SCAN_DEBUG.
+     *
+     * Receive and transmit share the antenna and matching network, so this
+     * cannot show that transmit works. What it can do is rule the antenna
+     * out as the cause, which is otherwise pure guesswork. The strongest
+     * RSSI is the number worth reading: a front end coupled to a working
+     * antenna hears a nearby handset at around -50 dBm, and one that only
+     * ever manages -90 with a phone alongside it is barely connected to
+     * anything.
+     *
+     * Rate-limited to 3 s. Scan reports arrive far faster and would flood
+     * RTT badly enough to stall the log backend.
+     */
+    if (IS_ENABLED(CONFIG_EW_BLE_SCAN_DEBUG)) {
+        static int64_t last_log;
+        static uint32_t seen;
+        static int8_t   best = -128;
+
+        seen++;
+        if (info->rssi > best) {
+            best = info->rssi;
+        }
+
+        if (k_uptime_get() - last_log >= 3000) {
+            last_log = k_uptime_get();
+            LOG_INF("scan: %u adverts heard, strongest %d dBm (latest %d dBm)",
+                    seen, best, info->rssi);
+        }
+    }
+
     int8_t rssi = info->rssi;
     bt_data_parse(buf, parse_adv, &rssi);
 }
@@ -236,6 +311,7 @@ static struct bt_le_scan_cb scan_callbacks = {
  *   0001 = EveryWatch primary service
  *   0002 = Notification characteristic (WRITE)
  *   0003 = Watch info characteristic   (READ)
+ *   0004 = Time characteristic         (READ | WRITE)
  */
 #define BT_UUID_EW_SVC \
     BT_UUID_DECLARE_128(BT_UUID_128_ENCODE( \
@@ -248,6 +324,10 @@ static struct bt_le_scan_cb scan_callbacks = {
 #define BT_UUID_EW_INFO \
     BT_UUID_DECLARE_128(BT_UUID_128_ENCODE( \
         0xEE550003, 0x0000, 0x0000, 0x0000, 0x000000000000))
+
+#define BT_UUID_EW_TIME \
+    BT_UUID_DECLARE_128(BT_UUID_128_ENCODE( \
+        0xEE550004, 0x0000, 0x0000, 0x0000, 0x000000000000))
 
 /*
  * Notification write payload:
@@ -347,6 +427,74 @@ static ssize_t on_info_read(struct bt_conn *conn,
     return bt_gatt_attr_read(conn, attr, buf, len, offset, info, sizeof(info));
 }
 
+/*
+ * Time characteristic — little-endian Unix epoch seconds, UTC.
+ *
+ * Accepts 4 or 8 bytes on write. Eight is the honest width and what a phone
+ * should send; four is accepted because it is far less to type by hand in a
+ * generic BLE tool, and unsigned it stays valid past this firmware's own year
+ * 2100 ceiling. Reads always return eight.
+ *
+ * Readable as well as writable so a client can check what actually landed.
+ * A write it cannot verify is a write it has to trust, and the RTC is exactly
+ * the thing where a silently-wrong value goes unnoticed for a long time.
+ *
+ * Encrypted like the rest of the service: the watch is bondable, and mixing an
+ * open characteristic into an otherwise encrypted service is the kind of
+ * inconsistency that gets copied by the next characteristic.
+ */
+static ssize_t on_time_write(struct bt_conn *conn,
+                             const struct bt_gatt_attr *attr,
+                             const void *buf, uint16_t len,
+                             uint16_t offset, uint8_t flags)
+{
+    ARG_UNUSED(conn); ARG_UNUSED(attr); ARG_UNUSED(flags);
+
+    if (offset != 0) {
+        return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+    }
+
+    int64_t epoch;
+
+    if (len == sizeof(uint32_t)) {
+        epoch = (int64_t)sys_get_le32(buf);
+    } else if (len == sizeof(uint64_t)) {
+        epoch = (int64_t)sys_get_le64(buf);
+    } else {
+        return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+    }
+
+    int rc = time_sync_set_epoch(epoch);
+
+    if (rc == -EINVAL) {
+        LOG_WRN("Time write rejected: epoch %lld out of range", epoch);
+        return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+    }
+    if (rc) {
+        LOG_ERR("Time write failed: %d", rc);
+        return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
+    }
+
+    LOG_INF("RTC set over BLE: epoch %lld", epoch);
+    return len;
+}
+
+static ssize_t on_time_read(struct bt_conn *conn,
+                            const struct bt_gatt_attr *attr,
+                            void *buf, uint16_t len, uint16_t offset)
+{
+    int64_t epoch = time_sync_get_epoch();
+
+    if (epoch < 0) {
+        return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
+    }
+
+    uint8_t out[sizeof(uint64_t)];
+
+    sys_put_le64((uint64_t)epoch, out);
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, out, sizeof(out));
+}
+
 BT_GATT_SERVICE_DEFINE(ew_svc,
     BT_GATT_PRIMARY_SERVICE(BT_UUID_EW_SVC),
     BT_GATT_CHARACTERISTIC(BT_UUID_EW_NOTIF,
@@ -357,6 +505,10 @@ BT_GATT_SERVICE_DEFINE(ew_svc,
         BT_GATT_CHRC_READ,
         BT_GATT_PERM_READ_ENCRYPT,
         on_info_read, NULL, NULL),
+    BT_GATT_CHARACTERISTIC(BT_UUID_EW_TIME,
+        BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
+        BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT,
+        on_time_read, on_time_write, NULL),
 );
 
 /* ── Init ──────────────────────────────────────────────────────────────── */

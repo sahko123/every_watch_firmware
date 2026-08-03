@@ -4,7 +4,6 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/sensor.h>
-#include <zephyr/pm/device.h>
 #include <zephyr/logging/log.h>
 
 LOG_MODULE_REGISTER(light, LOG_LEVEL_INF);
@@ -55,6 +54,17 @@ static struct k_work_q light_q;
 #define LIGHT_POLL_ACTIVE_MS    1000
 #define LIGHT_POLL_IDLE_MS     10000
 #define LIGHT_ACTIVE_WINDOW_MS 60000
+
+/* Brightness change past which a reading is taken whole rather than averaged.
+ * Sized above the swing sensor noise can produce through the steepest part of
+ * the curve (~7 units per lux below 10 lx), and well below a real change of
+ * room. */
+#define BR_SNAP_THRESHOLD 20
+
+/* Smoothed brightness actually handed to the display. Seeded on the first
+ * reading so the watch does not spend four polls fading up from zero. */
+static uint8_t br_filt;
+static bool    br_filt_seeded;
 
 /*
  * Piecewise-linear lux → brightness curve.
@@ -128,13 +138,20 @@ static void light_work_fn(struct k_work *work)
         return;
     }
 
-    /* Resume/suspend around the read rather than leaving the sensor
-     * powered continuously between on-demand samples — mirrors imu.c's
-     * pattern for the BMI260. Whether this has any real effect depends on
-     * the BH1750 Zephyr driver actually implementing PM_DEVICE actions;
-     * unverified here, same caveat as imu.c's equivalent calls. */
-    (void)pm_device_action_run(bh, PM_DEVICE_ACTION_RESUME);
-
+    /*
+     * No PM calls here, deliberately.
+     *
+     * This used to resume and suspend the device around each read, on the
+     * assumption that mirrored imu.c and saved power. It did neither: the
+     * Zephyr BH1750 driver implements only sample_fetch and channel_get, with
+     * no PM_DEVICE support whatsoever, so pm_device_action_run() returned
+     * -ENOSYS every time — silently, because the result was cast to (void).
+     *
+     * Nothing is lost by removing it. The driver uses the sensor's ONE_TIME
+     * modes, and a BH1750 returns to power-down by itself after each one-shot
+     * conversion. The part was already doing in hardware what those calls
+     * pretended to do in software.
+     */
     int err = sensor_sample_fetch(bh);
 
     /*
@@ -147,7 +164,6 @@ static void light_work_fn(struct k_work *work)
      */
     if (display_is_on()) {
         LOG_DBG("Light: display woke mid-conversion, discarding");
-        (void)pm_device_action_run(bh, PM_DEVICE_ACTION_SUSPEND);
         return;
     }
 
@@ -160,18 +176,46 @@ static void light_work_fn(struct k_work *work)
             uint32_t lux = (uint32_t)lux_val.val1;
             uint8_t  br  = lux_to_brightness(lux);
 
-            led_brightness = br;
+            /*
+             * Smooth small movements, follow large ones immediately.
+             *
+             * Consecutive readings of a still scene wander by a lux or two —
+             * measured at 45-50 lx across one capture. That is harmless where
+             * the curve is flat, but between 5 and 10 lx it climbs 7.2
+             * brightness units per lux, so the same two-lux wobble swings the
+             * display by fourteen units. At the peak channel values a dark
+             * room produces, that is visible stepping in something that should
+             * be holding still.
+             *
+             * A plain filter would fix the jitter and ruin the response:
+             * walking into a dark room has to take effect on the next reading,
+             * not four readings later, and the idle poll is ten seconds apart.
+             * So anything past the threshold is taken whole and only genuine
+             * noise gets averaged.
+             */
+            int delta = (int)br - (int)br_filt;
+
+            if (!br_filt_seeded) {
+                br_filt_seeded = true;
+                br_filt = br;
+            } else if (delta > BR_SNAP_THRESHOLD || delta < -BR_SNAP_THRESHOLD) {
+                br_filt = br;
+            } else {
+                br_filt = (uint8_t)((br_filt * 3 + br) / 4);
+            }
+
+            led_brightness = br_filt;
             /* INFO, not DEBUG: this fires once per display-off and once a
              * minute while idle, so it is not noisy — and it is the only
              * outward sign the sensor is feeding anything at all. The bug
              * this replaced was invisible precisely because nothing logged. */
-            LOG_INF("Light: %u lux -> brightness %u", lux, br);
+            LOG_INF("Light: %u lux -> brightness %u (applied %u)",
+                    lux, br, br_filt);
         }
     } else {
         LOG_WRN("BH1750 fetch failed: %d", err);
     }
 
-    (void)pm_device_action_run(bh, PM_DEVICE_ACTION_SUSPEND);
 }
 
 static K_WORK_DEFINE(light_work, light_work_fn);

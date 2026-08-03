@@ -233,8 +233,15 @@ against the driver source, not assumed from it:
   while a DFU block has arrived within the last 5 minutes, and stop
   on purpose once nothing has for that long — the short 30 s hardware
   timeout then catches up and forces a reset, turning "wedged forever, only
-  SWD gets you out" (no VBUS sense on this board, so unplugging the cable
-  doesn't reset the chip) into "self-heals within a few minutes."
+  SWD gets you out" into "self-heals within a few minutes."
+
+  This used to be justified by the board having no VBUS sense, so that
+  unplugging the cable could not reset the chip. That was wrong — VBUS is
+  connected to USB 5 V and the nRF52833 senses it via the POWER peripheral
+  (`USBREGSTATUS.VBUSDETECT`). The watchdog path is still the right mechanism,
+  because it recovers a wedged transfer without the user having to do anything
+  and works whether or not a cable is present. But a cable-removal reset is now
+  a viable *second* escape hatch, and worth considering alongside it.
 
 ### Watchdog trade-offs
 

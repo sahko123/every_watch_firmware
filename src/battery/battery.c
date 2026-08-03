@@ -10,6 +10,7 @@
 #include <zephyr/logging/log.h>
 #include <stdatomic.h>
 #include <string.h>
+#include <stdlib.h>
 
 LOG_MODULE_REGISTER(battery, LOG_LEVEL_INF);
 
@@ -390,6 +391,80 @@ void battery_show_level(void)
     k_work_submit(&show_level_work);
 }
 
+/*
+ * Everything else the BQ27441 knows, logged alongside the headline reading.
+ *
+ * The gauge exposes twelve channels and this code used three. The other nine
+ * are worth having for two specific reasons:
+ *
+ * FULL_CHARGE_CAPACITY is the capacity the gauge has *learned*, as opposed to
+ * the design-capacity someone typed into the devicetree. After one full charge
+ * and discharge it is the empirical answer to whether that 400 mAh figure is
+ * right — and taper-current is currently set to the C/10 convention against
+ * that unverified number, so the gauge is modelling on a guess.
+ *
+ * AVG_CURRENT measures whole-board draw. The LED current budget, the display
+ * page costs and the idle targets in this firmware are all arithmetic derived
+ * from a 0.078 mA-per-sum-unit conversion that has never been checked against
+ * a measurement. This makes checking it a matter of putting a page up and
+ * reading the log.
+ *
+ * Note the resolution limit before trusting it too far: the BQ27441 reports
+ * current in whole mA. That is ample for display-on currents in the tens to
+ * hundreds, and useless for the sub-10 uA idle target, which still needs a
+ * proper meter.
+ *
+ * Channels are read individually and a failure on one is not fatal — a driver
+ * that does not implement a channel should not cost us the ones that work.
+ */
+static void log_gauge_detail(struct sensor_value current)
+{
+    struct sensor_value full_cap, rem_cap, health, power, temp;
+    int rc;
+
+    int full_mah   = (rc = sensor_channel_get(bq, SENSOR_CHAN_GAUGE_FULL_CHARGE_CAPACITY,
+                                              &full_cap)) ? -1 : full_cap.val1;
+    int rem_mah    = sensor_channel_get(bq, SENSOR_CHAN_GAUGE_REMAINING_CHARGE_CAPACITY,
+                                        &rem_cap)  ? -1 : rem_cap.val1;
+    int health_pct = sensor_channel_get(bq, SENSOR_CHAN_GAUGE_STATE_OF_HEALTH,
+                                        &health)   ? -1 : health.val1;
+    int power_mw   = sensor_channel_get(bq, SENSOR_CHAN_GAUGE_AVG_POWER,
+                                        &power)    ? -1 : power.val1;
+    int temp_c     = sensor_channel_get(bq, SENSOR_CHAN_GAUGE_TEMP,
+                                        &temp)     ? -1 : temp.val1;
+
+    ARG_UNUSED(rc);
+
+    /*
+     * val1 is AMPS and val2 is MICROAMPS — the driver takes the gauge's raw
+     * mA and splits it as val1 = mA/1000, val2 = (mA%1000)*1000. Reading val1
+     * as milliamps understates everything by a factor of a thousand, which is
+     * an easy mistake to make and a hard one to notice: a watch drawing 3 mA
+     * prints as "0.003" and looks like a plausible sleeping current.
+     *
+     * Signed, negative being discharge. C truncates division toward zero, so a
+     * discharge of -50 mA arrives as val1 = 0, val2 = -50000.
+     */
+    int cur_ma = current.val1 * 1000 + current.val2 / 1000;
+
+    LOG_INF("  gauge: %d mA  %d mW  %d/%d mAh  health %d%%  %d C",
+            cur_ma, power_mw, rem_mah, full_mah, health_pct, temp_c);
+
+    /* The learned capacity against what the devicetree claims. They diverging
+     * is the point of printing it — design-capacity is an assertion, this is a
+     * measurement, and the gauge only reaches a trustworthy figure after a full
+     * cycle. -1 means the driver declined the channel. */
+    if (full_mah > 0) {
+        int design = DT_PROP(DT_NODELABEL(bq27441), design_capacity);
+
+        if (full_mah < (design * 8) / 10 || full_mah > (design * 12) / 10) {
+            LOG_WRN("  gauge: learned capacity %d mAh vs design-capacity %d mAh"
+                    " — check the cell fitted, or let it finish a full cycle",
+                    full_mah, design);
+        }
+    }
+}
+
 static void battery_work_fn(struct k_work *work)
 {
     ARG_UNUSED(work);
@@ -412,9 +487,14 @@ static void battery_work_fn(struct k_work *work)
 
     uint8_t  pct  = (uint8_t)soc.val1;
     uint32_t mv   = (uint32_t)(volt.val1 * 1000 + volt.val2 / 1000);
-    /* BQ27441 current: val1 = mA integer part, val2 = millionths of mA
-     * (Zephyr's sensor_value convention — not µA directly).
-     * val1 > 0 alone misses charge currents below 1 mA (val1=0, val2>0). */
+    /* val1 is AMPS, val2 is MICROAMPS — see log_gauge_detail() above, which
+     * documents why that is easy to misread. This comment previously claimed
+     * val1 was milliamps, which would make the val1 > 0 test require a whole
+     * amp before it ever fired.
+     *
+     * The test is still correct as written, but only because val2 carries
+     * everything below 1 A: charge currents on this watch never reach val1 at
+     * all, so val2 > 0 is what actually detects charging. */
     bool     chrg = (current.val1 > 0) ||
                     (current.val1 == 0 && current.val2 > 0);
 
@@ -424,6 +504,8 @@ static void battery_work_fn(struct k_work *work)
 
     LOG_INF("Battery: %u%% %umV %s",
             pct, mv, chrg ? "charging" : "discharging");
+
+    log_gauge_detail(current);
 
     /* While charging, own the display for the whole session rather than a
      * timed peek: show the readout on plug-in, refresh it each poll so the

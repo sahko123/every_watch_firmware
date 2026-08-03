@@ -92,6 +92,26 @@ config EW_IMU_ANYMOTION_WAKE
 	  addresses are ever established — see src/imu/imu.c for what would
 	  replace it (tap-to-wake, or software tilt detection).
 
+config EW_BLE_SCAN_DEBUG
+	bool "Log received BLE advertisements (antenna health check)"
+	default n
+	help
+	  Reports every 3 s how many advertisements the watch has heard and the
+	  strongest signal among them.
+
+	  Diagnostic for the case where bt_le_adv_start() reports success and yet
+	  nothing can see the watch. Receive and transmit share the antenna and
+	  matching network, so this cannot prove transmit works — but it can rule
+	  the antenna in or out, which is the expensive thing to guess at.
+
+	  Read the strongest RSSI, not the count. A working antenna hears a phone
+	  a metre away at roughly -50 to -60 dBm. Numbers down near -90 with a
+	  handset alongside the watch mean the front end is barely coupled to
+	  anything, and no amount of firmware will fix that. Silence in a room
+	  with any Bluetooth in it says the same thing more bluntly.
+
+	  Bring-up only.
+
 config EW_IMU_AXIS_DEBUG
 	bool "Log accelerometer axes, and keep the IMU alive with the display off"
 	default n

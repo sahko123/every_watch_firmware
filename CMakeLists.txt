@@ -43,6 +43,9 @@ else()
     # Hardware self-test — only in bring-up / manufacturing builds.
     target_sources_ifdef(CONFIG_EW_SELFTEST app PRIVATE src/selftest/selftest.c)
 
-    # `settime <epoch>` shell command — only where a shell exists.
-    target_sources_ifdef(CONFIG_SHELL app PRIVATE src/time_sync/time_sync.c)
+    # Epoch -> RTC conversion. Built unconditionally: it used to be gated on
+    # CONFIG_SHELL because the shell command was its only caller, but the BLE
+    # time characteristic needs the same conversion and the production image
+    # has no shell. The `settime` command inside it is still shell-gated.
+    target_sources(app PRIVATE src/time_sync/time_sync.c)
 endif()

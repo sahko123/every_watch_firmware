@@ -114,8 +114,31 @@ No device present = success.
 - **No 32.768 kHz crystal, no I2C pull-ups** — both will hang or damage the
   board without the firmware workarounds already in place. Don't "fix" the
   devicetree to assume normal crystal/pull-up hardware.
-- **No reset pin, no VBUS sense.** This is why DFU entry has no software
-  escape and why `FIH_PANIC` is currently unrecoverable without SWD.
+- **No reset pin.** This is why DFU entry has no software escape and why
+  `FIH_PANIC` is currently unrecoverable without SWD.
+- **VBUS *is* connected** to USB 5 V, contrary to what this file said until
+  2026-08-03. The nRF52833 senses it through the POWER peripheral —
+  `USBREGSTATUS.VBUSDETECT` plus the `USBDETECTED`/`USBREMOVED` events — so no
+  GPIO is involved and nothing needs adding to the devicetree to read it.
+
+  Nothing currently uses it, and two decisions were made on the assumption it
+  was absent and are worth revisiting:
+
+  - The USB CDC console has to be a **separate build variant**
+    (`bringup_usb.conf`) because an always-on USB stack costs idle current. With
+    VBUS detectable, USB can be brought up only while a cable is present, which
+    would put the `settime` shell command in the normal image instead of a
+    variant that has to be flashed specially.
+  - Charging detection leans on the SGM41524 indicator on P0.05, whose
+    interrupt path is still unverified. VBUS is a more direct signal for
+    "a cable is attached" — it does not say the cell is charging, which remains
+    the fuel gauge's job.
+- **The SGM41524 is not an I2C part.** It is a standalone charger and P0.05 is
+  its entire interface — there is nothing to configure, no driver to write, and
+  its absence from the boot I2C sweep is correct rather than a fault. (The
+  programmable part on the bus is the BQ27441 fuel gauge at 0x55; the two are
+  easy to conflate.) Charge current and termination are set by hardware, so
+  anything wrong there is a BOM question, not a firmware one.
 - Charge indicator: SGM41524 on P0.05, active-low, edge interrupt — used only
   as a hint to trigger an immediate fuel-gauge poll; the BQ27441's average
   current is the actual source of truth for "charging". The interrupt path is

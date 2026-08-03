@@ -148,6 +148,32 @@
 	bh1750: bh1750@23 {
 		compatible = "rohm,bh1750";
 		reg = <0x23>;
+
+		/*
+		 * High-resolution mode 2: 0.5 lx per count instead of 1 lx.
+		 *
+		 * Free. The driver picks the same 180 ms integration time for
+		 * modes 1 and 2 (bh1750_get_wait_time_from_dts_device) and
+		 * halves the result in the conversion, so this is twice the
+		 * resolution at no cost in time or power.
+		 *
+		 * It matters at the dark end specifically. The lux -> brightness
+		 * curve in light.c climbs 24 -> 60 between 5 and 10 lx, i.e.
+		 * 7.2 brightness units per lux — fifteen times steeper than
+		 * anywhere above 50 lx. At 1 lx resolution each sensor count
+		 * moves the display by 7 units; at 0.5 lx it moves 3.6. That is
+		 * the difference between visible stepping in a dim room and not.
+		 */
+		resolution = <2>;
+
+		/*
+		 * Measurement time register, default. Raising it buys sensitivity
+		 * at the cost of proportionally longer integration and a lower
+		 * saturation ceiling — 138 would double both the sensitivity and
+		 * the 180 ms conversion, and halve the ~54 klx maximum. Stated
+		 * explicitly so the choice is visible rather than inherited.
+		 */
+		mtreg = <69>;
 	};
 
 	bq27441: bq27441@55 {
