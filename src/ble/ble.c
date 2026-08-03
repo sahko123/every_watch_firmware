@@ -52,9 +52,30 @@ static void build_mfr_data(void)
     sys_put_le16(identity_encounter_count(), mfr_data + 7);
 }
 
+/*
+ * Name goes in the advertisement, not only the scan response.
+ *
+ * Advertising here is ADV_IND — connectable, and therefore scannable — so a
+ * scan response was always available and nRF Connect would have shown the
+ * name. But a scan response costs a round trip: their scan request has to
+ * reach us and our reply has to get back. On a marginal link that is two
+ * chances to fail rather than one, and this radio currently has about 50 dB
+ * of margin missing.
+ *
+ * With the name in the advertisement, a single one-way packet is enough to be
+ * seen and identified. It also means passive scanners show it, where before
+ * they would have listed an unnamed address.
+ *
+ * The budget is 31 bytes: flags 3 + manufacturer data 11 + name 12 = 26. The
+ * scan response is kept as well, which costs nothing on air — responses are
+ * only transmitted when something actually asks.
+ */
 static struct bt_data adv_data[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR),
     BT_DATA(BT_DATA_MANUFACTURER_DATA, mfr_data, MFR_LEN),
+    BT_DATA(BT_DATA_NAME_COMPLETE,
+            CONFIG_BT_DEVICE_NAME,
+            sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
 
 static const struct bt_data scan_rsp[] = {
@@ -223,9 +244,58 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
     start_adv();
 }
 
+/*
+ * Pairing and encryption visibility.
+ *
+ * Every characteristic on this watch requires an encrypted link, so bonding is
+ * not optional — it is the gate on all of them. Until now none of it was
+ * logged: a phone that failed to pair produced complete silence, leaving
+ * "it will not connect" indistinguishable between a radio fault, a pairing
+ * rejection, and the phone giving up. That is the same blindness that let
+ * advertising fail with -EACCES for as long as it did.
+ *
+ * Note this device has no input and no display, so its IO capability is
+ * NoInputNoOutput and the only association model available is Just Works —
+ * which yields an unauthenticated link, security level 2. That satisfies the
+ * BT_GATT_PERM_*_ENCRYPT permissions used here, but a peer demanding
+ * authenticated security (level 3+) can never be satisfied and will fail. If
+ * that ever happens, this is where it becomes visible.
+ */
+static void on_security_changed(struct bt_conn *conn, bt_security_t level,
+                                enum bt_security_err err)
+{
+    ARG_UNUSED(conn);
+
+    if (err) {
+        LOG_ERR("security failed at level %d: err %d — encrypted"
+                " characteristics stay unreadable", level, err);
+        return;
+    }
+    LOG_INF("security level %d established", level);
+}
+
 BT_CONN_CB_DEFINE(conn_callbacks) = {
-    .connected    = on_connected,
-    .disconnected = on_disconnected,
+    .connected        = on_connected,
+    .disconnected     = on_disconnected,
+    .security_changed = on_security_changed,
+};
+
+static void on_pairing_complete(struct bt_conn *conn, bool bonded)
+{
+    ARG_UNUSED(conn);
+    LOG_INF("pairing complete (%s)", bonded ? "bonded, keys stored"
+                                            : "paired only, not bonded");
+}
+
+static void on_pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
+{
+    ARG_UNUSED(conn);
+    LOG_ERR("pairing FAILED: reason %d", reason);
+}
+
+static struct bt_conn_auth_info_cb auth_info_cb = {
+    .pairing_complete = on_pairing_complete,
+    .pairing_failed   = on_pairing_failed,
 };
 
 /* ── Passive scanner — encounter detection ────────────────────────────── */
@@ -262,6 +332,80 @@ static bool parse_adv(struct bt_data *data, void *user_data)
     return false;
 }
 
+#if IS_ENABLED(CONFIG_EW_BLE_SCAN_DEBUG)
+
+/* Pulls a name out of an advertising payload, if it carries one. Most devices
+ * put it in the scan response rather than the advertisement, so plenty of
+ * entries will legitimately have none. */
+static bool parse_name(struct bt_data *data, void *user_data)
+{
+    char *out = user_data;
+
+    if (data->type == BT_DATA_NAME_COMPLETE ||
+        data->type == BT_DATA_NAME_SHORTENED) {
+        size_t n = MIN(data->data_len, 19);
+
+        memcpy(out, data->data, n);
+        out[n] = '\0';
+        return false;
+    }
+    return true;
+}
+
+/*
+ * Name each distinct advertiser once, rather than counting anonymous packets.
+ *
+ * A running total and a best RSSI say how much is out there but not what, and
+ * "what" is the part that tells you whether the radio is hearing a phone on
+ * the desk or a neighbour's television through a wall. One line per new
+ * address, with RSSI, so the list doubles as a picture of the RF environment.
+ *
+ * The table is small and never ages out: this is a bring-up aid meant to be
+ * read over the first minute after a reset, not a long-running census.
+ */
+#define SCAN_SEEN_MAX 16
+
+static void scan_debug(const struct bt_le_scan_recv_info *info,
+                       struct net_buf_simple *buf)
+{
+    static bt_addr_le_t seen[SCAN_SEEN_MAX];
+    static uint8_t      seen_count;
+    static uint32_t     total;
+    static int8_t       best = -128;
+
+    total++;
+    if (info->rssi > best) {
+        best = info->rssi;
+    }
+
+    for (uint8_t i = 0; i < seen_count; i++) {
+        if (bt_addr_le_eq(&seen[i], info->addr)) {
+            return;  /* already reported */
+        }
+    }
+
+    if (seen_count >= SCAN_SEEN_MAX) {
+        return;
+    }
+    bt_addr_le_copy(&seen[seen_count++], info->addr);
+
+    /* bt_data_parse() consumes the buffer, and the real encounter parser
+     * downstream needs it intact — so rewind after peeking. */
+    char name[20] = "";
+    struct net_buf_simple_state state;
+
+    net_buf_simple_save(buf, &state);
+    bt_data_parse(buf, parse_name, name);
+    net_buf_simple_restore(buf, &state);
+
+    LOG_INF("scan #%u: %s  %d dBm  %s%s  [best %d dBm, %u pkts]",
+            seen_count, bt_addr_le_str(info->addr), info->rssi,
+            name[0] ? "name=" : "(no name in advert)", name,
+            best, total);
+}
+
+#endif /* CONFIG_EW_BLE_SCAN_DEBUG */
+
 static void on_scan_recv(const struct bt_le_scan_recv_info *info,
                          struct net_buf_simple *buf)
 {
@@ -280,20 +424,7 @@ static void on_scan_recv(const struct bt_le_scan_recv_info *info,
      * RTT badly enough to stall the log backend.
      */
     if (IS_ENABLED(CONFIG_EW_BLE_SCAN_DEBUG)) {
-        static int64_t last_log;
-        static uint32_t seen;
-        static int8_t   best = -128;
-
-        seen++;
-        if (info->rssi > best) {
-            best = info->rssi;
-        }
-
-        if (k_uptime_get() - last_log >= 3000) {
-            last_log = k_uptime_get();
-            LOG_INF("scan: %u adverts heard, strongest %d dBm (latest %d dBm)",
-                    seen, best, info->rssi);
-        }
+        scan_debug(info, buf);
     }
 
     int8_t rssi = info->rssi;
@@ -513,6 +644,187 @@ BT_GATT_SERVICE_DEFINE(ew_svc,
 
 /* ── Init ──────────────────────────────────────────────────────────────── */
 
+#if IS_ENABLED(CONFIG_EW_BLE_CHANNEL_SURVEY)
+
+/*
+ * Nordic's QoS channel survey: measured energy in dBm on each of the 40 BLE
+ * channels, straight from the controller.
+ *
+ * This is the antenna test every other measurement here has wanted, because it
+ * needs no reference transmitter, no known distance, and no second board — it
+ * is self-referencing on the shape of the spectrum rather than on absolute
+ * level.
+ *
+ * The 2.4 GHz band is crowded and Wi-Fi dominates it. Channels 1, 6 and 11 sit
+ * at 2412, 2437 and 2462 MHz, each 20 MHz wide, so each covers a broad block of
+ * BLE channels. A receiver connected to a working antenna, in any room with
+ * Wi-Fi in it, sees pronounced humps in those blocks. A receiver whose antenna
+ * is not connected sees its own thermal noise: flat, low, and featureless
+ * across all forty.
+ *
+ * So it is the *profile* that answers the question. Structure means the front
+ * end is coupled to something; a flat line means it is not — and neither
+ * reading depends on knowing what is transmitting nearby.
+ *
+ * 127 means the controller had no measurement for that channel. Survey
+ * measurements are scheduled at low priority, so gaps are normal and not a
+ * fault.
+ */
+#define BLE_CHAN_COUNT 40
+
+static void survey_report(const int8_t energy[BLE_CHAN_COUNT])
+{
+    /* BLE channel index -> centre frequency: index 37 = 2402, 38 = 2426,
+     * 39 = 2480, and 0..36 fill the gaps from 2404 upward in 2 MHz steps.
+     * Printed as one line so a whole sweep stays readable in the log. */
+    /*
+     * Six bytes per channel, not five. " %3d " looks like five characters but
+     * %3d is a MINIMUM width — a value of -107 prints as four, giving " -107 ".
+     * At 40 channels the difference is 240 bytes into a 201-byte buffer.
+     *
+     * That overran the stack and crashed the watch with an instruction bus
+     * error, because snprintk's size argument is size_t: once pos passed the
+     * buffer length, sizeof(line) - pos underflowed to about four billion and
+     * the clamp stopped clamping. The fix is both halves — a buffer that fits
+     * the real worst case, and never handing snprintk a length computed by
+     * subtraction that can go negative.
+     */
+    char   line[BLE_CHAN_COUNT * 6 + 1];
+    size_t pos = 0;
+    int    strongest = -128;
+    int    measured = 0;
+
+    for (int i = 0; i < BLE_CHAN_COUNT; i++) {
+        if (pos + 1 >= sizeof(line)) {
+            break;
+        }
+
+        size_t room = sizeof(line) - pos;
+        int    n;
+
+        if (energy[i] == 127) {
+            n = snprintk(line + pos, room, "  .. ");
+        } else {
+            measured++;
+            if (energy[i] > strongest) {
+                strongest = energy[i];
+            }
+            n = snprintk(line + pos, room, " %3d ", energy[i]);
+        }
+
+        if (n < 0) {
+            break;
+        }
+        /* snprintk returns what it WOULD have written, so clamp before it is
+         * added to pos — that return value is the other half of the trap. */
+        pos += MIN((size_t)n, room - 1);
+    }
+
+    LOG_INF("survey dBm by channel 0-39:%s", line);
+    LOG_INF("survey: %d/%d channels measured, strongest %d dBm",
+            measured, BLE_CHAN_COUNT, measured ? strongest : 0);
+}
+
+static bool survey_vs_evt(struct net_buf_simple *buf)
+{
+    if (buf->len < 1) {
+        return false;
+    }
+
+    uint8_t subevent = net_buf_simple_pull_u8(buf);
+
+    if (subevent != 0x81 /* SDC_HCI_SUBEVENT_VS_QOS_CHANNEL_SURVEY_REPORT */) {
+        return false;  /* not ours — let the host handle it */
+    }
+    if (buf->len < BLE_CHAN_COUNT) {
+        return true;
+    }
+
+    survey_report((const int8_t *)buf->data);
+    return true;
+}
+
+static void survey_start(void)
+{
+    /* sdc_hci_cmd_vs_qos_channel_survey_enable: uint8 enable, uint32 interval_us.
+     * 500 ms keeps the log readable; the controller schedules these at low
+     * priority and may deliver fewer. */
+    struct net_buf *cmd = bt_hci_cmd_create(0xfd0e, 5);
+
+    if (!cmd) {
+        LOG_ERR("survey: no command buffer");
+        return;
+    }
+
+    net_buf_add_u8(cmd, 1);              /* enable */
+    net_buf_add_le32(cmd, 500000);       /* interval_us */
+
+    int rc = bt_hci_cmd_send_sync(0xfd0e, cmd, NULL);
+
+    if (rc) {
+        LOG_ERR("survey: enable failed: %d", rc);
+        return;
+    }
+
+    bt_hci_register_vnd_evt_cb(survey_vs_evt);
+    LOG_INF("survey: channel energy scan running (Wi-Fi humps = antenna alive,"
+            " flat line = antenna dead)");
+}
+
+#endif /* CONFIG_EW_BLE_CHANNEL_SURVEY */
+
+/*
+ * Set transmit power, and report back what the controller actually chose.
+ *
+ * CONFIG_BT_CTLR_TX_PWR_PLUS_8 does NOT work with this build. That Kconfig
+ * belongs to Zephyr's open-source controller; we use the SoftDevice Controller
+ * (CONFIG_BT_LL_SOFTDEVICE), and nothing in nrfxlib or the NCS controller glue
+ * reads CONFIG_BT_CTLR_TX_PWR_DBM. The symbol is accepted, the build reports
+ * "=8", and the radio stays at 0 dBm — a setting that looks applied in every
+ * place you would think to check and is not applied anywhere that matters.
+ * NCS's own nrf_desktop sidesteps it with BT_CTLR_TX_PWR_DYNAMIC_CONTROL.
+ *
+ * The SDC's real interface is this runtime vendor command, per role. Its reply
+ * carries the level the controller settled on, so this asks for a value and
+ * then prints what it got rather than assuming the two match — which is the
+ * mistake the Kconfig route quietly encouraged.
+ *
+ * Set per role: the advertiser and the scanner are configured independently,
+ * and scan requests come from the scanner handle.
+ */
+static void set_tx_power(uint8_t handle_type, uint16_t handle, int8_t dbm)
+{
+    struct net_buf *buf, *rsp = NULL;
+
+    buf = bt_hci_cmd_create(0xfc0e /* VS_ZEPHYR_WRITE_TX_POWER */, 4);
+    if (!buf) {
+        LOG_ERR("tx power: no command buffer");
+        return;
+    }
+
+    net_buf_add_u8(buf, handle_type);
+    net_buf_add_le16(buf, handle);
+    net_buf_add_u8(buf, (uint8_t)dbm);
+
+    int rc = bt_hci_cmd_send_sync(0xfc0e, buf, &rsp);
+
+    if (rc) {
+        LOG_ERR("tx power: request for %d dBm failed: %d", dbm, rc);
+        return;
+    }
+
+    /* Reply: status, handle_type, handle, selected_tx_power */
+    if (rsp && rsp->len >= 5) {
+        int8_t got = (int8_t)rsp->data[4];
+
+        LOG_INF("tx power: asked %d dBm, controller selected %d dBm (role %u)",
+                dbm, got, handle_type);
+    }
+    if (rsp) {
+        net_buf_unref(rsp);
+    }
+}
+
 static void bt_ready(int err)
 {
     if (err) {
@@ -521,17 +833,57 @@ static void bt_ready(int err)
         return;
     }
 
-    settings_load();
+    /* Checked: this is what restores bonding keys from NVS. If it fails the
+     * watch still runs and still advertises, but every previously paired phone
+     * has to pair again — a symptom that looks like a phone-side problem and
+     * would never be traced back to here without a log line. */
+    int src = settings_load();
+
+    if (src) {
+        LOG_ERR("settings_load failed: %d — bonds will not persist", src);
+    }
+
+    src = bt_conn_auth_info_cb_register(&auth_info_cb);
+    if (src) {
+        LOG_ERR("auth info cb register failed: %d — pairing will be silent", src);
+    }
 
     bt_le_scan_cb_register(&scan_callbacks);
 
-    /* 10% scan duty cycle: 500 ms interval, 50 ms window.
-     * Down from 100% (30/30 ms) — reduces scan current ~6x. */
+    /*
+     * Normally a 10% duty cycle: 500 ms interval, 50 ms window. Down from
+     * 100% (30/30 ms) — reduces scan current ~6x.
+     *
+     * Under CONFIG_EW_BLE_SCAN_DEBUG both of those change, because the
+     * diagnostic wants different things from the census:
+     *
+     * ACTIVE instead of passive, so the watch sends scan requests. That is
+     * the only way to exercise the TRANSMIT path from the bench without a
+     * second device to talk to — anything that answers a scan request has
+     * heard us, which passive scanning can never demonstrate. It also fetches
+     * scan responses, which is where devices put their names, so the census
+     * stops being a list of anonymous addresses.
+     *
+     * And a full duty cycle, so "heard almost nothing" cannot be blamed on
+     * having only listened for a tenth of the time. At 10% a quiet-looking
+     * minute is really six seconds of listening; at 100% the count means what
+     * it appears to mean.
+     *
+     * Both cost power and neither belongs in a shipping build, which is why
+     * they are tied to the debug option rather than left on.
+     */
     static const struct bt_le_scan_param scan_param = {
+#if IS_ENABLED(CONFIG_EW_BLE_SCAN_DEBUG)
+        .type     = BT_LE_SCAN_TYPE_ACTIVE,
+        .options  = BT_LE_SCAN_OPT_NONE,
+        .interval = 0x0030,   /* 30 ms */
+        .window   = 0x0030,   /* 30 ms — continuous */
+#else
         .type     = BT_LE_SCAN_TYPE_PASSIVE,
         .options  = BT_LE_SCAN_OPT_NONE,
         .interval = 0x0320,   /* 500 ms */
         .window   = 0x0050,   /* 50 ms  */
+#endif
     };
     int rc = bt_le_scan_start(&scan_param, NULL);
     if (rc) {
@@ -539,6 +891,14 @@ static void bt_ready(int err)
     }
 
     start_adv();
+
+    /* After the roles exist, so the controller has something to apply it to. */
+    set_tx_power(0 /* ADV */,       0, CONFIG_EW_BLE_TX_POWER_DBM);
+    set_tx_power(1 /* SCAN_INIT */, 0, CONFIG_EW_BLE_TX_POWER_DBM);
+
+#if IS_ENABLED(CONFIG_EW_BLE_CHANNEL_SURVEY)
+    survey_start();
+#endif
 }
 
 void ble_init(void)

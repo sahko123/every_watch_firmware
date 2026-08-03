@@ -133,6 +133,12 @@ No device present = success.
     interrupt path is still unverified. VBUS is a more direct signal for
     "a cable is attached" — it does not say the cell is charging, which remains
     the fuel gauge's job.
+- **The internal DC/DC is off deliberately — do not enable it.** VDD comes from
+  an external 3.3 V regulator, so the SoC runs in normal LDO mode. Enabling
+  `CONFIG_BOARD_ENABLE_DCDC` requires inductors on the `DCC` pins that this
+  board does not have; without them the supply would sag under radio load,
+  which presents as an RF fault rather than a power one. The usual "the DC/DC
+  halves radio current" advice does not apply here.
 - **The SGM41524 is not an I2C part.** It is a standalone charger and P0.05 is
   its entire interface — there is nothing to configure, no driver to write, and
   its absence from the boot I2C sweep is correct rather than a fault. (The

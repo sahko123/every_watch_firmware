@@ -92,6 +92,60 @@ config EW_IMU_ANYMOTION_WAKE
 	  addresses are ever established — see src/imu/imu.c for what would
 	  replace it (tap-to-wake, or software tilt detection).
 
+config EW_BLE_TX_POWER_DBM
+	int "BLE transmit power, dBm"
+	default 0
+	range -40 8
+	help
+	  Applied at runtime via the SoftDevice Controller's vendor HCI command,
+	  per role, and the level the controller actually selected is logged.
+
+	  REQUIRES CONFIG_BT_CTLR_TX_PWR_DYNAMIC_CONTROL=y, set alongside this in
+	  prj.conf. That is what compiles the handler for the command into the
+	  controller; without it the request returns -EIO, the radio stays at
+	  0 dBm, and the only sign is an error nobody was logging. It cannot be
+	  selected from here — Kconfig does not allow an int symbol to select.
+
+	  Do NOT use CONFIG_BT_CTLR_TX_PWR_PLUS_8 for this. That Kconfig belongs
+	  to Zephyr's open-source controller, and this build uses the SoftDevice
+	  Controller — nothing in nrfxlib reads CONFIG_BT_CTLR_TX_PWR_DBM. Setting
+	  it is accepted, appears in the generated .config as "=8", and leaves the
+	  radio at 0 dBm. It looks applied everywhere except where it counts.
+
+	  +8 dBm is the nRF52833's ceiling. The +9 and +10 options in Zephyr's
+	  list require an external front-end module, which this board does not
+	  have.
+
+	  0 is the right default for a battery watch. Raise it only as a
+	  deliberate trade, and remember it does nothing for reception — the
+	  receiver is fixed-gain, so a connection still needs the other half of
+	  the link to work.
+
+config EW_BLE_CHANNEL_SURVEY
+	bool "Measure RF energy on all 40 BLE channels"
+	default n
+	select BT_CTLR_SDC_QOS_CHANNEL_SURVEY
+	select BT_HCI_VS_EVT_USER
+	help
+	  Turns on Nordic's QoS channel survey and logs the measured energy in
+	  dBm for every BLE channel, roughly twice a second.
+
+	  This is an antenna test that needs no reference transmitter, no known
+	  distance and no second board, which is what makes it worth having when
+	  every other measurement is guessing at what is nearby.
+
+	  Read the profile, not the numbers. Wi-Fi occupies 2412, 2437 and 2462
+	  MHz in 20 MHz blocks, so a receiver on a working antenna shows clear
+	  humps over the corresponding BLE channels in any room with Wi-Fi. A
+	  receiver whose antenna is not connected sees only its own thermal
+	  noise: flat and featureless across all forty. Structure means the front
+	  end is coupled to something; a flat line means it is not.
+
+	  A value of 127 means no measurement for that channel. Survey work is
+	  scheduled at low priority, so gaps are expected.
+
+	  Bring-up only — it costs radio time and log bandwidth.
+
 config EW_BLE_SCAN_DEBUG
 	bool "Log received BLE advertisements (antenna health check)"
 	default n

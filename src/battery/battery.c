@@ -595,7 +595,19 @@ static void chg_indicator_init(void)
     }
 
     gpio_init_callback(&chg_cb, chg_isr, BIT(chg_pin.pin));
-    gpio_add_callback(chg_pin.port, &chg_cb);
+
+    /* Checked, because this is the last step and the one that actually
+     * connects the handler. It was previously called bare, with the "armed"
+     * message printed unconditionally underneath — so a failure here would
+     * report success and leave an interrupt that could never fire. This
+     * interrupt has in fact never been observed firing, which makes it worth
+     * knowing rather than assuming. */
+    rc = gpio_add_callback(chg_pin.port, &chg_cb);
+    if (rc) {
+        LOG_WRN("Charge indicator callback registration failed (%d) —"
+                " falling back to poll", rc);
+        return;
+    }
 
     LOG_INF("Charge indicator interrupt armed");
 }
