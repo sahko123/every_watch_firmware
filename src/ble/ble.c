@@ -12,6 +12,12 @@
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/gap.h>
+/* bt_hci_cmd_create()/bt_hci_cmd_send_sync(), used to set TX power through the
+ * SoftDevice Controller's vendor command. Without this the build still links —
+ * implicit declarations resolve at link time — but the compiler assumes both
+ * return int, so bt_hci_cmd_create()'s net_buf pointer travels through an int.
+ * It happens to survive on a 32-bit target and would not on a 64-bit one. */
+#include <zephyr/bluetooth/hci.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/reboot.h>
@@ -402,6 +408,20 @@ static void scan_debug(const struct bt_le_scan_recv_info *info,
             seen_count, bt_addr_le_str(info->addr), info->rssi,
             name[0] ? "name=" : "(no name in advert)", name,
             best, total);
+}
+
+#else /* !CONFIG_EW_BLE_SCAN_DEBUG */
+
+/* The call below is guarded by a runtime if (IS_ENABLED(...)), not #if, so the
+ * compiler still has to see a declaration even when the feature is off — and
+ * without one it assumed an implicit int-returning function and left an
+ * unresolved call that only ever disappeared because dead-code elimination
+ * removed it. That holds at -Os and would break the link at -O0. */
+static inline void scan_debug(const struct bt_le_scan_recv_info *info,
+                              struct net_buf_simple *buf)
+{
+    ARG_UNUSED(info);
+    ARG_UNUSED(buf);
 }
 
 #endif /* CONFIG_EW_BLE_SCAN_DEBUG */
