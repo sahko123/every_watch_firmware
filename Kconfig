@@ -147,16 +147,21 @@ config EW_BLE_CHANNEL_SURVEY
 	  Bring-up only — it costs radio time and log bandwidth.
 
 config EW_BLE_SCAN_DEBUG
-	bool "Log received BLE advertisements (antenna health check)"
+	bool "Periodic BLE RSSI table (antenna health / signal-strength monitor)"
 	default n
 	help
-	  Reports every 3 s how many advertisements the watch has heard and the
-	  strongest signal among them.
+	  Every 3 s, prints a table of every BLE advertiser currently heard:
+	  address, name (if it carries one), latest and best RSSI, packet count,
+	  and how many seconds since its last packet. Up to 16 devices, oldest
+	  replaced first once full, so a long-running watch tracks what is
+	  actually still around rather than filling up once and stopping.
 
 	  Diagnostic for the case where bt_le_adv_start() reports success and yet
 	  nothing can see the watch. Receive and transmit share the antenna and
 	  matching network, so this cannot prove transmit works — but it can rule
-	  the antenna in or out, which is the expensive thing to guess at.
+	  the antenna in or out, which is the expensive thing to guess at. It also
+	  works as a plain signal-strength monitor: watch the table update while
+	  walking the watch around a room or away from a phone.
 
 	  Read the strongest RSSI, not the count. A working antenna hears a phone
 	  a metre away at roughly -50 to -60 dBm. Numbers down near -90 with a
@@ -164,7 +169,9 @@ config EW_BLE_SCAN_DEBUG
 	  anything, and no amount of firmware will fix that. Silence in a room
 	  with any Bluetooth in it says the same thing more bluntly.
 
-	  Bring-up only.
+	  Also switches scanning to active/100% duty cycle instead of the normal
+	  passive/10% — see the scan_param comment in ble.c. Bring-up only: both
+	  that and the table itself cost real power and RTT bandwidth.
 
 config EW_IMU_AXIS_DEBUG
 	bool "Log accelerometer axes, and keep the IMU alive with the display off"

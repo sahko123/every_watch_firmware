@@ -76,6 +76,17 @@ west build -b every_watch/nrf52833 every_watch_firmware -p always -d build_usb \
     -- -DEXTRA_CONF_FILE=bringup_usb.conf -DEXTRA_DTC_OVERLAY_FILE=bringup_usb.overlay
 ```
 
+**RSSI monitor** — console-only build (RTT, so a J-Link on SWD, no USB) that
+prints a table of every BLE device currently heard — address, name, latest
+and best RSSI, packet count, seconds since last packet — refreshed every 3 s.
+Doubles as an antenna health check and a plain signal-strength monitor; see
+`CONFIG_EW_BLE_SCAN_DEBUG`'s help in `Kconfig`:
+
+```bash
+west build -b every_watch/nrf52833 every_watch_firmware -p always -d build_rssi \
+    -- -DEXTRA_CONF_FILE=rssi_monitor.conf
+```
+
 Approximate sizes (slot is 450,048 B):
 
 | Build | Flash | RAM |
@@ -83,6 +94,7 @@ Approximate sizes (slot is 450,048 B):
 | Production | 229 KB (51%) | 38 KB (29%) |
 | Bring-up, RTT | 353 KB (78%) | 52 KB (40%) |
 | Bring-up, USB CDC | 373 KB (83%) | 59 KB (45%) |
+| RSSI monitor | 278 KB (63%) | 49 KB (38%) |
 
 > This app builds through the legacy child-image path
 > (`child_image/mcuboot.conf`), not sysbuild. The stale `sysbuild/` config

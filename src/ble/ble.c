@@ -359,56 +359,159 @@ static bool parse_name(struct bt_data *data, void *user_data)
 }
 
 /*
- * Name each distinct advertiser once, rather than counting anonymous packets.
+ * Live per-advertiser table: address, name, latest/best RSSI, packet count,
+ * last-seen time — refreshed on every scan report, dumped as a whole on a
+ * timer. A running total and a single best RSSI (still printed, see
+ * rssi_print_fn()) say how much is out there but not what, and "what" is the
+ * part that tells you whether the radio is hearing a phone on the desk or a
+ * neighbour's television through a wall.
  *
- * A running total and a best RSSI say how much is out there but not what, and
- * "what" is the part that tells you whether the radio is hearing a phone on
- * the desk or a neighbour's television through a wall. One line per new
- * address, with RSSI, so the list doubles as a picture of the RF environment.
+ * Previously this logged one line the first time each address was seen and
+ * never touched it again — a snapshot of the first minute after reset, not
+ * something you could watch while walking around with the board to see
+ * signal strength change. This keeps the entry live instead: same address,
+ * same slot, RSSI and last-seen updated every packet.
  *
- * The table is small and never ages out: this is a bring-up aid meant to be
- * read over the first minute after a reset, not a long-running census.
+ * Table is capped and reused, not grown: once full, a newly-seen address
+ * evicts whichever slot has gone longest without a packet, so a long-running
+ * monitor tracks what is actually still around rather than filling up once
+ * on a busy room and refusing every arrival after.
  */
-#define SCAN_SEEN_MAX 16
+#define SCAN_SEEN_MAX      16
+#define SCAN_PRINT_PERIOD_MS 3000
 
-static void scan_debug(const struct bt_le_scan_recv_info *info,
+struct seen_dev {
+    bt_addr_le_t addr;
+    char         name[20];
+    int8_t       rssi;      /* most recent packet from this address */
+    int8_t       best;      /* strongest ever seen from it */
+    uint32_t     pkts;
+    int64_t      last_seen_ms;
+};
+
+static struct seen_dev seen[SCAN_SEEN_MAX];
+static uint8_t         seen_count;
+static uint32_t        total_pkts;
+static int8_t          best_overall = -128;
+
+/* scan_track() runs on the BT RX thread (CONFIG_BT_RECV_WORKQ_BT, this SoC's
+ * default — a thread of its own, not the system workqueue); rssi_print_fn()
+ * runs on the system workqueue. Genuinely two threads touching the same
+ * table, so it needs a real lock: last_seen_ms is an int64_t, two separate
+ * load/store instructions on this 32-bit core, and eviction writes a slot's
+ * address/rssi/pkts/name/last_seen_ms as several separate statements — a
+ * print landing mid-write could see a torn timestamp or a Frankenstein row
+ * (new address, stale leftover name) without one. */
+static K_MUTEX_DEFINE(rssi_mutex);
+
+/* Called from on_scan_recv() — BT RX thread context, same as parse_adv(). */
+static void scan_track(const struct bt_le_scan_recv_info *info,
                        struct net_buf_simple *buf)
 {
-    static bt_addr_le_t seen[SCAN_SEEN_MAX];
-    static uint8_t      seen_count;
-    static uint32_t     total;
-    static int8_t       best = -128;
+    k_mutex_lock(&rssi_mutex, K_FOREVER);
 
-    total++;
-    if (info->rssi > best) {
-        best = info->rssi;
+    total_pkts++;
+    if (info->rssi > best_overall) {
+        best_overall = info->rssi;
     }
 
+    int64_t now = k_uptime_get();
+
     for (uint8_t i = 0; i < seen_count; i++) {
-        if (bt_addr_le_eq(&seen[i], info->addr)) {
-            return;  /* already reported */
+        if (bt_addr_le_eq(&seen[i].addr, info->addr)) {
+            seen[i].rssi = info->rssi;
+            if (info->rssi > seen[i].best) {
+                seen[i].best = info->rssi;
+            }
+            seen[i].pkts++;
+            seen[i].last_seen_ms = now;
+            k_mutex_unlock(&rssi_mutex);
+            return;
         }
     }
 
-    if (seen_count >= SCAN_SEEN_MAX) {
-        return;
+    uint8_t slot;
+
+    if (seen_count < SCAN_SEEN_MAX) {
+        slot = seen_count++;
+    } else {
+        slot = 0;
+        for (uint8_t i = 1; i < SCAN_SEEN_MAX; i++) {
+            if (seen[i].last_seen_ms < seen[slot].last_seen_ms) {
+                slot = i;
+            }
+        }
     }
-    bt_addr_le_copy(&seen[seen_count++], info->addr);
+
+    bt_addr_le_copy(&seen[slot].addr, info->addr);
+    seen[slot].rssi         = info->rssi;
+    seen[slot].best         = info->rssi;
+    seen[slot].pkts         = 1;
+    seen[slot].last_seen_ms = now;
+    seen[slot].name[0]      = '\0';
 
     /* bt_data_parse() consumes the buffer, and the real encounter parser
-     * downstream needs it intact — so rewind after peeking. */
-    char name[20] = "";
+     * downstream needs it intact — so rewind after peeking. Parsing a
+     * buffer already in hand doesn't block, so holding the lock across it
+     * is fine — no I2C, no I/O, nothing that could stall the BT RX thread
+     * against a print. */
     struct net_buf_simple_state state;
 
     net_buf_simple_save(buf, &state);
-    bt_data_parse(buf, parse_name, name);
+    bt_data_parse(buf, parse_name, seen[slot].name);
     net_buf_simple_restore(buf, &state);
 
-    LOG_INF("scan #%u: %s  %d dBm  %s%s  [best %d dBm, %u pkts]",
-            seen_count, bt_addr_le_str(info->addr), info->rssi,
-            name[0] ? "name=" : "(no name in advert)", name,
-            best, total);
+    k_mutex_unlock(&rssi_mutex);
 }
+
+/* Dumps the whole table every SCAN_PRINT_PERIOD_MS. Runs on the system
+ * workqueue (via rssi_print_timer below), not the BT RX thread that
+ * scan_track() runs on — a multi-line RTT dump has no business stalling
+ * connection-event handling, same reasoning as ble_paint_notification()'s
+ * deferral. Holds rssi_mutex for the whole dump, not just the copy, so the
+ * table can't be evicted-from mid-print — see the mutex's comment above for
+ * why an unsynchronized read isn't safe here. That does mean a plug-in-heavy
+ * moment on the BT RX thread can wait out one print pass; RTT writes are
+ * fast enough that this is not worth avoiding for a bring-up tool. */
+static void rssi_print_fn(struct k_work *w)
+{
+    ARG_UNUSED(w);
+
+    k_mutex_lock(&rssi_mutex, K_FOREVER);
+
+    if (seen_count == 0) {
+        k_mutex_unlock(&rssi_mutex);
+        LOG_INF("RSSI monitor: nothing heard yet");
+        return;
+    }
+
+    int64_t now = k_uptime_get();
+
+    LOG_INF("---- RSSI monitor: %u device%s heard, %u packets total, best %d dBm ----",
+            seen_count, seen_count == 1 ? "" : "s", total_pkts, best_overall);
+
+    for (uint8_t i = 0; i < seen_count; i++) {
+        uint32_t age_s = (uint32_t)((now - seen[i].last_seen_ms) / 1000);
+        char     addr_str[BT_ADDR_LE_STR_LEN];
+
+        bt_addr_le_to_str(&seen[i].addr, addr_str, sizeof(addr_str));
+
+        LOG_INF("  %4d dBm (best %4d)  %s  %-19s  %5u pkts  %3u s ago",
+                seen[i].rssi, seen[i].best, addr_str,
+                seen[i].name[0] ? seen[i].name : "(no name in advert)",
+                seen[i].pkts, age_s);
+    }
+
+    k_mutex_unlock(&rssi_mutex);
+}
+static K_WORK_DEFINE(rssi_print_work, rssi_print_fn);
+
+static void rssi_print_timer_cb(struct k_timer *t)
+{
+    ARG_UNUSED(t);
+    k_work_submit(&rssi_print_work);
+}
+static K_TIMER_DEFINE(rssi_print_timer, rssi_print_timer_cb, NULL);
 
 #else /* !CONFIG_EW_BLE_SCAN_DEBUG */
 
@@ -417,7 +520,7 @@ static void scan_debug(const struct bt_le_scan_recv_info *info,
  * without one it assumed an implicit int-returning function and left an
  * unresolved call that only ever disappeared because dead-code elimination
  * removed it. That holds at -Os and would break the link at -O0. */
-static inline void scan_debug(const struct bt_le_scan_recv_info *info,
+static inline void scan_track(const struct bt_le_scan_recv_info *info,
                               struct net_buf_simple *buf)
 {
     ARG_UNUSED(info);
@@ -430,7 +533,7 @@ static void on_scan_recv(const struct bt_le_scan_recv_info *info,
                          struct net_buf_simple *buf)
 {
     /*
-     * Antenna health readout — see CONFIG_EW_BLE_SCAN_DEBUG.
+     * Antenna health / RSSI monitor — see CONFIG_EW_BLE_SCAN_DEBUG.
      *
      * Receive and transmit share the antenna and matching network, so this
      * cannot show that transmit works. What it can do is rule the antenna
@@ -440,11 +543,13 @@ static void on_scan_recv(const struct bt_le_scan_recv_info *info,
      * ever manages -90 with a phone alongside it is barely connected to
      * anything.
      *
-     * Rate-limited to 3 s. Scan reports arrive far faster and would flood
-     * RTT badly enough to stall the log backend.
+     * Only updates the table here — cheap, no I/O. The table is printed on
+     * its own timer (rssi_print_timer, started in bt_ready()) rather than
+     * from this callback, which runs far faster than anything should be
+     * logged from and would flood RTT badly enough to stall the log backend.
      */
     if (IS_ENABLED(CONFIG_EW_BLE_SCAN_DEBUG)) {
-        scan_debug(info, buf);
+        scan_track(info, buf);
     }
 
     int8_t rssi = info->rssi;
@@ -909,6 +1014,11 @@ static void bt_ready(int err)
     if (rc) {
         LOG_ERR("scan_start failed: %d", rc);
     }
+
+#if IS_ENABLED(CONFIG_EW_BLE_SCAN_DEBUG)
+    k_timer_start(&rssi_print_timer,
+                  K_MSEC(SCAN_PRINT_PERIOD_MS), K_MSEC(SCAN_PRINT_PERIOD_MS));
+#endif
 
     start_adv();
 
