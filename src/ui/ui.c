@@ -56,6 +56,11 @@ static void timeout_cb(struct k_timer *t)
 
 static K_TIMER_DEFINE(timeout_timer, timeout_cb, NULL);
 
+void ui_cancel_timeout(void)
+{
+	k_timer_stop(&timeout_timer);
+}
+
 /* -------------------------------------------------------------------------
  * Page implementations
  *
@@ -99,6 +104,12 @@ static void battery_enter(void)
 {
 	display_on();
 	battery_show_level();
+
+	/* Always a manual entry now — the page is never auto-shown on
+	 * plug-in (see battery_work_fn()). It gets the normal timeout_ms
+	 * like any other page; if the watch turns out to be on power,
+	 * battery.c promotes it to persistent later via ui_cancel_timeout(),
+	 * once that poll actually runs — not here. */
 }
 
 static void battery_exit(void)
@@ -326,12 +337,29 @@ void ui_handle_button(enum btn_event ev)
 		return;
 
 	case BTN_EV_R_SINGLE:
-		/* Toggle: same button takes the toy away again. */
-		ui_goto(current == UI_PAGE_SAND ? UI_PAGE_BLANK : UI_PAGE_SAND);
+		if (current == UI_PAGE_BATTERY) {
+			/* Quick press dismisses the battery view — same
+			 * button that opened it (a hold), same toggle-off
+			 * idea as the sand toy below. */
+			ui_dismiss();
+		} else {
+			/* Toggle: same button takes the toy away again. */
+			ui_goto(current == UI_PAGE_SAND ? UI_PAGE_BLANK : UI_PAGE_SAND);
+		}
 		return;
 
 	case BTN_EV_R_HOLD:
-		ui_goto(UI_PAGE_BATTERY);
+		/* Re-entering while already on the battery page would tear
+		 * down and immediately rebuild it — harmless for a manual
+		 * peek, but for the persistent on-power view it briefly
+		 * drops charging_mode (battery_screen_dismiss() clears it on
+		 * the way out) and comes back up as a plain timed peek
+		 * instead, until the next poll notices and restores it. Held
+		 * open is already showing exactly what this button asks for,
+		 * so treat it as a no-op instead. */
+		if (current != UI_PAGE_BATTERY) {
+			ui_goto(UI_PAGE_BATTERY);
+		}
 		return;
 
 	/* Recognised by the driver and deliberately unbound for now, rather

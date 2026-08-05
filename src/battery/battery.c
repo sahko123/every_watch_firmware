@@ -3,6 +3,7 @@
 #include "display/display.h"
 #include "time_display/time_display.h"
 #include "sand/sand.h"
+#include "ui/ui.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/sensor.h>
@@ -11,6 +12,7 @@
 #include <stdatomic.h>
 #include <string.h>
 #include <stdlib.h>
+#include <nrfx_power.h>
 
 LOG_MODULE_REGISTER(battery, LOG_LEVEL_INF);
 
@@ -30,12 +32,20 @@ LOG_MODULE_REGISTER(battery, LOG_LEVEL_INF);
 #define LOW_BATTERY_CLEAR_MV   3500  /* hysteresis, so it cannot chatter */
 
 /*
- * 15 s rather than 60. The poll is what detects power being connected, and a
+ * Percentage points a poll-to-poll change must exceed to be taken whole
+ * rather than smoothed — see the filter in battery_work_fn(). Sized well
+ * above the noise floor observed poll to poll and well below a plausible
+ * real event (unplugging, a fresh boot reading).
+ */
+#define PCT_SNAP_THRESHOLD      5
+
+/*
+ * 5 s rather than 60. The poll is what detects power being connected, and a
  * readout that can take a minute to appear after plugging in reads as broken.
  * The SGM41524 charge indicator below normally beats it to the punch; this is
  * the backstop for if that line is not behaving.
  */
-#define POLL_INTERVAL_S        15
+#define POLL_INTERVAL_S        5
 
 static const struct device *bq = DEVICE_DT_GET(DT_ALIAS(batt0));
 
@@ -94,7 +104,6 @@ static void clear_low_battery_indicator(void)
  * Battery level screen — right button, 3 second hold
  * -------------------------------------------------------------------------- */
 
-#define LEVEL_SHOW_MS      3000  /* right-button hold, while not charging */
 #define LEVEL_ROW             1  /* 5-row font on a 7-row grid, 1px margin */
 #define LEVEL_LOW_PCT        20  /* below this the readout goes red */
 
@@ -102,17 +111,19 @@ static void clear_low_battery_indicator(void)
 #define WAVE_COL_SHIFT       12  /* phase offset per column — sets wavelength */
 
 /*
- * Colour encodes charge level; motion encodes charging.
+ * Colour encodes power state; motion encodes actual charge current.
  *
- * Discharging is a flat colour, charging adds a hue wave travelling across the
- * text. Keeping the two on separate axes means a nearly-flat battery still
- * reads as red while you can see at a glance that it is charging — which is
- * exactly when you most want both facts at once.
+ * Discharging is a flat blue, being on power (cable attached, whether or not
+ * current is presently flowing) is green, and a hue wave travels across the
+ * text only while current is genuinely moving. Keeping those on separate
+ * axes means a topped-off cell sitting on the charger still reads green
+ * (it's on power) but stops shimmering (nothing is actually charging it
+ * anymore) instead of looking indistinguishable from unplugged.
  */
-static struct led_rgb level_base_color(uint8_t pct, bool charging)
+static struct led_rgb level_base_color(uint8_t pct, bool on_power)
 {
     if (pct < LEVEL_LOW_PCT) return (struct led_rgb){200,   0,  0}; /* red   */
-    if (charging)            return (struct led_rgb){  0, 180, 40}; /* green */
+    if (on_power)            return (struct led_rgb){  0, 180, 40}; /* green */
     return (struct led_rgb){0, 90, 220};                            /* blue  */
 }
 
@@ -124,26 +135,24 @@ static uint8_t tri(uint8_t x)
 }
 
 static void level_dismiss(void);
-static void level_clear_work_fn(struct k_work *work);
-static K_WORK_DEFINE(level_clear_work, level_clear_work_fn);
-
-static void level_timer_cb(struct k_timer *t)
-{
-    ARG_UNUSED(t);
-    k_work_submit(&level_clear_work);
-}
-
-static K_TIMER_DEFINE(level_timer, level_timer_cb, NULL);
 
 static bool    level_showing;
 
-/* True for the whole time the watch is plugged in and charging, not just a
- * brief peek: the readout stays up, refreshing each poll, until unplugged.
- * A manual right-button hold is ignored while this is set — the screen is
- * already showing the thing the hold would ask for. */
+/* True once a manually-opened battery page has been promoted to stay open
+ * for as long as the watch is on power, rather than fading out on the
+ * page's normal timeout — see the promotion logic in battery_work_fn().
+ * Never set on its own initiative: the page is only ever opened by a
+ * right-button hold, this just changes how long it stays once it is. Left
+ * via ui_dismiss() in battery_work_fn() (unplugging) or battery_screen_
+ * dismiss() (navigating away, a quick right-press, a reveal taking over) —
+ * never drawn directly, so ui.c's page state always agrees with what's
+ * actually on screen. */
 static bool    charging_mode;
 
-static bool    level_wave;      /* animate — latched at show time */
+static bool    level_wave;      /* animate — latched at show time, true only
+                                 * while current is genuinely flowing */
+static bool    level_onp;       /* on-power colour band — latched separately
+                                 * from level_wave, see level_base_color() */
 static uint8_t level_pct;       /* latched, so the wave cannot change colour
                                  * band mid-animation if a poll lands */
 static uint8_t wave_phase;
@@ -153,7 +162,7 @@ static uint8_t wave_phase;
  * takes each pixel's colour from led_color[] and we can vary it per column. */
 static void level_paint(void)
 {
-    struct led_rgb base = level_base_color(level_pct, level_wave);
+    struct led_rgb base = level_base_color(level_pct, level_onp);
 
     /* led_color[] shares build_buffers()'s lock contract with led_mask[] —
      * see led_matrix.h. This used to write it unlocked, racing the
@@ -212,16 +221,18 @@ static void wave_timer_cb(struct k_timer *t)
 
 static K_TIMER_DEFINE(wave_timer, wave_timer_cb, NULL);
 
-/* Take the readout down cleanly. Shared by the timed dismiss (right-button
- * peek) and the immediate one (unplugging out of the persistent charging
- * view) — both need the identical teardown. */
+/* Take the readout down cleanly. Called whenever ui.c's page timeout fires,
+ * a quick right-press dismisses it, something else navigates away, or
+ * unplugging ends a promoted view — all need the identical teardown.
+ * Dismiss *timing* is entirely ui.c's job now (see ui_cancel_timeout() and
+ * battery_work_fn()); this function only ever tears down, never schedules
+ * anything. */
 static void level_dismiss(void)
 {
     if (!level_showing) {
         return;
     }
     level_showing = false;
-    k_timer_stop(&level_timer);
     k_timer_stop(&wave_timer);
 
     k_mutex_lock(&led_mask_mutex, K_FOREVER);
@@ -246,24 +257,18 @@ static void level_dismiss(void)
     }
 }
 
-static void level_clear_work_fn(struct k_work *work)
-{
-    ARG_UNUSED(work);
-    level_dismiss();
-}
-
 /* Called by time_display_reveal() before it takes over the whole screen.
  * Without this, a button press or wrist-tilt during the battery percentage
  * peek — or worse, during the persistent charging view — left level_showing/
- * charging_mode/wave_timer/level_timer all still live while the reveal wiped
- * the mask out from under them: wave_timer kept firing every 60ms, repainting
- * led_color[] over whatever the reveal had just drawn, and time_display's
- * `paused` flag (only ever cleared by level_dismiss()'s time_display_resume()
- * call) stayed stuck true for the rest of the charging session, freezing the
- * clock. Safe to call unconditionally from workqueue context: every caller of
+ * charging_mode/wave_timer all still live while the reveal wiped the mask out
+ * from under them: wave_timer kept firing every 60ms, repainting led_color[]
+ * over whatever the reveal had just drawn, and time_display's `paused` flag
+ * (only ever cleared by level_dismiss()'s time_display_resume() call) stayed
+ * stuck true for the rest of the charging session, freezing the clock. Safe
+ * to call unconditionally from workqueue context: every caller of
  * time_display_reveal() (button ISR -> reveal_work, wrist-tilt trigger, both
- * via display_wake_and_reveal()) runs on the system workqueue, the same
- * thread every other battery.c state mutation runs on. */
+ * via ui_goto()) runs on the system workqueue, the same thread every other
+ * battery.c state mutation runs on. */
 void battery_screen_dismiss(void)
 {
     if (level_showing) {
@@ -293,10 +298,11 @@ void battery_notify_display_off(void)
     low_shown = false;
 }
 
-static void level_show_for(uint32_t show_ms)
+static void level_show_for(void)
 {
     uint8_t pct  = battery_percent();
     bool    chrg = battery_charging();
+    bool    onp  = chrg || battery_cable_present();
 
     /* Re-reading the gauge here would block this call on I2C for the sake of a
      * value the poll already keeps fresh. Use the cached reading. */
@@ -324,10 +330,11 @@ static void level_show_for(uint32_t show_ms)
     }
     led_stamp_percent(bitmap, LEVEL_ROW, col + digits * 4);
 
-    /* Latch both, so a poll landing mid-animation cannot switch colour band or
-     * start/stop the wave under the repaint. */
+    /* Latch all three, so a poll landing mid-animation cannot switch colour
+     * band or start/stop the wave under the repaint. */
     level_pct  = pct;
     level_wave = chrg;
+    level_onp  = onp;
 
     /* Own the display outright: stop the clock republishing underneath, and
      * clear any settled sand so the number is not read against a pile of it. */
@@ -344,45 +351,39 @@ static void level_show_for(uint32_t show_ms)
     k_mutex_unlock(&led_mask_mutex);
 
     level_showing = true;
-    display_on();          /* also resets the auto-off timeout */
+    display_on();
     led_commit();
 
     if (level_wave) {
         k_timer_start(&wave_timer, K_MSEC(WAVE_STEP_MS), K_MSEC(WAVE_STEP_MS));
-    }
-
-    /* show_ms == 0 means persistent (the charging view): no auto-dismiss,
-     * and cancel any peek timer left running from an earlier call. */
-    if (show_ms > 0) {
-        k_timer_start(&level_timer, K_MSEC(show_ms), K_NO_WAIT);
     } else {
-        k_timer_stop(&level_timer);
+        k_timer_stop(&wave_timer);
     }
 
     LOG_INF("Battery level: %u%% %umV %s",
-            pct, battery_voltage_mv(), chrg ? "charging" : "discharging");
+            pct, battery_voltage_mv(),
+            chrg ? "charging" : onp ? "on power" : "discharging");
 }
 
-/* Runs the actual check-and-show on the system workqueue — the same context
- * that owns charging_mode/level_pct/level_wave/wave_phase everywhere else
- * (battery_work_fn, wave_work_fn, level_clear_work_fn). battery_show_level()
- * used to run this check-then-act directly on the calling (main) thread,
- * which was a second, unsynchronized writer of that state: a right-button
- * hold landing in the same instant as a plug-in (battery_work_fn fires
- * immediately off the SGM41524 edge) could read charging_mode as false right
- * before battery_work_fn set it true and called level_show_for(0), then
- * proceed to call level_show_for(LEVEL_SHOW_MS) anyway — silently imposing a
- * 3 s dismiss timer on what's supposed to be a persistent charging view. */
+/* Runs the actual draw on the system workqueue — the same context that owns
+ * charging_mode/level_pct/level_wave/wave_phase everywhere else
+ * (battery_work_fn, wave_work_fn). battery_show_level() is only ever called
+ * from ui.c's battery_enter(), itself only reached via ui_goto(UI_PAGE_
+ * BATTERY) — and every one of those call sites (ui_handle_button()'s
+ * BTN_EV_R_HOLD, battery_work_fn()'s poll-driven entry) already checks that
+ * the battery page isn't already current before going there, so by the time
+ * this runs it is always a genuine fresh entry that wants a draw — including
+ * the persistent on-power view's very first one, where charging_mode is
+ * already true (battery_work_fn sets it just before calling ui_goto()). An
+ * earlier version of this function skipped drawing whenever charging_mode
+ * was already set, meant to stop a manual hold from re-timing an
+ * already-showing view — which, now that ui.c's own current-page check
+ * guards manual re-entry, only ever fired on that very first draw and
+ * silently swallowed it. */
 static void show_level_work_fn(struct k_work *work)
 {
     ARG_UNUSED(work);
-
-    /* Already up and will keep refreshing itself every poll — a hold here
-     * would just impose a 3 s dismiss timer on a view meant to persist. */
-    if (charging_mode) {
-        return;
-    }
-    level_show_for(LEVEL_SHOW_MS);
+    level_show_for();
 }
 static K_WORK_DEFINE(show_level_work, show_level_work_fn);
 
@@ -485,8 +486,38 @@ static void battery_work_fn(struct k_work *work)
     ch_err = sensor_channel_get(bq, SENSOR_CHAN_GAUGE_AVG_CURRENT, &current);
     if (ch_err) { LOG_WRN("Current channel read failed: %d", ch_err); return; }
 
-    uint8_t  pct  = (uint8_t)soc.val1;
-    uint32_t mv   = (uint32_t)(volt.val1 * 1000 + volt.val2 / 1000);
+    uint8_t  pct_raw = (uint8_t)soc.val1;
+    uint32_t mv      = (uint32_t)(volt.val1 * 1000 + volt.val2 / 1000);
+
+    /*
+     * Smooth the readout the same way light.c smooths lux -> brightness.
+     * SENSOR_CHAN_GAUGE_STATE_OF_CHARGE is already TI's own filtered
+     * estimate (StateOfCharge(), not the unfiltered command — see the
+     * driver, bq274xx.c), but it still steps a few points either way poll
+     * to poll: Impedance Track recomputes against instantaneous voltage,
+     * and does so against a 400 mAh design-capacity that is still a guess
+     * the gauge hasn't learned through a full charge/discharge cycle (see
+     * the devicetree comment on bq27441). Nothing here needs a fast
+     * response — battery level changes over minutes, not seconds, unlike
+     * brightness — so smooth everything except a jump large enough to be a
+     * real event (unplugging, the first reading after boot) and take that
+     * whole.
+     */
+    static uint8_t pct_filt;
+    static bool    pct_filt_seeded;
+    int pct_delta = (int)pct_raw - (int)pct_filt;
+
+    if (!pct_filt_seeded) {
+        pct_filt_seeded = true;
+        pct_filt = pct_raw;
+    } else if (pct_delta > PCT_SNAP_THRESHOLD || pct_delta < -PCT_SNAP_THRESHOLD) {
+        pct_filt = pct_raw;
+    } else {
+        pct_filt = (uint8_t)((pct_filt * 3 + pct_raw) / 4);
+    }
+
+    uint8_t pct = pct_filt;
+
     /* val1 is AMPS, val2 is MICROAMPS — see log_gauge_detail() above, which
      * documents why that is easy to misread. This comment previously claimed
      * val1 was milliamps, which would make the val1 > 0 test require a whole
@@ -502,40 +533,71 @@ static void battery_work_fn(struct k_work *work)
     atomic_store(&g_volt_mv,  (int)mv);
     atomic_store(&g_charging, chrg ? 1 : 0);
 
-    LOG_INF("Battery: %u%% %umV %s",
-            pct, mv, chrg ? "charging" : "discharging");
+    LOG_INF("Battery: %u%% (raw %u%%) %umV %s",
+            pct, pct_raw, mv, chrg ? "charging" : "discharging");
 
     log_gauge_detail(current);
 
-    /* While charging, own the display for the whole session rather than a
-     * timed peek: show the readout on plug-in, refresh it each poll so the
-     * percentage climbs live, and take it down the moment power is removed.
+    /*
+     * "On power" is current flowing OR a cable physically attached, not
+     * current alone. Avg current tapers to ~0 once the cell tops off, which
+     * on its own reads identically to "unplugged" — that used to dismiss the
+     * persistent view (and hand the display back to whatever ui.c considered
+     * idle) while the watch was still sitting on the charger. VBUS doesn't
+     * care about taper, so ORing it in keeps this correct through a full
+     * charge cycle. See battery_cable_present().
+     */
+    bool on_power = chrg || battery_cable_present();
+
+    /*
+     * The battery page is never shown on plug-in by itself — only a manual
+     * right-button hold opens it (see battery_show_level()). This used to
+     * take the display over automatically once idle, which is exactly the
+     * "can't tell if it's plugged in without checking, and can't get the
+     * charging popup to leave you alone" complaint that changed it: the
+     * watch should just sit there normally, on power or not, until asked.
      *
-     * first_poll suppresses drawing anything at boot: battery_init() runs
-     * before main() blanks the display and drops to idle, so a readout drawn
-     * here would be wiped a moment later and look like a glitch. If the watch
-     * boots already on charge, charging_mode still latches true here so the
-     * very next poll (up to POLL_INTERVAL_S later) picks it up normally. */
-    static bool prev_charging;
+     * What plugging in still does is *promote* an already-open peek: if the
+     * page happens to be up (because someone held the button) and the watch
+     * turns out to be on power, this poll cancels its timeout so it stays
+     * open instead of fading out mid-charge, and keeps refreshing it every
+     * poll so the percentage climbs live. ui_cancel_timeout() rather than
+     * ui_goto() again — the page is already showing the right thing, no
+     * need to blank and redraw it.
+     *
+     * Dismissal is a quick press of the same button (ui.c's BTN_EV_R_SINGLE)
+     * or unplugging — see the prev_power branch below.
+     *
+     * first_poll suppresses acting at boot: battery_init() runs before
+     * main() blanks the display and drops to idle, so anything drawn here
+     * would be wiped a moment later and look like a glitch. */
+    static bool prev_power;
     static bool first_poll = true;
 
     if (first_poll) {
-        first_poll    = false;
-        prev_charging = chrg;
-        charging_mode = chrg;
-    } else if (chrg) {
-        if (!prev_charging) {
+        first_poll = false;
+        prev_power = on_power;
+    } else if (on_power) {
+        if (!prev_power) {
             LOG_INF("Power connected");
         }
-        prev_charging = true;
-        charging_mode = true;
-        level_show_for(0);
-    } else if (prev_charging) {
-        prev_charging = false;
+        prev_power = true;
+
+        if (charging_mode) {
+            /* Already promoted — refresh in place. */
+            level_show_for();
+        } else if (ui_current() == UI_PAGE_BATTERY) {
+            /* Open as a plain peek and now on power: promote it. */
+            charging_mode = true;
+            ui_cancel_timeout();
+            level_show_for();
+        }
+    } else if (prev_power) {
+        prev_power = false;
         LOG_INF("Power disconnected");
         if (charging_mode) {
             charging_mode = false;
-            level_dismiss();
+            ui_dismiss();
         }
     }
 
@@ -557,9 +619,9 @@ static void battery_work_fn(struct k_work *work)
     }
 
     /* If the level screen is up it owns the notification layer, so the state
-     * change is only recorded in low_shown. level_clear_work_fn() applies it
-     * when the screen comes down — a poll landing in that 3 s window must not
-     * paint over the readout. */
+     * change is only recorded in low_shown. level_dismiss() applies it when
+     * the screen comes down — a poll landing while it's up must not paint
+     * over the readout. */
 }
 
 static void battery_timer_cb(struct k_timer *timer)
@@ -613,6 +675,93 @@ static void chg_indicator_init(void)
 }
 #endif
 
+/* --------------------------------------------------------------------------
+ * VBUS detection — nRF52833 POWER peripheral
+ *
+ * A second, independent "cable attached" signal alongside the SGM41524
+ * indicator above. Where that one is board wiring whose interrupt "has in
+ * fact never been observed firing" (see chg_indicator_init()), this is the
+ * SoC sensing its own D+/D- lines — no GPIO, no external part, nothing that
+ * can be missing pull-ups or miswired. It answers a narrower question than
+ * either the SGM41524 pin or the fuel gauge's current reading: not
+ * "charging", just "a cable is physically there" — which is exactly what
+ * avg current can't tell you once it tapers to ~0 near a full charge (see
+ * the on_power comment in battery_work_fn()).
+ *
+ * nRF52833's USBDETECTED/USBREMOVED events ride the POWER peripheral, on
+ * the same physical interrupt line the CLOCK peripheral uses (there is no
+ * separate USBREGULATOR_IRQn on this SoC, unlike nRF5340). Zephyr's own
+ * clock driver already connects that line unconditionally at boot
+ * (clock_control_nrf.c, POWER_CLOCK IRQ), so registering a usbevt handler
+ * here needs no IRQ wiring of our own — just nrfx_power_init() once and
+ * nrfx_power_usbevt_init()/_enable() to hook in.
+ * -------------------------------------------------------------------------- */
+
+static atomic_int g_vbus_present = ATOMIC_INIT(0);
+
+/* ISR context (shared POWER_CLOCK vector): no I2C here, same rule as
+ * chg_isr() above — just latch the new state and kick a poll. */
+static void vbus_evt_handler(nrfx_power_usb_evt_t event)
+{
+    switch (event) {
+    case NRFX_POWER_USB_EVT_DETECTED:
+        atomic_store(&g_vbus_present, 1);
+        k_work_submit(&battery_work);
+        break;
+    case NRFX_POWER_USB_EVT_REMOVED:
+        atomic_store(&g_vbus_present, 0);
+        k_work_submit(&battery_work);
+        break;
+    case NRFX_POWER_USB_EVT_READY:
+        /* Regulator ready to supply current — not new information here;
+         * DETECTED already said a cable is present. */
+        break;
+    }
+}
+
+static void vbus_init(void)
+{
+    /*
+     * Skip entirely on the USB-console build variant (bringup_usb.conf).
+     * Zephyr's own nRF USB device driver (usb_dc_nrfx.c) registers itself as
+     * nrfx_power's one and only usbevt handler at boot — nrfx_power supports
+     * exactly one, so a second registration here would just race it, and
+     * whichever loses stops seeing events. The normal/production image never
+     * sets CONFIG_USB_DEVICE_STACK, so this runs unopposed there.
+     */
+    if (IS_ENABLED(CONFIG_USB_DEVICE_STACK)) {
+        LOG_INF("VBUS detect skipped — USB device stack owns it on this build");
+        return;
+    }
+
+    /* dcdcen left false (zero-initialised): this board has no inductors on
+     * the DCC pins and runs off an external 3.3V LDO — see CLAUDE.md, "the
+     * internal DC/DC is off deliberately". nrfx_power_init() also brings up
+     * POF and sleep-event handling, none of which this app uses; the config
+     * struct covers only what nrfx_power itself needs to start. */
+    static const nrfx_power_config_t power_config = {0};
+
+    /* NRFX_ERROR_ALREADY_INITIALIZED would mean something else already
+     * called this — nothing else does on this build, but the check is free
+     * and matches how Zephyr's own USB driver treats the same call. */
+    (void)nrfx_power_init(&power_config);
+
+    static const nrfx_power_usbevt_config_t usbevt_config = {
+        .handler = vbus_evt_handler,
+    };
+
+    nrfx_power_usbevt_init(&usbevt_config);
+    nrfx_power_usbevt_enable();
+
+    /* Seed from the live register rather than waiting for the first edge —
+     * if the watch boots already plugged in, there is no edge coming. */
+    atomic_store(&g_vbus_present,
+                 nrf_power_usbregstatus_vbusdet_get(NRF_POWER) ? 1 : 0);
+
+    LOG_INF("VBUS detect armed (cable %s)",
+            atomic_load(&g_vbus_present) ? "present" : "absent");
+}
+
 void battery_init(void)
 {
     if (!device_is_ready(bq)) {
@@ -630,10 +779,13 @@ void battery_init(void)
     chg_indicator_init();
 #endif
 
+    vbus_init();
+
     LOG_INF("Battery monitor started (poll every %ds)", POLL_INTERVAL_S);
 }
 
 uint8_t  battery_percent(void)    { return (uint8_t)atomic_load(&g_percent); }
 uint32_t battery_voltage_mv(void) { return (uint32_t)atomic_load(&g_volt_mv); }
 bool     battery_charging(void)   { return atomic_load(&g_charging) != 0; }
+bool     battery_cable_present(void) { return atomic_load(&g_vbus_present) != 0; }
 bool     battery_is_low(void)     { return battery_voltage_mv() < LOW_BATTERY_MV; }

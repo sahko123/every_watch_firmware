@@ -121,18 +121,15 @@ No device present = success.
   `USBREGSTATUS.VBUSDETECT` plus the `USBDETECTED`/`USBREMOVED` events — so no
   GPIO is involved and nothing needs adding to the devicetree to read it.
 
-  Nothing currently uses it, and two decisions were made on the assumption it
-  was absent and are worth revisiting:
+  As of `battery.c`'s `vbus_init()` this is now used, as `battery_cable_present()`
+  — see "Recent changes" below. One decision made on the assumption it was
+  absent is still worth revisiting:
 
   - The USB CDC console has to be a **separate build variant**
     (`bringup_usb.conf`) because an always-on USB stack costs idle current. With
     VBUS detectable, USB can be brought up only while a cable is present, which
     would put the `settime` shell command in the normal image instead of a
     variant that has to be flashed specially.
-  - Charging detection leans on the SGM41524 indicator on P0.05, whose
-    interrupt path is still unverified. VBUS is a more direct signal for
-    "a cable is attached" — it does not say the cell is charging, which remains
-    the fuel gauge's job.
 - **The internal DC/DC is off deliberately — do not enable it.** VDD comes from
   an external 3.3 V regulator, so the SoC runs in normal LDO mode. Enabling
   `CONFIG_BOARD_ENABLE_DCDC` requires inductors on the `DCC` pins that this
@@ -153,12 +150,34 @@ No device present = success.
 
 ## Recent changes (uncommitted as of this writing — see below)
 
-- **Battery percentage screen**, right button 3 s hold (`battery.c`,
-  `battery_show_level()`). Colour: blue discharging, green (with a travelling
-  hue shimmer) while charging, red under 20% regardless.
-- **Persistent charging view**: plugging in enters a mode that stays up and
-  refreshes every poll for the whole charging session (not a timed peek),
-  drops instantly on unplug. A manual hold is a no-op while this is active.
+- **Battery percentage screen**, right button hold, opened manually only —
+  plugging in does *not* show it by itself (`battery.c`,
+  `battery_show_level()`). Colour: blue discharging, green while on power
+  (cable attached, whether or not current is actually flowing — see VBUS
+  below), with a travelling hue shimmer only while current is genuinely
+  flowing; red under 20% regardless. SoC reading is smoothed (`pct_filt` in
+  `battery_work_fn()`) since the fuel gauge's own filtered value still steps
+  a few points poll to poll.
+- **Promotion, not auto-popup**: if the screen happens to be open (from a
+  hold) and the watch turns out to be on power, `battery_work_fn()` cancels
+  its normal auto-return timeout (`ui_cancel_timeout()`) so it stays open
+  and keeps refreshing instead of fading out mid-charge. A quick right-press
+  (`BTN_EV_R_SINGLE` in `ui.c`) or unplugging dismisses it either way. This
+  replaced an earlier design where plugging in opened the screen
+  automatically and hijacked whatever page was in use — removed because it
+  meant you couldn't use the watch normally while charging.
+- **VBUS detection** (`battery.c`, `vbus_init()`): the nRF52833's POWER
+  peripheral senses USB power directly (`nrfx_power` USBDETECTED/REMOVED
+  events), no GPIO involved. Used as `battery_cable_present()`, OR'd with
+  the fuel gauge's current reading to decide "on power" — current alone
+  tapers to ~0 near a full charge, which used to read identically to
+  "unplugged". Skipped at runtime on the USB-console build variant
+  (`CONFIG_USB_DEVICE_STACK`), which needs the same peripheral for its own
+  USB stack.
+- **RSSI monitor** (`ble.c`, `CONFIG_EW_BLE_SCAN_DEBUG`): prints a live
+  table of every BLE device heard — address, name, RSSI, packet count, age —
+  refreshed every 3 s, not just logged once per device like it used to be.
+  Its own build variant, `rssi_monitor.conf` — see README.md.
 - **Time-display holdover fix**: previously, waking the display for any
   reason (a bare right-press, the battery screen dismissing) could show time
   instantly with no reveal, because the digit layer was kept live in the

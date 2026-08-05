@@ -53,6 +53,22 @@ void ui_goto(enum ui_page page);
 void ui_dismiss(void);
 
 /*
+ * Stop the current page's auto-return timer, if one is running. Unlike
+ * calling ui_goto() again (which blanks, re-enters and restarts the page),
+ * this leaves the page exactly as it is — just retroactively cancels its
+ * timeout, for information learned after the page was already entered.
+ *
+ * Used by the battery page: a manual peek gets the normal timeout_ms like
+ * any other page, but if the watch turns out to be on power while it's up,
+ * battery.c promotes it to the persistent on-power view by cancelling that
+ * timeout here rather than re-entering the page (see battery_work_fn()).
+ *
+ * Must be called from the workqueue that owns ui_goto(), same as ui_goto()
+ * itself.
+ */
+void ui_cancel_timeout(void);
+
+/*
  * Feed a recognised button gesture into the UI. Global bindings (DFU) are
  * handled first, then the active page gets a look.
  */
