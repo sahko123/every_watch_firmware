@@ -77,14 +77,40 @@ west build -b every_watch/nrf52833 every_watch_firmware -p always -d build_usb \
 ```
 
 **RSSI monitor** — console-only build (RTT, so a J-Link on SWD, no USB) that
-prints a table of every BLE device currently heard — address, name, latest
-and best RSSI, packet count, seconds since last packet — refreshed every 3 s.
-Doubles as an antenna health check and a plain signal-strength monitor; see
-`CONFIG_EW_BLE_SCAN_DEBUG`'s help in `Kconfig`:
+prints a table of every BLE device currently *visible* — address, name,
+latest and best RSSI, packet count — refreshed every 3 s. Anything not heard
+again since the last print drops out of the table on its own rather than
+sitting there with a growing age. Doubles as an antenna health check and a
+plain signal-strength monitor; see `CONFIG_EW_BLE_SCAN_DEBUG`'s help in
+`Kconfig`:
 
 ```bash
 west build -b every_watch/nrf52833 every_watch_firmware -p always -d build_rssi \
     -- -DEXTRA_CONF_FILE=rssi_monitor.conf
+```
+
+**Channel survey** — same console setup, but prints raw RF energy (dBm)
+measured directly off the radio for all 40 BLE channels, roughly twice a
+second, instead of advertisements from other devices. No reference
+transmitter or known distance needed — a working antenna shows clear energy
+humps at the three Wi-Fi channels (1/6/11), a disconnected or badly-matched
+one shows flat thermal noise across the whole sweep. See
+`CONFIG_EW_BLE_CHANNEL_SURVEY`'s help in `Kconfig` and `survey_report()` in
+`src/ble/ble.c`:
+
+```bash
+west build -b every_watch/nrf52833 every_watch_firmware -p always -d build_survey \
+    -- -DEXTRA_CONF_FILE=channel_survey.conf
+```
+
+For this one, `tools/channel_survey_plot.py` turns the raw text into a live
+bar graph instead of reading numbers off the RTT log by eye — handy for
+watching an antenna change in real time while tuning it:
+
+```bash
+python -m pip install matplotlib   # once
+sh /c/ewdev/rtt.sh                 # in one terminal, leave running
+python tools/channel_survey_plot.py  # in another
 ```
 
 Approximate sizes (slot is 450,048 B):
@@ -95,6 +121,7 @@ Approximate sizes (slot is 450,048 B):
 | Bring-up, RTT | 353 KB (78%) | 52 KB (40%) |
 | Bring-up, USB CDC | 373 KB (83%) | 59 KB (45%) |
 | RSSI monitor | 278 KB (63%) | 49 KB (38%) |
+| Channel survey | 279 KB (63%) | 48 KB (38%) |
 
 > This app builds through the legacy child-image path
 > (`child_image/mcuboot.conf`), not sysbuild. The stale `sysbuild/` config

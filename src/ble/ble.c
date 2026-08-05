@@ -360,22 +360,24 @@ static bool parse_name(struct bt_data *data, void *user_data)
 
 /*
  * Live per-advertiser table: address, name, latest/best RSSI, packet count,
- * last-seen time — refreshed on every scan report, dumped as a whole on a
- * timer. A running total and a single best RSSI (still printed, see
- * rssi_print_fn()) say how much is out there but not what, and "what" is the
- * part that tells you whether the radio is hearing a phone on the desk or a
- * neighbour's television through a wall.
+ * last-seen time — refreshed on every scan report. A running total and a
+ * single best RSSI (still printed, see rssi_print_fn()) say how much is out
+ * there but not what, and "what" is the part that tells you whether the
+ * radio is hearing a phone on the desk or a neighbour's television through
+ * a wall.
  *
- * Previously this logged one line the first time each address was seen and
- * never touched it again — a snapshot of the first minute after reset, not
- * something you could watch while walking around with the board to see
- * signal strength change. This keeps the entry live instead: same address,
- * same slot, RSSI and last-seen updated every packet.
+ * Printed table is a snapshot of what's currently visible, not a running
+ * history: rssi_print_fn() prunes any entry not heard since the last pass
+ * before it prints, so something that's gone quiet drops out of the table
+ * on its own rather than sitting there with a growing age. That makes this
+ * a live antenna/signal-strength readout — walk the board around and watch
+ * entries appear and disappear — rather than a census of everything ever
+ * heard since reset, which was the previous, one-shot-log design.
  *
- * Table is capped and reused, not grown: once full, a newly-seen address
- * evicts whichever slot has gone longest without a packet, so a long-running
- * monitor tracks what is actually still around rather than filling up once
- * on a busy room and refusing every arrival after.
+ * Table is capped and reused, not grown. Pruning is what keeps it from
+ * filling up during ordinary use; the LRU eviction below (steal whichever
+ * slot has gone longest without a packet) is only a fallback for the rare
+ * case of 16+ devices all genuinely visible inside the same print window.
  */
 #define SCAN_SEEN_MAX      16
 #define SCAN_PRINT_PERIOD_MS 3000
@@ -425,6 +427,22 @@ static void scan_track(const struct bt_le_scan_recv_info *info,
             }
             seen[i].pkts++;
             seen[i].last_seen_ms = now;
+
+            /* Names often ride the scan response, not the primary
+             * advertisement — bt_le_scan_cb's .recv fires once per HCI
+             * report, so those arrive as separate calls to this
+             * function. If the first packet seen from this address
+             * didn't carry a name, keep checking each later one until
+             * it does, instead of settling for "no name" permanently
+             * just because of which packet happened to arrive first. */
+            if (!seen[i].name[0]) {
+                struct net_buf_simple_state state;
+
+                net_buf_simple_save(buf, &state);
+                bt_data_parse(buf, parse_name, seen[i].name);
+                net_buf_simple_restore(buf, &state);
+            }
+
             k_mutex_unlock(&rssi_mutex);
             return;
         }
@@ -464,42 +482,72 @@ static void scan_track(const struct bt_le_scan_recv_info *info,
     k_mutex_unlock(&rssi_mutex);
 }
 
-/* Dumps the whole table every SCAN_PRINT_PERIOD_MS. Runs on the system
- * workqueue (via rssi_print_timer below), not the BT RX thread that
- * scan_track() runs on — a multi-line RTT dump has no business stalling
- * connection-event handling, same reasoning as ble_paint_notification()'s
- * deferral. Holds rssi_mutex for the whole dump, not just the copy, so the
- * table can't be evicted-from mid-print — see the mutex's comment above for
- * why an unsynchronized read isn't safe here. That does mean a plug-in-heavy
- * moment on the BT RX thread can wait out one print pass; RTT writes are
- * fast enough that this is not worth avoiding for a bring-up tool. */
+/* Dumps the table every SCAN_PRINT_PERIOD_MS, currently-visible devices
+ * only. Runs on the system workqueue (via rssi_print_timer below), not the
+ * BT RX thread that scan_track() runs on — a multi-line RTT dump has no
+ * business stalling connection-event handling, same reasoning as
+ * ble_paint_notification()'s deferral. Holds rssi_mutex for the whole pass,
+ * not just a copy, so the table can't be written to mid-prune/print — see
+ * the mutex's comment above for why an unsynchronized read isn't safe here.
+ * That does mean a plug-in-heavy moment on the BT RX thread can wait out one
+ * pass; RTT writes are fast enough that this is not worth avoiding for a
+ * bring-up tool. */
 static void rssi_print_fn(struct k_work *w)
 {
     ARG_UNUSED(w);
 
     k_mutex_lock(&rssi_mutex, K_FOREVER);
 
-    if (seen_count == 0) {
-        k_mutex_unlock(&rssi_mutex);
-        LOG_INF("RSSI monitor: nothing heard yet");
-        return;
-    }
-
     int64_t now = k_uptime_get();
 
-    LOG_INF("---- RSSI monitor: %u device%s heard, %u packets total, best %d dBm ----",
-            seen_count, seen_count == 1 ? "" : "s", total_pkts, best_overall);
+    /*
+     * Prune first, print what's left — not a running history, a snapshot
+     * of what's actually around right now. A device not heard again since
+     * before this pass (age > 0s) is dropped from the table outright, not
+     * just skipped: it should stop existing here the moment it goes quiet,
+     * the same way it'd drop off a phone's nearby-devices list, rather than
+     * sit around with a growing age until something else evicts it or it
+     * scrolls past on an otherwise-live table.
+     *
+     * Erase-remove in place: walk the array once, keep only entries seen
+     * within the last second, compacting survivors down to a dense
+     * [0, kept) prefix. A device that goes quiet and comes back later is
+     * re-added fresh via scan_track()'s new-device path rather than found
+     * — pkts/best restart from that reappearance, which fits "currently
+     * visible" better than a total spanning gaps it wasn't around for.
+     */
+    uint8_t kept = 0;
 
     for (uint8_t i = 0; i < seen_count; i++) {
         uint32_t age_s = (uint32_t)((now - seen[i].last_seen_ms) / 1000);
-        char     addr_str[BT_ADDR_LE_STR_LEN];
+
+        if (age_s == 0) {
+            if (kept != i) {
+                seen[kept] = seen[i];
+            }
+            kept++;
+        }
+    }
+    seen_count = kept;
+
+    if (seen_count == 0) {
+        k_mutex_unlock(&rssi_mutex);
+        LOG_INF("RSSI monitor: nothing currently visible");
+        return;
+    }
+
+    LOG_INF("---- RSSI monitor: %u device%s visible, %u packets total, best %d dBm ----",
+            seen_count, seen_count == 1 ? "" : "s", total_pkts, best_overall);
+
+    for (uint8_t i = 0; i < seen_count; i++) {
+        char addr_str[BT_ADDR_LE_STR_LEN];
 
         bt_addr_le_to_str(&seen[i].addr, addr_str, sizeof(addr_str));
 
-        LOG_INF("  %4d dBm (best %4d)  %s  %-19s  %5u pkts  %3u s ago",
+        LOG_INF("  %4d dBm (best %4d)  %s  %-19s  %5u pkts",
                 seen[i].rssi, seen[i].best, addr_str,
                 seen[i].name[0] ? seen[i].name : "(no name in advert)",
-                seen[i].pkts, age_s);
+                seen[i].pkts);
     }
 
     k_mutex_unlock(&rssi_mutex);
@@ -869,16 +917,16 @@ static bool survey_vs_evt(struct net_buf_simple *buf)
     return true;
 }
 
-static void survey_start(void)
+/* sdc_hci_cmd_vs_qos_channel_survey_enable: uint8 enable, uint32 interval_us.
+ * 500 ms keeps the log readable; the controller schedules these at low
+ * priority and may deliver fewer. */
+static int survey_enable(void)
 {
-    /* sdc_hci_cmd_vs_qos_channel_survey_enable: uint8 enable, uint32 interval_us.
-     * 500 ms keeps the log readable; the controller schedules these at low
-     * priority and may deliver fewer. */
     struct net_buf *cmd = bt_hci_cmd_create(0xfd0e, 5);
 
     if (!cmd) {
         LOG_ERR("survey: no command buffer");
-        return;
+        return -ENOMEM;
     }
 
     net_buf_add_u8(cmd, 1);              /* enable */
@@ -888,6 +936,24 @@ static void survey_start(void)
 
     if (rc) {
         LOG_ERR("survey: enable failed: %d", rc);
+    }
+    return rc;
+}
+
+/*
+ * A one-second re-arm keepalive was tried here and measured to do nothing:
+ * every re-send failed with HCI status 0x0C (Command Disallowed, Zephyr's
+ * -EACCES) — including the ones sent *during* a stretch where the survey
+ * was actively producing reports just fine. So the survey's own on/off
+ * pattern is entirely independent of whether we keep asking it to
+ * re-enable; the real fix is not competing with it for radio time in the
+ * first place — see the CONFIG_EW_BLE_CHANNEL_SURVEY skip in bt_ready()
+ * below, which stops this build from also running continuous advertising
+ * and active scanning alongside the survey.
+ */
+static void survey_start(void)
+{
+    if (survey_enable()) {
         return;
     }
 
@@ -1010,9 +1076,27 @@ static void bt_ready(int err)
         .window   = 0x0050,   /* 50 ms  */
 #endif
     };
-    int rc = bt_le_scan_start(&scan_param, NULL);
-    if (rc) {
-        LOG_ERR("scan_start failed: %d", rc);
+
+    /*
+     * A channel-survey-only build (CONFIG_EW_BLE_CHANNEL_SURVEY without
+     * CONFIG_EW_BLE_SCAN_DEBUG — the two are never both on in practice, but
+     * checked explicitly so scanning stays on if they ever were) skips
+     * advertising and scanning entirely. Neither is needed for the survey
+     * itself — a direct RF energy read, nothing to do with the
+     * scan/advertise state machine — and measurement showed them competing
+     * with it for radio time: with both running continuously, the SDC's
+     * explicitly low-priority QoS survey only got bursts of a few seconds
+     * every minute or so instead of running continuously. See this
+     * config's help in Kconfig.
+     */
+    bool survey_only = IS_ENABLED(CONFIG_EW_BLE_CHANNEL_SURVEY) &&
+                        !IS_ENABLED(CONFIG_EW_BLE_SCAN_DEBUG);
+
+    if (!survey_only) {
+        int rc = bt_le_scan_start(&scan_param, NULL);
+        if (rc) {
+            LOG_ERR("scan_start failed: %d", rc);
+        }
     }
 
 #if IS_ENABLED(CONFIG_EW_BLE_SCAN_DEBUG)
@@ -1020,11 +1104,16 @@ static void bt_ready(int err)
                   K_MSEC(SCAN_PRINT_PERIOD_MS), K_MSEC(SCAN_PRINT_PERIOD_MS));
 #endif
 
-    start_adv();
-
-    /* After the roles exist, so the controller has something to apply it to. */
-    set_tx_power(0 /* ADV */,       0, CONFIG_EW_BLE_TX_POWER_DBM);
-    set_tx_power(1 /* SCAN_INIT */, 0, CONFIG_EW_BLE_TX_POWER_DBM);
+    if (!survey_only) {
+        start_adv();
+        /* After the roles exist, so the controller has something to apply
+         * it to. */
+        set_tx_power(0 /* ADV */,       0, CONFIG_EW_BLE_TX_POWER_DBM);
+        set_tx_power(1 /* SCAN_INIT */, 0, CONFIG_EW_BLE_TX_POWER_DBM);
+    } else {
+        LOG_INF("Advertising and scanning skipped — channel-survey-only"
+                " build, giving it all the radio time instead");
+    }
 
 #if IS_ENABLED(CONFIG_EW_BLE_CHANNEL_SURVEY)
     survey_start();

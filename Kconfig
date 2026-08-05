@@ -142,7 +142,17 @@ config EW_BLE_CHANNEL_SURVEY
 	  end is coupled to something; a flat line means it is not.
 
 	  A value of 127 means no measurement for that channel. Survey work is
-	  scheduled at low priority, so gaps are expected.
+	  scheduled at low priority, so gaps within a reading are expected.
+	  Advertising and active scanning were found competing with it for radio
+	  time badly enough to reduce it to a few seconds of reports every minute
+	  or so — bt_ready() in ble.c now skips both entirely on a build that has
+	  this on without CONFIG_EW_BLE_SCAN_DEBUG, since neither is needed for
+	  the survey itself (a direct RF energy read, nothing to do with the
+	  scan/advertise state machine). A periodic re-send of the enable command
+	  was tried first and measured to do nothing — every re-send failed with
+	  HCI status 0x0C (Command Disallowed), including ones sent while the
+	  survey was already producing reports fine, proving its on/off pattern
+	  doesn't depend on that at all.
 
 	  Bring-up only — it costs radio time and log bandwidth.
 
@@ -150,11 +160,13 @@ config EW_BLE_SCAN_DEBUG
 	bool "Periodic BLE RSSI table (antenna health / signal-strength monitor)"
 	default n
 	help
-	  Every 3 s, prints a table of every BLE advertiser currently heard:
-	  address, name (if it carries one), latest and best RSSI, packet count,
-	  and how many seconds since its last packet. Up to 16 devices, oldest
-	  replaced first once full, so a long-running watch tracks what is
-	  actually still around rather than filling up once and stopping.
+	  Every 3 s, prints a table of every BLE advertiser currently visible:
+	  address, name (if it carries one), latest and best RSSI, packet count.
+	  Anything not heard again since the last print drops out of the table
+	  on its own — this is a live snapshot of what's around right now, not
+	  a running history, so a device that's moved out of range or gone
+	  quiet disappears rather than sitting there with a growing age. Up to
+	  16 devices at once.
 
 	  Diagnostic for the case where bt_le_adv_start() reports success and yet
 	  nothing can see the watch. Receive and transmit share the antenna and
