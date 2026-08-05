@@ -100,8 +100,8 @@ static uint8_t lux_to_brightness(uint32_t lux)
         uint8_t  brightness;
     } pts[] = {
         {5,        24},   /* pitch dark, or face-down on a table / in a pocket */
-        {10,       60},   /* dim room at night                                 */
-        {50,       75},   /* normal indoor evening lighting                    */
+        {10,       40},   /* dim room at night                                 */
+        {50,       60},   /* normal indoor evening lighting                    */
         {200,      95},   /* well-lit room, office                             */
         {1000,    170},   /* bright indoors, or overcast outdoors              */
         {10000,   255},   /* direct sunlight — everything it has               */
