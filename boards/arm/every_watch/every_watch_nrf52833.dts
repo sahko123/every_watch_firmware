@@ -16,6 +16,16 @@
 		 * power-on (or through the in-app 3 s hold reboot) and the
 		 * bootloader stays in DFU until flashed:
 		 *   dfu-util -d 2fe3:0100 -a 0 -D build/zephyr/app_update.bin */
+
+		/* Shell transport only, deliberately not zephyr,console: this
+		 * points the `settime` shell command (src/time_sync/time_sync.c)
+		 * at the USB CDC-ACM port that already exists on this board for
+		 * MCUboot's DFU class, without also making USB the system log
+		 * console the way bringup_usb.overlay's zephyr,console does.
+		 * Inert unless CONFIG_SHELL_BACKEND_SERIAL + CONFIG_USB_CDC_ACM
+		 * are both on — the referenced node exists in every build
+		 * regardless, so this line costs nothing when they're off. */
+		zephyr,shell-uart = &cdc_acm_uart0;
 	};
 
 	/* ── Buttons ─────────────────────────────────────────────────────── */

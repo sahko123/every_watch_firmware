@@ -1,6 +1,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/rtc.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/usb/usb_device.h>
 
 #include "led_matrix/led_matrix.h"
 #include "sand/sand.h"
@@ -22,6 +23,48 @@
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 static const struct device *rtc = DEVICE_DT_GET(DT_ALIAS(rtc0));
+
+/*
+ * usb_enable() has to run before the shell backend's own init, or the
+ * shell never comes up at all: shell_uart.c registers enable_shell_uart()
+ * as SYS_INIT(..., POST_KERNEL, CONFIG_SHELL_BACKEND_SERIAL_INIT_PRIORITY)
+ * (that priority defaults to APPLICATION_INIT_PRIORITY), and it calls
+ * device_is_ready() on the CDC-ACM UART once, at that point, with no retry
+ * — if the USB stack hasn't been enabled yet the device isn't ready, the
+ * hook returns -ENODEV, and shell_init() is simply never called for the
+ * rest of the boot. main() runs after every POST_KERNEL and APPLICATION
+ * SYS_INIT has already completed, so calling usb_enable() from there (as
+ * this used to) is always too late — confirmed on hardware: USB enumerated
+ * fine but the shell never echoed or responded to anything.
+ *
+ * A SYS_INIT hook of its own fixes it, but the priority within POST_KERNEL
+ * still matters: usb_dc_nrfx.c's own driver init
+ * (SYS_INIT(usb_init, POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEVICE),
+ * default 50) has to run first or usb_enable() operates on an
+ * uninitialised driver. 90 is after that but still POST_KERNEL, which as
+ * a whole always finishes before APPLICATION starts — so this beats the
+ * shell backend's init regardless of where
+ * CONFIG_SHELL_BACKEND_SERIAL_INIT_PRIORITY is set within that later stage.
+ */
+static int usb_enable_early(void)
+{
+	if (!IS_ENABLED(CONFIG_USB_DEVICE_STACK)) {
+		return 0;
+	}
+
+	int rc = usb_enable(NULL);
+
+	if (rc && rc != -EALREADY) {
+		LOG_ERR("USB enable failed: %d — settime over USB will"
+			" not be reachable", rc);
+	} else {
+		LOG_INF("USB enabled (settime available once a host"
+			" enumerates the CDC port)");
+	}
+
+	return 0;
+}
+SYS_INIT(usb_enable_early, POST_KERNEL, 90);
 
 /*
  * Button gestures all go to the UI, which owns the display and decides what
