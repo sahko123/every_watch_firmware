@@ -7,6 +7,7 @@
 #include <zephyr/sys/util.h>
 #include <hal/nrf_ficr.h>
 #include <string.h>
+#include <errno.h>
 
 LOG_MODULE_REGISTER(identity, LOG_LEVEL_INF);
 
@@ -162,9 +163,23 @@ void identity_init(void)
         dev_dist = saved_dist;
     }
 
-    if (nvs_read(&nvs, NVS_KEY_ENC_COUNT, &enc_count, sizeof(enc_count)) < 0) {
-        LOG_WRN("enc_count read failed — starting from 0");
+    /*
+     * -ENOENT here is not a failure: it is what NVS returns for a key that has
+     * never been written, which is the normal state of a watch that has not yet
+     * had a BLE encounter (or has just been mass-erased over SWD). This warned
+     * unconditionally and so cried wolf on every boot of a fresh device, while
+     * the dev_dist read three lines up treats the identical situation as
+     * unremarkable — the inconsistency was the bug, not the read.
+     *
+     * A genuine read error is still worth hearing about, so only that case
+     * warns now.
+     */
+    rc = nvs_read(&nvs, NVS_KEY_ENC_COUNT, &enc_count, sizeof(enc_count));
+    if (rc < 0) {
         enc_count = 0;
+        if (rc != -ENOENT) {
+            LOG_WRN("enc_count read failed (%d) — starting from 0", rc);
+        }
     }
 
     ssize_t n = nvs_read(&nvs, NVS_KEY_ENC_HASHES,

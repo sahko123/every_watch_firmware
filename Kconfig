@@ -5,18 +5,6 @@
 
 menu "Every Watch"
 
-config EW_STAGE0
-	bool "Build the stage 0 bring-up image instead of the application"
-	default n
-	help
-	  Replaces the whole application with a minimal first-power-on image:
-	  an I2C bus scan, a GPIO read, and a shell. No sensor drivers, no RTC
-	  driver, no SPI, no BLE and no LED matrix, so there is nothing that can
-	  hang during driver initialisation on an unproven board.
-
-	  Enabled by stage0.conf, which is used as CONF_FILE rather than as an
-	  overlay. Not useful on its own.
-
 config EW_SELFTEST
 	bool "Run the hardware self-test at boot"
 	default n
@@ -91,6 +79,54 @@ config EW_IMU_ANYMOTION_WAKE
 	  working wake path. Turn on only if the correct BMI260 feature-register
 	  addresses are ever established — see src/imu/imu.c for what would
 	  replace it (tap-to-wake, or software tilt detection).
+
+config EW_IMU_MOTION_WAKE
+	bool "Wake the display on motion, detected in software"
+	default y
+	help
+	  Wrist-raise wake, done by watching the accelerometer from the IMU
+	  thread rather than by arming a hardware trigger. This is the working
+	  replacement for EW_IMU_ANYMOTION_WAKE above: the BMI260's feature
+	  engine cannot be made to do it, but the raw acceleration is right
+	  there and the detection is a handful of subtractions.
+
+	  Costs idle current, and that is the whole trade. With this off the
+	  accelerometer is powered down entirely while the display is dark
+	  (~3 uA in suspend). With it on the part stays in its low-power mode at
+	  EW_IMU_MOTION_WAKE_ODR to have something to look at, which the
+	  datasheet puts in the low tens of microamps. Nothing else in this
+	  firmware can wake the watch, so the alternative is that a button is
+	  the only way in.
+
+	  Detection compares each sample against a slow-moving baseline, so a
+	  gradual change of orientation (the watch resting at a new angle) does
+	  not trigger, but a deliberate movement does.
+
+config EW_IMU_MOTION_WAKE_ODR
+	int "Accelerometer rate while watching for motion, Hz"
+	default 25
+	range 1 100
+	depends on EW_IMU_MOTION_WAKE
+	help
+	  Kept well below the 50 Hz used while the display is on, because this
+	  rate runs whenever the watch is idle and is the part that costs
+	  battery. Stay under 100: the driver selects its power-optimised filter
+	  below that threshold and its performance filter at or above it.
+
+config EW_IMU_MOTION_WAKE_THRESHOLD
+	int "Motion threshold, milli-m/s^2 summed across the three axes"
+	default 1500
+	range 100 20000
+	depends on EW_IMU_MOTION_WAKE
+	help
+	  How far a sample must depart from the running baseline to count.
+	  1500 is about 0.15 g, the same figure the old hardware trigger used —
+	  a deliberate wrist raise rather than the knock of setting the watch
+	  down. Two consecutive samples must exceed it, which rejects single
+	  spikes.
+
+	  Tuned by feel on this hardware, not measured. Raise it if the watch
+	  lights up in a pocket; lower it if a raise has to be exaggerated.
 
 config EW_BLE_TX_POWER_DBM
 	int "BLE transmit power, dBm"

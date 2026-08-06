@@ -5,7 +5,6 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/sensor.h>
-#include <zephyr/pm/device.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/logging/log.h>
 #include <stdlib.h>
@@ -14,6 +13,33 @@ LOG_MODULE_REGISTER(imu, LOG_LEVEL_INF);
 
 static const struct device *bmi = DEVICE_DT_GET(DT_NODELABEL(bmi260));
 static bool imu_ready;
+
+/*
+ * Accelerometer output data rate, Hz. 50 against a 30 Hz consumer: comfortably
+ * above the poll rate without paying for bandwidth nothing reads.
+ *
+ * Shared by accel_config() and imu_resume() deliberately — imu_suspend() powers
+ * the sensor down by writing an ODR of zero, so resume has to write this back,
+ * and the two silently disagreeing would leave the display-wake path running at
+ * a different rate from the one boot set up. Kept under 100 Hz on purpose: the
+ * driver selects its power-optimised filter below that threshold and the
+ * performance filter at or above it.
+ */
+#define ACCEL_ODR_HZ 50
+
+/*
+ * Set the accelerometer's output data rate, which on this driver is also how it
+ * is powered up and down: set_accel_odr_osr() writes PWR_CTRL_ACC_EN for a
+ * non-zero rate and clears it for zero. There is no PM_DEVICE path — see
+ * imu_suspend().
+ */
+static int set_accel_odr(int hz)
+{
+	struct sensor_value v = {.val1 = hz, .val2 = 0};
+
+	return sensor_attr_set(bmi, SENSOR_CHAN_ACCEL_XYZ,
+			       SENSOR_ATTR_SAMPLING_FREQUENCY, &v);
+}
 
 /* -------------------------------------------------------------------------
  * Wrist-tilt wake — DOES NOT WORK ON THIS HARDWARE. Kept, disarmed, because
@@ -252,6 +278,96 @@ static struct sand_gravity accel_to_gravity(const struct sensor_value *a)
 	};
 }
 
+/* -------------------------------------------------------------------------
+ * Motion wake, in software
+ *
+ * The hardware any-motion trigger above cannot be made to work on this part, so
+ * this does the same job from the accelerometer's raw output: while the display
+ * is dark the IMU thread keeps sampling, slowly, and compares each reading
+ * against a baseline that follows it lazily.
+ *
+ * Comparing against a moving baseline rather than a fixed orientation is what
+ * makes it a *motion* detector instead of a tilt detector. A watch left at a new
+ * angle drags the baseline with it over about a second and stops registering; a
+ * deliberate movement outruns the baseline and shows up as a large deviation.
+ * That distinction is the whole reason a fixed threshold on |a| would not do —
+ * gravity is 9.8 m/s^2 whichever way the watch is lying.
+ *
+ * Two consecutive samples must exceed the threshold. One is not enough: putting
+ * the watch down produces a single large spike, and waking on that means it
+ * lights up every time it is set on a table.
+ * ------------------------------------------------------------------------- */
+
+#if defined(CONFIG_EW_IMU_MOTION_WAKE)
+
+#define MOTION_POLL_MS   100  /* 10 Hz — a wrist raise lasts several samples */
+#define MOTION_BASE_SHIFT  3  /* baseline EWMA: new = old + (sample-old)/8 */
+#define MOTION_CONSEC      2
+
+/* Non-zero while the display is off and this is watching. Not atomic_t: it is
+ * written by display_on()/display_off() on their caller's thread and read by
+ * the IMU thread, and a torn read of a bool is not a thing on this core — the
+ * worst case is acting on the previous state for one 100 ms poll. */
+static volatile bool motion_watching;
+
+static int32_t motion_base[3];
+static bool    motion_base_valid;
+static int     motion_consec;
+
+/* milli-m/s^2, so the whole detector stays in integers. */
+static inline int32_t sv_milli(const struct sensor_value *v)
+{
+	return v->val1 * 1000 + v->val2 / 1000;
+}
+
+static void motion_reset(void)
+{
+	motion_base_valid = false;
+	motion_consec     = 0;
+}
+
+/* True when this sample should wake the watch. */
+static bool motion_check(const struct sensor_value a[3])
+{
+	int32_t s[3] = {sv_milli(&a[0]), sv_milli(&a[1]), sv_milli(&a[2])};
+
+	if (!motion_base_valid) {
+		/* Seed on the first sample after the display goes dark, so the
+		 * transition itself — which is always accompanied by the
+		 * movement that caused it — cannot count as motion. */
+		motion_base[0] = s[0];
+		motion_base[1] = s[1];
+		motion_base[2] = s[2];
+		motion_base_valid = true;
+		return false;
+	}
+
+	int32_t dev = 0;
+
+	for (int i = 0; i < 3; i++) {
+		int32_t d = s[i] - motion_base[i];
+
+		dev += (d < 0) ? -d : d;
+		motion_base[i] += d >> MOTION_BASE_SHIFT;
+	}
+
+	if (dev < CONFIG_EW_IMU_MOTION_WAKE_THRESHOLD) {
+		motion_consec = 0;
+		return false;
+	}
+
+	if (++motion_consec < MOTION_CONSEC) {
+		return false;
+	}
+
+	LOG_INF("motion wake: deviation %d >= %d", dev,
+		CONFIG_EW_IMU_MOTION_WAKE_THRESHOLD);
+	motion_consec = 0;
+	return true;
+}
+
+#endif /* CONFIG_EW_IMU_MOTION_WAKE */
+
 #define IMU_STACK_SIZE 1024
 #define IMU_PRIORITY   4
 /* Matches sand.c's 30 Hz tick — sand_set_gravity()'s only consumer. Was
@@ -286,6 +402,24 @@ static void imu_thread(void *p1, void *p2, void *p3)
 			k_msleep(IMU_PERIOD_MS);
 			continue;
 		}
+
+#if defined(CONFIG_EW_IMU_MOTION_WAKE)
+		if (motion_watching) {
+			/*
+			 * Display is dark: no gravity consumer is running (the
+			 * sand thread is suspended), so do nothing but look for
+			 * movement. ui_goto() lands back here through
+			 * display_on() -> imu_resume(), which clears
+			 * motion_watching and restores the full rate, so the
+			 * next iteration is a normal one.
+			 */
+			if (motion_check(a)) {
+				ui_goto(UI_PAGE_CLOCK);
+			}
+			k_msleep(MOTION_POLL_MS);
+			continue;
+		}
+#endif
 
 		struct sand_gravity g = accel_to_gravity(a);
 
@@ -333,11 +467,56 @@ void imu_suspend(void)
 		return;
 	}
 
-	k_thread_suspend(&imu_thread_data);
-	int rc = pm_device_action_run(bmi, PM_DEVICE_ACTION_SUSPEND);
-	if (rc) {
-		LOG_ERR("BMI260 suspend failed: %d", rc);
+#if defined(CONFIG_EW_IMU_MOTION_WAKE)
+	/*
+	 * Motion wake: the thread has to keep running to have anything to look
+	 * at, so drop the sensor to its idle rate instead of powering it off and
+	 * leave the thread alive in watching mode. See the block comment above
+	 * motion_check() for the detector, and EW_IMU_MOTION_WAKE's Kconfig help
+	 * for what this costs — it is the whole reason the option exists rather
+	 * than this just being how the watch behaves.
+	 */
+	motion_reset();
+	motion_watching = true;
+
+	int rc_idle = set_accel_odr(CONFIG_EW_IMU_MOTION_WAKE_ODR);
+
+	if (rc_idle) {
+		LOG_ERR("BMI260 idle-rate set failed: %d — motion wake will not"
+			" work", rc_idle);
 	}
+	return;
+#else
+	k_thread_suspend(&imu_thread_data);
+
+	/*
+	 * Powered down by setting the ODR to zero, not by pm_device_action_run().
+	 *
+	 * This used to call PM_DEVICE_ACTION_SUSPEND and log its failure, which
+	 * is where the `BMI260 suspend/resume failed: -88` in every boot log came
+	 * from: -88 is -ENOSYS, because the driver passes NULL as the PM device
+	 * to SENSOR_DEVICE_DT_INST_DEFINE and so implements no PM actions at all.
+	 * The call could never have done anything. Same trap light.c fell into
+	 * and documented; see the "No PM calls here, deliberately" comment there.
+	 *
+	 * It was not a harmless error message. k_thread_suspend() above stopped
+	 * anything from *reading* the accelerometer, so the failure was invisible,
+	 * but the sensor itself carried on converting at 50 Hz for as long as the
+	 * watch sat idle — the display being off is exactly when it should have
+	 * cost nothing.
+	 *
+	 * Zero ODR is the driver's own documented route to this: acc_odr_to_reg()
+	 * maps it to 0, and set_accel_odr_osr() clears PWR_CTRL_ACC_EN on a zero
+	 * ODR specifically. With the gyro never enabled and advanced power save
+	 * left on by bmi260_init(), clearing that bit drops the part to suspend.
+	 */
+	int rc = set_accel_odr(0);
+
+	if (rc) {
+		LOG_ERR("BMI260 accel power-down failed: %d — it will keep"
+			" converting while idle", rc);
+	}
+#endif /* CONFIG_EW_IMU_MOTION_WAKE */
 }
 
 void imu_resume(void)
@@ -345,11 +524,33 @@ void imu_resume(void)
 	if (!imu_ready) {
 		return;
 	}
-	int rc = pm_device_action_run(bmi, PM_DEVICE_ACTION_RESUME);
+	/*
+	 * Mirror of imu_suspend(): put the ODR back, which re-sets
+	 * PWR_CTRL_ACC_EN. Only the ODR needs restoring — full scale and
+	 * oversampling live in registers that a zero-ODR write does not touch,
+	 * so the range and filter set up by accel_config() survive the round
+	 * trip and do not have to be reapplied.
+	 *
+	 * No settling delay here: the thread is resumed inside its k_msleep(),
+	 * so the first fetch is up to IMU_PERIOD_MS away, which is far longer
+	 * than the BMI260 needs to produce valid data from suspend.
+	 */
+	int rc = set_accel_odr(ACCEL_ODR_HZ);
+
 	if (rc) {
-		LOG_ERR("BMI260 resume failed: %d", rc);
+		LOG_ERR("BMI260 accel power-up failed: %d — axes will read zero",
+			rc);
 	}
+
+#if defined(CONFIG_EW_IMU_MOTION_WAKE)
+	/* Ordered after the rate change so the thread cannot take one more
+	 * watching sample at the full rate and re-trigger on the movement that
+	 * woke it. The thread was never suspended in this configuration, so
+	 * there is nothing to resume. */
+	motion_watching = false;
+#else
 	k_thread_resume(&imu_thread_data);
+#endif
 }
 
 /*
@@ -376,9 +577,7 @@ static int accel_config(void)
 	 * the smallest range gives the most resolution where it matters. */
 	struct sensor_value full_scale  = {.val1 = 2,  .val2 = 0};
 	struct sensor_value oversampling = {.val1 = 1, .val2 = 0}; /* normal */
-	/* 50 Hz against a 30 Hz consumer: comfortably above the poll rate
-	 * without paying for bandwidth nothing reads. */
-	struct sensor_value sampling_freq = {.val1 = 50, .val2 = 0};
+	struct sensor_value sampling_freq = {.val1 = ACCEL_ODR_HZ, .val2 = 0};
 	int rc;
 
 	rc  = sensor_attr_set(bmi, SENSOR_CHAN_ACCEL_XYZ,
