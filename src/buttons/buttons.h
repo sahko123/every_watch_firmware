@@ -10,8 +10,13 @@
  * main() that only knew about "held 3 s". Neither could see the other, so a
  * gesture spanning both buttons was not expressible at all.
  *
- * Events are delivered from the system workqueue, never from ISR context, so
- * handlers may take mutexes, touch I2C and drive the display directly.
+ * Events are delivered from a work queue, never from ISR context, so handlers
+ * may take mutexes, touch I2C and drive the display directly.
+ *
+ * That queue is this module's own, at a priority above the system and USB
+ * queues rather than sharing the system one — see buttons.c. Handlers
+ * therefore preempt USB and workqueue activity, and must not assume they are
+ * serialised against anything else running on the system queue.
  */
 enum btn_event {
 	BTN_EV_L_SINGLE,

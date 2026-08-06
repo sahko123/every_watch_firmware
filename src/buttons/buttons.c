@@ -58,6 +58,30 @@ static bool    hold_fired;     /* hold already emitted; suppress the release eve
 static bool    pending_l;      /* a single-press candidate waiting out DOUBLE_MS */
 static bool    pending_r;
 
+/*
+ * Own work queue, at a priority above both the system workqueue and the USB
+ * device stack's workqueue (both -1, see prj.conf/USB Kconfig defaults).
+ * CONFIG_TIMESLICE_SIZE is 0 (off), so among threads at equal priority
+ * nothing forces a switch back to the system workqueue if the USB workqueue
+ * thread stays busy — a burst of CDC-ACM TX activity can occupy it for a
+ * real, visible stretch. sample_work_fn runs on a 15 ms periodic timer while
+ * a gesture is live (SAMPLE_MS); if its queue is starved for longer than one
+ * press-and-release, the two samples that would have straddled it never run,
+ * and gpio_pin_get_dt() reads "not down" on both sides — the whole press is
+ * gone with no event ever firing. A dedicated, higher-priority queue means
+ * button sampling always preempts USB activity instead of queuing behind it.
+ */
+#define BUTTON_WORKQ_PRIORITY -2
+/* Matches CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE: this call chain (emit() ->
+ * ui_handle_button() -> ui_goto() -> display/sand/time_display/battery code)
+ * is identical to what used to run on the system workqueue, just moved to
+ * its own thread — no reason for it to need less stack than that queue was
+ * already proven to need for the same call depth. */
+#define BUTTON_WORKQ_STACK_SIZE 2048
+
+static struct k_work_q button_work_q;
+static K_THREAD_STACK_DEFINE(button_work_q_stack, BUTTON_WORKQ_STACK_SIZE);
+
 static void emit(enum btn_event ev)
 {
 	LOG_DBG("gesture: %s", btn_event_name(ev));
@@ -97,7 +121,7 @@ static K_WORK_DEFINE(sample_work, sample_work_fn);
 static void sample_timer_cb(struct k_timer *t)
 {
 	ARG_UNUSED(t);
-	k_work_submit(&sample_work);
+	k_work_submit_to_queue(&button_work_q, &sample_work);
 }
 
 static K_TIMER_DEFINE(sample_timer, sample_timer_cb, NULL);
@@ -235,7 +259,7 @@ static void sample_work_fn(struct k_work *w)
 			 * G_IDLE's entry logic turns the pending single into a
 			 * double. */
 			state = G_IDLE;
-			k_work_submit(&sample_work);
+			k_work_submit_to_queue(&button_work_q, &sample_work);
 			break;
 		}
 
@@ -257,7 +281,7 @@ static void btn_isr(const struct device *port, struct gpio_callback *cb, uint32_
 
 	/* Idle cost lives here: without a press the timer never runs. */
 	timer_start();
-	k_work_submit(&sample_work);
+	k_work_submit_to_queue(&button_work_q, &sample_work);
 }
 
 bool buttons_left_down(void)  { return gpio_pin_get_dt(&btn_l) == 1; }
@@ -266,6 +290,11 @@ bool buttons_right_down(void) { return gpio_pin_get_dt(&btn_r) == 1; }
 void buttons_init(btn_handler_t handler)
 {
 	user_handler = handler;
+
+	k_work_queue_start(&button_work_q, button_work_q_stack,
+			    K_THREAD_STACK_SIZEOF(button_work_q_stack),
+			    BUTTON_WORKQ_PRIORITY, NULL);
+	k_thread_name_set(&button_work_q.thread, "button_workq");
 
 	if (!gpio_is_ready_dt(&btn_l) || !gpio_is_ready_dt(&btn_r)) {
 		LOG_ERR("button GPIO not ready — no input available");
