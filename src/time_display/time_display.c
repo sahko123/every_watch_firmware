@@ -6,6 +6,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/rtc.h>
 #include <zephyr/logging/log.h>
+#include <errno.h>
 #include <string.h>
 
 LOG_MODULE_REGISTER(time_display, LOG_LEVEL_INF);
@@ -99,13 +100,49 @@ static bool active;
  * a second of it appearing. */
 static bool paused;
 
+/*
+ * Placeholder written back to the RTC whenever it reports VLF (voltage-low
+ * flag) — an arbitrary but validly-encodable date, chosen only so the write
+ * succeeds. The FRTC8900 sets VLF itself, in hardware, whenever its own
+ * supply dips below ~1.6 V or the oscillator drops out (see rtc_frtc8900.c);
+ * once set, every future rtc_get_time() keeps returning -ENODATA forever,
+ * by design, until something calls rtc_set_time() — which is also the only
+ * thing that clears VLF. Without this, one power dip permanently blanks the
+ * clock until someone happens to run `settime` over USB, with no on-screen
+ * sign of why. 00:00 matches the placeholder time_display_init() already
+ * shows for the "never been set" case, so a VLF recovery looks the same as
+ * a fresh unconfigured RTC rather than a new, different failure mode.
+ */
+static const struct rtc_time RTC_RESET_DEFAULT = {
+	.tm_sec = 0, .tm_min = 0, .tm_hour = 0,
+	.tm_mday = 1, .tm_mon = 0, .tm_year = 100, /* 2000-01-01, a Saturday */
+	.tm_wday = 6,
+};
+
 static bool read_time(int *hours, int *minutes)
 {
 	struct rtc_time t = {0};
+	int ret;
 
-	if (rtc_dev == NULL || rtc_get_time(rtc_dev, &t) != 0) {
+	if (rtc_dev == NULL) {
 		return false;
 	}
+
+	ret = rtc_get_time(rtc_dev, &t);
+
+	if (ret == -ENODATA) {
+		LOG_WRN("RTC lost power (VLF set) -- resetting to a"
+			" placeholder; run settime to correct it");
+		if (rtc_set_time(rtc_dev, &RTC_RESET_DEFAULT) == 0) {
+			t   = RTC_RESET_DEFAULT;
+			ret = 0;
+		}
+	}
+
+	if (ret != 0) {
+		return false;
+	}
+
 	*hours   = t.tm_hour;
 	*minutes = t.tm_min;
 	return true;
