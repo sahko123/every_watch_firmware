@@ -114,19 +114,89 @@ config EW_IMU_MOTION_WAKE_ODR
 	  below that threshold and its performance filter at or above it.
 
 config EW_IMU_MOTION_WAKE_THRESHOLD
-	int "Motion threshold, milli-m/s^2 summed across the three axes"
-	default 1500
+	int "Gate threshold, milli-m/s^2 summed across the three axes"
+	default 1200
 	range 100 20000
 	depends on EW_IMU_MOTION_WAKE
 	help
-	  How far a sample must depart from the running baseline to count.
-	  1500 is about 0.15 g, the same figure the old hardware trigger used —
-	  a deliberate wrist raise rather than the knock of setting the watch
-	  down. Two consecutive samples must exceed it, which rejects single
-	  spikes.
+	  Stage one only: how far a sample must depart from the running baseline
+	  before the gyroscope is powered up to take a proper look.
 
-	  Tuned by feel on this hardware, not measured. Raise it if the watch
-	  lights up in a pocket; lower it if a raise has to be exaggerated.
+	  This is deliberately loose. Its job is to not miss the start of a
+	  flick, and being wrong is cheap — the gyro stage rejects whatever this
+	  waves through. Set it too high and real flicks are missed before
+	  anything can judge them; too low and the gyro spins up constantly,
+	  which is the one thing that actually costs battery here.
+
+	  All of these are runtime-tunable over the shell (`imu show`), which is
+	  the sane way to find them. These values are the starting point.
+
+config EW_IMU_FLICK_PEAK_DPS
+	int "Peak angular speed a flick must reach, degrees/second"
+	default 150
+	range 20 2000
+	depends on EW_IMU_MOTION_WAKE
+	help
+	  A flick is fast. This is what separates it from slow reorientation —
+	  putting an arm on a desk sweeps the same angle over a second or two
+	  and never gets near this.
+
+	  Raise it if the watch wakes while walking; lower it if a natural raise
+	  has to be exaggerated to register.
+
+config EW_IMU_FLICK_ANGLE_DEG
+	int "Total swept angle a flick must cover, degrees"
+	default 35
+	range 5 360
+	depends on EW_IMU_MOTION_WAKE
+	help
+	  Integrated over the confirmation window, so it measures how far the
+	  watch actually turned rather than how hard it was jolted. Together
+	  with the peak-rate check this rejects a fast knock: a bump is quick
+	  but goes nowhere.
+
+	  A deliberate raise from arm-down to reading position is well over 45
+	  degrees, so 35 leaves room for a lazy one.
+
+config EW_IMU_FLICK_SETTLE_DPS
+	int "Rate below which the motion counts as finished, degrees/second"
+	default 45
+	range 5 500
+	depends on EW_IMU_MOTION_WAKE
+	help
+	  A flick ends with the wrist held still to look at it. Walking,
+	  running and gesturing rotate the wrist just as hard but never stop,
+	  so requiring the motion to come to rest is what rejects them.
+
+	  Two consecutive samples under this end the window early, which also
+	  means a real flick wakes the display as soon as it finishes rather
+	  than at the end of the full window.
+
+config EW_IMU_FLICK_VIEW_MILLI
+	int "How far the display must face upward at the end, milli-m/s^2 on Z"
+	default 4000
+	range 0 9800
+	depends on EW_IMU_MOTION_WAKE
+	help
+	  The Z axis is the display's face normal and reads negative with the
+	  screen upwards, so this is a cone the face must end up inside. 4000
+	  of 9810 is roughly 24 degrees above horizontal.
+
+	  This is the cheapest and most effective of the four checks: a flick
+	  that ends with the screen pointing at the floor, or edge-on in a
+	  pocket, was not someone checking the time. Set to 0 to disable the
+	  check entirely.
+
+config EW_IMU_FLICK_WINDOW_MS
+	int "How long to watch with the gyro powered, milliseconds"
+	default 500
+	range 100 2000
+	depends on EW_IMU_MOTION_WAKE
+	help
+	  Upper bound on one confirmation. A flick that settles early ends the
+	  window early, so this only costs its full length on gestures that
+	  never resolve — and it is the whole of the gyro's duty cycle, at
+	  roughly 900 uA while it runs.
 
 config EW_BLE_TX_POWER_DBM
 	int "BLE transmit power, dBm"

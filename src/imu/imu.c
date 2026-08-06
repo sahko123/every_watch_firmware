@@ -41,6 +41,21 @@ static int set_accel_odr(int hz)
 			       SENSOR_ATTR_SAMPLING_FREQUENCY, &v);
 }
 
+/*
+ * Same again for the gyroscope, which is powered down for all but the few
+ * hundred milliseconds a flick confirmation takes — it costs around 900 uA
+ * against the accelerometer's ~20, so it is never left on. set_gyro_odr_osr()
+ * writes PWR_CTRL_GYR_EN for a non-zero rate and clears it for zero, exactly
+ * as the accelerometer path does.
+ */
+static int set_gyro_odr(int hz)
+{
+	struct sensor_value v = {.val1 = hz, .val2 = 0};
+
+	return sensor_attr_set(bmi, SENSOR_CHAN_GYRO_XYZ,
+			       SENSOR_ATTR_SAMPLING_FREQUENCY, &v);
+}
+
 /* -------------------------------------------------------------------------
  * Wrist-tilt wake — DOES NOT WORK ON THIS HARDWARE. Kept, disarmed, because
  * the code is correct for a BMI270 and is the starting point for whatever
@@ -300,19 +315,80 @@ static struct sand_gravity accel_to_gravity(const struct sensor_value *a)
 
 #if defined(CONFIG_EW_IMU_MOTION_WAKE)
 
-#define MOTION_POLL_MS   100  /* 10 Hz — a wrist raise lasts several samples */
-#define MOTION_BASE_SHIFT  3  /* baseline EWMA: new = old + (sample-old)/8 */
-#define MOTION_CONSEC      2
+/*
+ * Two stages, because the gyroscope is the sensor that can tell a wrist flick
+ * from being jostled and also the one that cannot be left running.
+ *
+ * The BMI260's gyro draws around 900 uA in normal mode against roughly 20 uA
+ * for the accelerometer in its low-power mode — call it forty-five times the
+ * idle budget, which would turn weeks of standby into days. So it stays powered
+ * down, and the accelerometer does the waiting:
+ *
+ *   WATCHING  accel only, 25 Hz, polled at MOTION_POLL_MS. Looks for any
+ *             departure from a slowly-following baseline. Deliberately
+ *             twitchy — its job is to not miss the start of a flick, and it is
+ *             allowed to be wrong because stage two is what decides.
+ *
+ *   ARMED     gyro powered up, both sensors polled at ARMED_POLL_MS for up to
+ *             flick_window_ms. Accumulates peak angular speed and total swept
+ *             angle, then requires the motion to STOP and the display to have
+ *             ended up facing the wearer. Gyro goes back off either way.
+ *
+ * The four conditions together are what make it a deliberate gesture rather
+ * than a movement:
+ *
+ *   peak rate   — a flick is fast. Slow reorientation (putting an arm on a
+ *                 desk) sweeps the same angle without ever being quick.
+ *   swept angle — and it is a real rotation, not a twitch that happened to be
+ *                 fast.
+ *   settling    — it ENDS. Walking, running and gesturing all rotate the wrist
+ *                 hard, repeatedly, and never come to rest pointing anywhere in
+ *                 particular. This is the condition that rejects most of them.
+ *   view cone   — and it ends with the screen pointed at a face. A flick that
+ *                 finishes with the display toward the floor was not someone
+ *                 checking the time.
+ *
+ * Every threshold is a runtime variable rather than a constant, seeded from
+ * Kconfig, because "feels like an intentional flick" is not something that can
+ * be derived — see the `imu` shell commands at the bottom of this file.
+ */
+
+#define MOTION_POLL_MS      50   /* 20 Hz while watching — a flick is ~400 ms */
+#define ARMED_POLL_MS       25   /* 40 Hz once the gyro is up */
+#define MOTION_BASE_SHIFT    3   /* baseline EWMA: new = old + (sample-old)/8 */
+#define GYRO_ODR_HZ        100
+#define GYRO_STARTUP_MS     60   /* datasheet gyro start-up, plus margin */
+#define SETTLE_SAMPLES       2
 
 /* Non-zero while the display is off and this is watching. Not atomic_t: it is
  * written by display_on()/display_off() on their caller's thread and read by
  * the IMU thread, and a torn read of a bool is not a thing on this core — the
- * worst case is acting on the previous state for one 100 ms poll. */
+ * worst case is acting on the previous state for one poll. */
 static volatile bool motion_watching;
+
+/* Runtime-tunable thresholds, seeded from Kconfig. See `imu show`. */
+static int32_t cfg_gate_milli   = CONFIG_EW_IMU_MOTION_WAKE_THRESHOLD;
+static int32_t cfg_peak_dps     = CONFIG_EW_IMU_FLICK_PEAK_DPS;
+static int32_t cfg_angle_deg    = CONFIG_EW_IMU_FLICK_ANGLE_DEG;
+static int32_t cfg_settle_dps   = CONFIG_EW_IMU_FLICK_SETTLE_DPS;
+static int32_t cfg_view_milli   = CONFIG_EW_IMU_FLICK_VIEW_MILLI;
+static int32_t cfg_window_ms    = CONFIG_EW_IMU_FLICK_WINDOW_MS;
+static bool    cfg_verbose;
+
+/* Last attempt, for `imu show` — tuning by eye needs the numbers from the
+ * flick that just failed, not from a fresh one you have to reproduce. */
+static struct {
+	int32_t peak_dps;
+	int32_t angle_deg;
+	int32_t final_z;
+	bool    settled;
+	bool    woke;
+	bool    valid;
+} last_flick;
 
 static int32_t motion_base[3];
 static bool    motion_base_valid;
-static int     motion_consec;
+static int32_t gate_peak_seen;   /* reset by `imu show` — see motion_gate() */
 
 /* milli-m/s^2, so the whole detector stays in integers. */
 static inline int32_t sv_milli(const struct sensor_value *v)
@@ -320,21 +396,31 @@ static inline int32_t sv_milli(const struct sensor_value *v)
 	return v->val1 * 1000 + v->val2 / 1000;
 }
 
+/*
+ * Zephyr reports angular rate in rad/s; degrees are what thresholds are
+ * naturally expressed in. The 64-bit intermediate is not optional: 2000 deg/s
+ * is ~35e6 micro-rad/s, and multiplying that by 57296 overflows 32 bits.
+ */
+static int32_t gyro_dps(const struct sensor_value *v)
+{
+	int64_t urad = (int64_t)v->val1 * 1000000 + v->val2;
+
+	return (int32_t)((urad * 57296) / 1000000000);
+}
+
 static void motion_reset(void)
 {
 	motion_base_valid = false;
-	motion_consec     = 0;
 }
 
-/* True when this sample should wake the watch. */
-static bool motion_check(const struct sensor_value a[3])
+/* Stage one: has anything happened at all? */
+static bool motion_gate(const struct sensor_value a[3])
 {
 	int32_t s[3] = {sv_milli(&a[0]), sv_milli(&a[1]), sv_milli(&a[2])};
 
 	if (!motion_base_valid) {
 		/* Seed on the first sample after the display goes dark, so the
-		 * transition itself — which is always accompanied by the
-		 * movement that caused it — cannot count as motion. */
+		 * movement that caused it cannot itself count as motion. */
 		motion_base[0] = s[0];
 		motion_base[1] = s[1];
 		motion_base[2] = s[2];
@@ -351,19 +437,114 @@ static bool motion_check(const struct sensor_value a[3])
 		motion_base[i] += d >> MOTION_BASE_SHIFT;
 	}
 
-	if (dev < CONFIG_EW_IMU_MOTION_WAKE_THRESHOLD) {
-		motion_consec = 0;
-		return false;
+	/* Highest deviation since the last `imu show`. Without this, a gate that
+	 * is set too high is invisible: nothing fires, nothing logs, and there is
+	 * no way to tell "the gate is too high" from "the accelerometer is not
+	 * being read at all". Logging every poll instead would be 20 lines a
+	 * second of noise. */
+	if (dev > gate_peak_seen) {
+		gate_peak_seen = dev;
 	}
 
-	if (++motion_consec < MOTION_CONSEC) {
-		return false;
+	return dev >= cfg_gate_milli;
+}
+
+/*
+ * Stage two. Blocks for up to cfg_window_ms with the gyro powered, and returns
+ * true only for something shaped like a deliberate flick.
+ */
+static bool flick_confirm(void)
+{
+	int32_t peak_dps  = 0;
+	int32_t angle_mdeg = 0;
+	int32_t final_z   = 0;
+	int     settle_run = 0;
+	bool    settled   = false;
+	bool    seen_peak = false;
+
+	if (set_gyro_odr(GYRO_ODR_HZ)) {
+		LOG_ERR("gyro power-up failed — falling back to accel-only wake");
+		last_flick.valid = false;
+		return true;   /* do not swallow the wake because a sensor failed */
 	}
 
-	LOG_INF("motion wake: deviation %d >= %d", dev,
-		CONFIG_EW_IMU_MOTION_WAKE_THRESHOLD);
-	motion_consec = 0;
-	return true;
+	k_msleep(GYRO_STARTUP_MS);
+
+	for (int elapsed = 0; elapsed < cfg_window_ms; elapsed += ARMED_POLL_MS) {
+		struct sensor_value g[3], a[3];
+
+		if (sensor_sample_fetch(bmi)) {
+			k_msleep(ARMED_POLL_MS);
+			continue;
+		}
+		if (sensor_channel_get(bmi, SENSOR_CHAN_GYRO_X, &g[0]) ||
+		    sensor_channel_get(bmi, SENSOR_CHAN_GYRO_Y, &g[1]) ||
+		    sensor_channel_get(bmi, SENSOR_CHAN_GYRO_Z, &g[2]) ||
+		    sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_Z, &a[AX_Z])) {
+			k_msleep(ARMED_POLL_MS);
+			continue;
+		}
+
+		int32_t wx = gyro_dps(&g[0]);
+		int32_t wy = gyro_dps(&g[1]);
+		int32_t wz = gyro_dps(&g[2]);
+		int32_t rate = (int32_t)isqrt32((uint32_t)(wx * wx + wy * wy +
+							   wz * wz));
+
+		if (rate > peak_dps) {
+			peak_dps = rate;
+		}
+		angle_mdeg += rate * ARMED_POLL_MS;
+		final_z = sv_milli(&a[AX_Z]);
+
+		if (peak_dps >= cfg_peak_dps) {
+			seen_peak = true;
+		}
+
+		/* Only start looking for the end once there has been a
+		 * beginning, or a motionless window trivially "settles". */
+		if (seen_peak && rate < cfg_settle_dps) {
+			if (++settle_run >= SETTLE_SAMPLES) {
+				settled = true;
+				break;
+			}
+		} else {
+			settle_run = 0;
+		}
+
+		k_msleep(ARMED_POLL_MS);
+	}
+
+	(void)set_gyro_odr(0);
+
+	int32_t angle_deg = angle_mdeg / 1000;
+
+	/*
+	 * Z is the display's face normal and reads negative with the screen
+	 * upwards (see the axis block above), so "pointing at the wearer" is Z
+	 * below a negative threshold. This is the condition that rejects a flick
+	 * ending with the watch face down or edge-on.
+	 */
+	bool in_view = final_z <= -cfg_view_milli;
+	bool woke    = seen_peak && settled && in_view &&
+		       angle_deg >= cfg_angle_deg;
+
+	last_flick.peak_dps  = peak_dps;
+	last_flick.angle_deg = angle_deg;
+	last_flick.final_z   = final_z;
+	last_flick.settled   = settled;
+	last_flick.woke      = woke;
+	last_flick.valid     = true;
+
+	if (cfg_verbose || woke) {
+		LOG_INF("flick: peak %d dps (>=%d) angle %d deg (>=%d) "
+			"settled %d viewZ %d (<=%d) -> %s",
+			peak_dps, cfg_peak_dps, angle_deg, cfg_angle_deg,
+			settled, final_z, -cfg_view_milli,
+			woke ? "WAKE" : "ignored");
+	}
+
+	return woke;
 }
 
 #endif /* CONFIG_EW_IMU_MOTION_WAKE */
@@ -407,15 +588,41 @@ static void imu_thread(void *p1, void *p2, void *p3)
 		if (motion_watching) {
 			/*
 			 * Display is dark: no gravity consumer is running (the
-			 * sand thread is suspended), so do nothing but look for
-			 * movement. ui_goto() lands back here through
-			 * display_on() -> imu_resume(), which clears
-			 * motion_watching and restores the full rate, so the
-			 * next iteration is a normal one.
+			 * sand thread is suspended), so do nothing but watch.
+			 *
+			 * The gate is cheap and twitchy; flick_confirm() is what
+			 * decides, and it blocks for up to cfg_window_ms with the
+			 * gyro powered. Re-check motion_watching after it returns:
+			 * a button may have woken the display while we were in
+			 * there, in which case this is no longer ours to drive.
+			 *
+			 * ui_goto() lands back here through display_on() ->
+			 * imu_resume(), which clears motion_watching and restores
+			 * the full accelerometer rate, so the next iteration is a
+			 * normal one.
 			 */
-			if (motion_check(a)) {
-				ui_goto(UI_PAGE_CLOCK);
+			if (motion_gate(a)) {
+				bool woke = flick_confirm();
+
+				/* Only here, and NOT on every non-gating poll:
+				 * the confirmation window just let the watch
+				 * move for up to half a second, so the baseline
+				 * is stale and the new resting orientation would
+				 * otherwise read as fresh motion.
+				 *
+				 * Resetting unconditionally was a bug that made
+				 * the gate impossible to fire at all — every poll
+				 * invalidated the baseline, so every poll took
+				 * motion_gate()'s seeding path and returned false
+				 * before any deviation was ever computed. */
+				motion_reset();
+
+				if (woke && motion_watching) {
+					ui_goto(UI_PAGE_CLOCK);
+					continue;
+				}
 			}
+
 			k_msleep(MOTION_POLL_MS);
 			continue;
 		}
@@ -626,3 +833,126 @@ void imu_init(void)
 
 	LOG_INF("IMU started (30 Hz)");
 }
+
+/* --------------------------------------------------------------------------
+ * Shell — flick tuning
+ * --------------------------------------------------------------------------
+ *
+ * "Feels like an intentional flick" cannot be derived, only found, and finding
+ * it by rebuilding and reflashing between guesses is unbearable. These change
+ * the thresholds on a running watch; `imu show` prints them alongside the
+ * numbers from the last attempt, so a flick that failed can be read off and
+ * turned into the setting that would have caught it.
+ *
+ * `imu verbose 1` logs every confirmation, including the ignored ones, which is
+ * how you find out what walking or typing actually looks like.
+ *
+ * Once the numbers are right, write them back into the Kconfig defaults.
+ * -------------------------------------------------------------------------- */
+
+#if defined(CONFIG_SHELL) && defined(CONFIG_EW_IMU_MOTION_WAKE)
+
+#include <zephyr/shell/shell.h>
+#include <stdlib.h>
+
+static int cmd_imu_show(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc); ARG_UNUSED(argv);
+
+	shell_print(sh, "gate    %d milli-m/s2   (stage 1: power the gyro up)",
+		    cfg_gate_milli);
+	shell_print(sh, "        peak seen since last show: %d  %s", gate_peak_seen,
+		    gate_peak_seen >= cfg_gate_milli ? "(would fire)"
+						     : "(never reached the gate)");
+	gate_peak_seen = 0;
+	shell_print(sh, "peak    %d dps          (stage 2: must be this fast)",
+		    cfg_peak_dps);
+	shell_print(sh, "angle   %d deg          (and turn this far)", cfg_angle_deg);
+	shell_print(sh, "settle  %d dps          (and then stop)", cfg_settle_dps);
+	shell_print(sh, "view    %d milli-m/s2   (and end facing up; 0 = off)",
+		    cfg_view_milli);
+	shell_print(sh, "window  %d ms           (gyro on for at most this long)",
+		    cfg_window_ms);
+	shell_print(sh, "verbose %d", cfg_verbose ? 1 : 0);
+
+	if (!last_flick.valid) {
+		shell_print(sh, "\nno confirmation attempted yet — flick the watch"
+				" with the display off");
+		return 0;
+	}
+
+	shell_print(sh, "\nlast attempt:");
+	shell_print(sh, "  peak    %d dps   %s", last_flick.peak_dps,
+		    last_flick.peak_dps >= cfg_peak_dps ? "ok" : "TOO SLOW");
+	shell_print(sh, "  angle   %d deg   %s", last_flick.angle_deg,
+		    last_flick.angle_deg >= cfg_angle_deg ? "ok" : "TOO SMALL");
+	shell_print(sh, "  settled %d       %s", last_flick.settled ? 1 : 0,
+		    last_flick.settled ? "ok" : "NEVER STOPPED");
+	shell_print(sh, "  final Z %d       %s", last_flick.final_z,
+		    last_flick.final_z <= -cfg_view_milli ? "ok" : "NOT FACING UP");
+	shell_print(sh, "  verdict %s", last_flick.woke ? "WAKE" : "ignored");
+	return 0;
+}
+
+/* One setter for all of them — they are all "a bare int, clamped by Kconfig's
+ * documented range", and six near-identical command functions would be six
+ * places to get the range wrong. */
+static int set_tunable(const struct shell *sh, const char *name, int32_t *dst,
+		       int32_t lo, int32_t hi, size_t argc, char **argv)
+{
+	if (argc == 2) {
+		long v = strtol(argv[1], NULL, 0);
+
+		if (v < lo || v > hi) {
+			shell_error(sh, "%s must be %d-%d", name, lo, hi);
+			return -EINVAL;
+		}
+		*dst = (int32_t)v;
+	}
+	shell_print(sh, "%s = %d", name, *dst);
+	return 0;
+}
+
+static int cmd_imu_gate(const struct shell *sh, size_t argc, char **argv)
+{ return set_tunable(sh, "gate", &cfg_gate_milli, 100, 20000, argc, argv); }
+
+static int cmd_imu_peak(const struct shell *sh, size_t argc, char **argv)
+{ return set_tunable(sh, "peak", &cfg_peak_dps, 20, 2000, argc, argv); }
+
+static int cmd_imu_angle(const struct shell *sh, size_t argc, char **argv)
+{ return set_tunable(sh, "angle", &cfg_angle_deg, 5, 360, argc, argv); }
+
+static int cmd_imu_settle(const struct shell *sh, size_t argc, char **argv)
+{ return set_tunable(sh, "settle", &cfg_settle_dps, 5, 500, argc, argv); }
+
+static int cmd_imu_view(const struct shell *sh, size_t argc, char **argv)
+{ return set_tunable(sh, "view", &cfg_view_milli, 0, 9800, argc, argv); }
+
+static int cmd_imu_window(const struct shell *sh, size_t argc, char **argv)
+{ return set_tunable(sh, "window", &cfg_window_ms, 100, 2000, argc, argv); }
+
+static int cmd_imu_verbose(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc == 2) {
+		cfg_verbose = strtol(argv[1], NULL, 0) != 0;
+	}
+	shell_print(sh, "verbose = %d%s", cfg_verbose ? 1 : 0,
+		    cfg_verbose ? "  (every attempt is logged, not just wakes)" : "");
+	return 0;
+}
+
+SHELL_STATIC_SUBCMD_SET_CREATE(imu_sub,
+	SHELL_CMD_ARG(show,    NULL, "Thresholds and the last flick attempt", cmd_imu_show,    1, 0),
+	SHELL_CMD_ARG(gate,    NULL, "Stage-1 trigger, milli-m/s2",           cmd_imu_gate,    1, 1),
+	SHELL_CMD_ARG(peak,    NULL, "Peak angular speed, dps",               cmd_imu_peak,    1, 1),
+	SHELL_CMD_ARG(angle,   NULL, "Swept angle, deg",                      cmd_imu_angle,   1, 1),
+	SHELL_CMD_ARG(settle,  NULL, "Stop-detect rate, dps",                 cmd_imu_settle,  1, 1),
+	SHELL_CMD_ARG(view,    NULL, "End-of-flick view cone, milli-m/s2",    cmd_imu_view,    1, 1),
+	SHELL_CMD_ARG(window,  NULL, "Confirmation window, ms",               cmd_imu_window,  1, 1),
+	SHELL_CMD_ARG(verbose, NULL, "Log ignored attempts too, 0 or 1",      cmd_imu_verbose, 1, 1),
+	SHELL_SUBCMD_SET_END
+);
+
+SHELL_CMD_REGISTER(imu, &imu_sub, "Wrist-flick wake tuning", NULL);
+
+#endif /* CONFIG_SHELL && CONFIG_EW_IMU_MOTION_WAKE */
