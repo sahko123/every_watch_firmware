@@ -44,7 +44,12 @@ Work down this list. Each step needs only the USB cable.
 
 ### 1. Normal update — the app is working
 
-Hold the **left button for 3 seconds**. The watch reboots into recovery.
+Hold **both buttons for 2 seconds**. The watch reboots into recovery.
+
+(The gesture is bound in `ui_handle_button()` and is both buttons, not the left
+one — left-hold is unbound. Not to be confused with MCUboot's *own* entry
+trigger in the table above, which is the **left** button held through a reset
+and belongs to the bootloader rather than the app.)
 
 Equivalent triggers, all doing the same thing:
 - A `bootloader` command on the console (bring-up builds)
@@ -134,12 +139,19 @@ CONFIG_BOOT_SERIAL_BOOT_MODE=y        # app requested it via retained register
 CONFIG_BOOT_SERIAL_NO_APPLICATION=y   # no valid image -> wait forever
 CONFIG_BOOT_SERIAL_PIN_RESET=y        # reset pin, if exposed
 
-# Smaller than the RSA-2048 default, same (nil) security value
-CONFIG_BOOT_SIGNATURE_TYPE_ECDSA_P256=y
+# Hash-only: integrity, no authenticity. Already live — see
+# child_image/mcuboot.conf and patches/nrf-imgtool-hash-only.patch.
+CONFIG_BOOT_SIGNATURE_TYPE_NONE=y
 ```
 
-`CONFIG_BOOT_USB_DFU_WAIT` is removed. That also eliminates the 5-second delay
-currently incurred on **every** boot, connected to USB or not.
+`CONFIG_BOOT_USB_DFU_WAIT` is removed — it already is, in fact: the current
+firmware uses `CONFIG_BOOT_USB_DFU_GPIO`, so there is no longer a per-boot delay
+to eliminate.
+
+Flash budget note: dropping the signature freed ~4.6 KB and MCUboot now sits at
+**82%** of its 48 KB partition (40,528 B of 49,152), against 92% before and 97%
+when this document was written. Whether the MCUmgr scheme below fits is worth
+re-testing against that figure rather than the old one.
 
 ### Devicetree
 

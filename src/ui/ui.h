@@ -23,6 +23,14 @@
  *   - Only the visible page ticks. The sand simulation and curtain animation
  *     burn no cycles while nothing is looking at them.
  *   - The sand thread runs only for pages that declare needs_sand.
+ *
+ * One consequence of that last rule is easy to trip over: the sand thread is
+ * also what commits frames to the panel, at 30 Hz. So pages without needs_sand
+ * are not refreshed continuously — whatever they draw and commit themselves is
+ * simply held by the WS2812Bs until something else commits. That is fine for a
+ * static page, and correct for power, but anything wanting animation on such a
+ * page has to drive its own commits (battery.c does exactly this for the charge
+ * shimmer).
  */
 enum ui_page {
 	UI_PAGE_BLANK = 0,   /* display off — the resting state */

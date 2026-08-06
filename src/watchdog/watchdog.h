@@ -29,9 +29,17 @@ void watchdog_init(void);
  * still starves the watchdog and forces a recovery reset.
  *
  * Call from a loop that is genuinely representative of the system doing its
- * job. Currently main()'s button-poll loop (every 50 ms), chosen because it
- * is also what services the 3 s left-button hold into DFU: if it stops
- * running, the watch has lost its only on-device route back to a reflash.
+ * job. Currently main()'s idle loop, every 500 ms. It used to be a 50 ms
+ * button-poll loop and was chosen for it — that loop also serviced the hold
+ * gesture into DFU, so its stopping meant the watch had lost its only
+ * on-device route back to a reflash. Gesture recognition has since moved to
+ * buttons.c and its own work queue, leaving main() with nothing to poll for,
+ * so the rate was relaxed: it no longer has any input latency to service and
+ * only has to stay well inside the hardware window.
+ *
+ * main() runs at the lowest priority in the system, which is what still makes
+ * this a meaningful liveness signal — if it stops being scheduled, something
+ * has gone badly wrong regardless of which subsystem caused it.
  *
  * Safe to call from any context (a single atomic store).
  */

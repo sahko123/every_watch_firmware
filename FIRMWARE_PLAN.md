@@ -1,14 +1,21 @@
 # Every Watch — Firmware Plan
 
-> **Note on the IMU:** this document was written against a BMI270 and the
-> remaining BMI270 references below are stale. The BOM has always specified a
-> **BMI260** (a parts-availability decision). The two are BMI2-family siblings
-> with near-identical register maps, but they are not drop-in: the BMI260
-> reports chip ID `0x27` vs the BMI270's `0x24`, and each needs its own
-> feature-engine config blob. Zephyr/NCS ship no BMI260 driver, so the IMU is
-> currently non-functional — see README.md's "Known open items". Treat the
-> BMI270-specific detail below (driver name, `CONFIG_BMI270`, step-counter
-> assumptions) as a description of the original plan, not of the hardware.
+> **This is the original design plan, kept as a record of intent.** The built
+> firmware has diverged from it in several places. Where the two disagree, the
+> code and README.md are right and this document is not. Known divergences:
+>
+> | This document says | The firmware actually does |
+> |---|---|
+> | BMI270, `CONFIG_BMI270`, upstream Zephyr driver | **BMI260**, `CONFIG_BMI260`, in-repo driver at `modules/bmi260`. Always the BOM part; a parts-availability decision. Chip ID `0x27` vs the BMI270's `0x24`, and each needs its own feature-engine blob, so they are not drop-in. Working — the "IMU non-functional" this note used to carry is resolved |
+> | LED matrix driven by four **SPI** masters, 9 bytes/LED, `ws2812_encode()` | Four **PWM** instances (PWM0-3) + EasyDMA generating the pulse-width waveform directly, 24 PWM words/LED. Moved because SPI could not hold T1H in spec. Every "SPI" reference in the LED sections below is stale; the parallel-DMA reasoning around it still holds |
+> | Wrist tilt (BMI270 INT2) wakes the display | The *hardware* any-motion trigger does not work on the BMI260 and is disarmed. The wake itself exists, done in software from raw acceleration — `CONFIG_EW_IMU_MOTION_WAKE` in `src/imu/imu.c` |
+> | Step counter | Never implemented |
+> | Images signed with a key | No signature at all. SHA-256 only: integrity, not authenticity, chosen deliberately — see `child_image/mcuboot.conf` |
+> | System power management drives deep sleep | `CONFIG_PM` is deliberately **not** set — it silently did nothing on this SoC under NCS 2.7. Idle relies on the SoC's own System ON low-power on WFI. Power figures below are targets, never measured |
+> | Left button held enters DFU | **Both** buttons held. See README.md's button table for the current map |
+>
+> The hardware summary, pin map, LED wiring/snake mapping, layer compositor
+> model and BLE protocol below are all still accurate.
 
 ## Hardware Summary
 

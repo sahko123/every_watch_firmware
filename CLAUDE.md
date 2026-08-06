@@ -38,18 +38,20 @@ Board target is **`every_watch/nrf52833`** (HWMv2 format) — not
 west build -b every_watch/nrf52833 every_watch_firmware -d build_bringup -- -DEXTRA_CONF_FILE=bringup.conf
 ```
 
-Other build variants (production, USB-CDC console, stage0) are in README.md.
+Other build variants (production, USB-CDC console, RSSI monitor, channel
+survey) are in README.md.
 This project builds through the legacy child_image path
 (`child_image/mcuboot.conf`), not sysbuild — the stale `sysbuild/` config
 that used to warn about this has been removed entirely, so there's nothing
 left to accidentally invoke.
 
-**Two files outside this repo, at `C:\ewdev\zephyr` and
-`C:\ewdev\bootloader\mcuboot`, are hand-patched** to make MCUboot's watchdog
-actually work on this SoC (see `patches/README.md`). A `west update` or a
-fresh workspace checkout loses them silently — run `sh patches/apply.sh
-/c/ewdev` afterward, or the watchdog silently goes back to being inert
-plumbing with no error to notice by.
+**Three files outside this repo, under `C:\ewdev\zephyr`,
+`C:\ewdev\bootloader\mcuboot` and `C:\ewdev\nrf`, are hand-patched** (see
+`patches/README.md`). Two make MCUboot's watchdog actually work on this SoC;
+the third lets `CONFIG_BOOT_SIGNATURE_TYPE_NONE` build at all. A `west update`
+or a fresh workspace checkout loses them silently — run `sh patches/apply.sh
+/c/ewdev` afterward. The signing one fails the build loudly if it is missing;
+the watchdog ones just revert to inert plumbing with no error to notice by.
 
 ## Flashing over USB DFU
 
@@ -66,17 +68,25 @@ sh /c/ewdev/flash_usb.sh /c/ewdev/build_bringup/zephyr/app_update.bin
 ```
 
 DFU entry is **persistent, not timed**: hold the left button through a reset
-(or the in-app 3 s hold) and MCUboot waits indefinitely in USB DFU
+(or hold both buttons in-app, which reboots into it) and MCUboot waits
+indefinitely in USB DFU
 (`CONFIG_BOOT_USB_DFU_GPIO`) until a transfer completes — this was deliberately
 changed from a 5-second window so there's time to sort out drivers/Zadig
 without racing a timeout.
 
 **First flash on new hardware, or any MCUboot change, must be over SWD** — USB
-DFU is provided *by* MCUboot, so it can't bootstrap itself. SWD is also the
-only recovery path if the app is invalid: no reset pin, no watchdog armed yet,
-so a bad image halts at `FIH_PANIC` permanently. Fixing that (arming a
-watchdog in MCUboot) is blocked on bootloader flash space — it's at 97% of its
-48 KB partition, full plan in RECOVERY.md.
+DFU is provided *by* MCUboot, so it can't bootstrap itself.
+
+A bad *app* image, though, no longer needs SWD. That claim was true before the
+watchdog patches and outlived them: `MCUBOOT_WATCHDOG_SETUP()` is now the first
+statement in MCUboot's `main()` (line 450) and `FIH_PANIC` is at line 569, so a
+failed validation gets a 30 s watchdog reset rather than a permanent halt. The
+DFU button is sampled at line 486 — also before validation — so holding left
+through any cycle of that loop reaches USB DFU. Reasoned from the code ordering,
+not yet exercised by deliberately corrupting an image.
+
+Bootloader occupancy is 92% of its 48 KB partition (45,172 of 49,152 B); it has
+been as high as 97%, so re-measure before concluding anything fits.
 
 Verify a flash landed by checking the `2FE3` USB device disappeared (MCUboot
 validated the SHA-256 and chainloaded):
@@ -89,47 +99,69 @@ No device present = success.
 
 ## Architecture (src/)
 
-- `main.c` — boot sequence, boot-blink indicator, the two button-hold polling
-  loops (left = DFU reboot, right = battery readout)
-- `display/` — on/off state machine, 10 s auto-off timer, left-button press
-  interrupt (wakes display + starts time reveal)
+- `main.c` — boot sequence, boot-blink indicator, `usb_enable()` (as a
+  `SYS_INIT` hook, not from `main()` — see below), and forwarding button
+  gestures to the UI. It binds no gestures itself; that all lives in `ui.c`
+- `buttons/` — debounce and gesture recognition (single / double / hold /
+  both), on its own work queue at priority -2 so a busy USB stack cannot
+  starve sampling. Emits `BTN_EV_*`; binds nothing
+- `ui/` — page arbitration. One page owns the display at a time, each with its
+  own enter/exit and timeout, and every gesture binding is one `case` in
+  `ui_handle_button()`. Start here to change what a button does
+- `display/` — on/off state machine and the 10 s auto-off timer. Resumes and
+  suspends the sand and IMU threads with the panel, so nothing runs while dark
 - `time_display/` — 3×5 digit font (shared via `led_matrix.h`), HH:MM curtain
   reveal. Gated by an `active` flag: time only renders as the result of an
-  explicit reveal, never just because the display woke up for something else
-  (see "Recent changes" below)
+  explicit reveal, never just because the display woke for something else.
+  Also auto-recovers the RTC's voltage-low flag (see below)
 - `led_matrix/` — WS2812B encoding, 4-layer compositor (notification > sand >
-  digits > bg), parallel DMA commit, ambient-brightness + current-budget
-  scaling, shared glyph stamping (`led_stamp_digit`/`led_stamp_percent`)
+  digits > bg), parallel DMA commit, ambient-brightness + gamma +
+  current-budget scaling, shared glyph stamping
+  (`led_stamp_digit`/`led_stamp_percent`), and the `led` shell command group
 - `sand/` — falling-sand cellular automaton, 30 Hz, free mode + two reveal
-  modes (curtain rain, column fill)
-- `battery/` — BQ27441 fuel gauge polling, low-battery indicator, the
-  percentage readout screen (see "Recent changes")
-- `light/` — BH1750 ambient light → `led_brightness`, sampled on button press
-  (see "Recent changes")
-- `imu/`, `identity/`, `ble/`, `selftest/` — not touched recently; see
-  FIRMWARE_PLAN.md
+  modes (curtain rain, column fill). Its thread also drives the panel commit,
+  so it is what refreshes the display on any page that needs it
+- `battery/` — BQ27441 fuel gauge polling, VBUS cable detection, low-battery
+  indicator, percentage readout screen
+- `light/` — BH1750 ambient light → `led_brightness`, adaptively polled (1 s
+  for a minute after any interaction, then 10 s), and only while the display
+  is off so the LEDs cannot feed back into the sensor
+- `time_sync/` — the `settime <unix-epoch>` shell command, reachable over USB
+  CDC in the normal image
+- `watchdog/` — feeds the watchdog MCUboot started, but only if something has
+  called `watchdog_alive()` since the last feed
+- `imu/` — BMI260 accelerometer. Feeds sand gravity while the display is on,
+  and watches for motion to wake it while off (`CONFIG_EW_IMU_MOTION_WAKE`,
+  software — the hardware any-motion trigger does not work on this part)
+- `identity/`, `ble/`, `selftest/` — see FIRMWARE_PLAN.md
 
 ## Hardware quirks (PCB rev 1)
 
 - **No 32.768 kHz crystal, no I2C pull-ups** — both will hang or damage the
   board without the firmware workarounds already in place. Don't "fix" the
   devicetree to assume normal crystal/pull-up hardware.
-- **No reset pin.** This is why DFU entry has no software escape and why
-  `FIH_PANIC` is currently unrecoverable without SWD.
+- **No reset pin.** This is why DFU entry has no software escape, and why
+  unplugging USB restarts nothing — the watch keeps running off its own cell.
+  The watchdog is what provides the reset that this pin would have.
 - **VBUS *is* connected** to USB 5 V, contrary to what this file said until
   2026-08-03. The nRF52833 senses it through the POWER peripheral —
   `USBREGSTATUS.VBUSDETECT` plus the `USBDETECTED`/`USBREMOVED` events — so no
   GPIO is involved and nothing needs adding to the devicetree to read it.
 
-  As of `battery.c`'s `vbus_init()` this is now used, as `battery_cable_present()`
-  — see "Recent changes" below. One decision made on the assumption it was
-  absent is still worth revisiting:
+  Used by `battery.c`'s `vbus_init()` as `battery_cable_present()`, OR'd with
+  the fuel gauge's current reading to decide "on power" — current alone tapers
+  to ~0 near a full charge, which reads identically to unplugged.
 
-  - The USB CDC console has to be a **separate build variant**
-    (`bringup_usb.conf`) because an always-on USB stack costs idle current. With
-    VBUS detectable, USB can be brought up only while a cable is present, which
-    would put the `settime` shell command in the normal image instead of a
-    variant that has to be flashed specially.
+  Note `vbus_init()` steps aside at runtime whenever `CONFIG_USB_DEVICE_STACK`
+  is compiled in, because Zephyr's USB driver wants the same POWER peripheral
+  events. That is the normal image now, not just the console variants, so
+  cable detection there falls back to fuel-gauge current alone.
+
+  The normal image carries a USB CDC **shell** (not console/logging) so
+  `settime` is reachable without a special build. It is enabled
+  unconditionally rather than gated on VBUS: gating would mean driving
+  Zephyr's own USB VBUS handling instead of the `nrfx_power` hookup above, and
+  that is real unverified work rather than a config line.
 - **The internal DC/DC is off deliberately — do not enable it.** VDD comes from
   an external 3.3 V regulator, so the SoC runs in normal LDO mode. Enabling
   `CONFIG_BOARD_ENABLE_DCDC` requires inductors on the `DCC` pins that this
@@ -148,49 +180,61 @@ No device present = success.
   unverified on hardware; if it's not firing, plug-in detection still works
   via the 15 s poll, just slower.
 
-## Recent changes (uncommitted as of this writing — see below)
+## Buttons
 
-- **Battery percentage screen**, right button hold, opened manually only —
-  plugging in does *not* show it by itself (`battery.c`,
-  `battery_show_level()`). Colour: blue discharging, green while on power
-  (cable attached, whether or not current is actually flowing — see VBUS
-  below), with a travelling hue shimmer only while current is genuinely
-  flowing; red under 20% regardless. SoC reading is smoothed (`pct_filt` in
-  `battery_work_fn()`) since the fuel gauge's own filtered value still steps
-  a few points poll to poll.
-- **Promotion, not auto-popup**: if the screen happens to be open (from a
-  hold) and the watch turns out to be on power, `battery_work_fn()` cancels
-  its normal auto-return timeout (`ui_cancel_timeout()`) so it stays open
-  and keeps refreshing instead of fading out mid-charge. A quick right-press
-  (`BTN_EV_R_SINGLE` in `ui.c`) or unplugging dismisses it either way. This
-  replaced an earlier design where plugging in opened the screen
-  automatically and hijacked whatever page was in use — removed because it
-  meant you couldn't use the watch normally while charging.
-- **VBUS detection** (`battery.c`, `vbus_init()`): the nRF52833's POWER
-  peripheral senses USB power directly (`nrfx_power` USBDETECTED/REMOVED
-  events), no GPIO involved. Used as `battery_cable_present()`, OR'd with
-  the fuel gauge's current reading to decide "on power" — current alone
-  tapers to ~0 near a full charge, which used to read identically to
-  "unplugged". Skipped at runtime on the USB-console build variant
-  (`CONFIG_USB_DEVICE_STACK`), which needs the same peripheral for its own
-  USB stack.
-- **RSSI monitor** (`ble.c`, `CONFIG_EW_BLE_SCAN_DEBUG`): prints a live
-  table of every BLE device heard — address, name, RSSI, packet count, age —
-  refreshed every 3 s, not just logged once per device like it used to be.
-  Its own build variant, `rssi_monitor.conf` — see README.md.
-- **Time-display holdover fix**: previously, waking the display for any
-  reason (a bare right-press, the battery screen dismissing) could show time
-  instantly with no reveal, because the digit layer was kept live in the
-  background continuously. Fixed with the `active` flag in `time_display.c` —
-  see that file's comments before changing display-wake paths.
-- **Ambient light**: sampled on button press (`light_sample_now()`, called
-  from `display.c`'s button ISR and `main.c`'s right-button hold loop) instead
-  of a fixed 2 s timer. Darkness floor and room-light band are tuned by feel
-  on the actual (custom, non-standard) LEDs, not measured — expect to retune
-  with `led ambient`/`led max` in the shell rather than trusting the lux
-  breakpoints in `light.c` as calibrated.
+All bindings live in `ui_handle_button()` (`ui.c`) — one `case` each. Current
+map, with `HOLD_MS` at **2 s**:
 
-**None of this is committed yet.** `git status` in `C:\ewdev\every_watch_firmware`
-will show it. If you're picking this up in a fresh context, check there before
-assuming a clean tree — this checkout (if you're reading this file from the
-non-`C:\ewdev` copy) won't have it until it's pushed and pulled.
+| Gesture | Effect |
+|---|---|
+| Left, press | Clock page; re-pressing restarts the reveal |
+| Right, press | Toggles the sand toy; dismisses the battery page if it's up |
+| Right, hold | Battery percentage (no-op if already showing) |
+| Both, hold | Reboots into MCUboot USB DFU |
+| Left hold, either double | Recognised by `buttons.c`, deliberately unbound |
+
+Note **both** buttons for DFU, not left — left-hold is free. That is separate
+from MCUboot's own DFU entry, which is the *left* button held through a reset
+and is a bootloader feature this firmware has no part in.
+
+## Things that will bite
+
+- **Ambient brightness is gamma-corrected** (`led_gamma`, default 2). The
+  numbers in `light.c`'s `lux_to_brightness()` are perceptual, not duty cycle:
+  the floor of 24 is 0.88% duty, not 9.4%. Change the gamma and that whole
+  curve needs re-checking. `led show` prints the duty the knobs work out to.
+- **The brightness floor is set by resolution, not taste.** At ~1% duty a
+  whole colour spans 2-3 LSB and hue starts collapsing under rounding.
+  Dithering was tried twice to get past this — ordered (spatial) and
+  error-feedback (temporal), the latter at up to 125 Hz refresh — and both
+  were removed: the error has to surface as either visible texture or visible
+  flicker, and eight bits at 1% duty simply does not carry the information.
+  Raise the floor rather than reaching for a filter. See `light.c`'s comment.
+- **Sensor drivers here do not implement `PM_DEVICE`.** BMI260, BH1750 and the
+  custom FRTC8900 all pass `NULL` as the PM device, so `pm_device_action_run()`
+  returns `-ENOSYS` and does nothing — silently, if the result is discarded.
+  Both `imu.c` and `light.c` were caught by this; the IMU one left the
+  accelerometer converting the whole time the display was off. Power sensors
+  down through the driver's own API instead (for the BMI260, an ODR of zero
+  clears `PWR_CTRL_ACC_EN`).
+- **The RTC sets its own voltage-low flag** on any supply dip below ~1.6 V, and
+  once set, `rtc_get_time()` returns `-ENODATA` forever until something calls
+  `rtc_set_time()`. `time_display.c`'s `read_time()` now detects that and
+  reseeds a placeholder automatically, so a dip shows 00:00 rather than a
+  permanently blank clock. Confirmed on hardware by reading FLAG register 0x0E.
+- **`usb_enable()` must run from a `SYS_INIT` hook, not `main()`.** The shell
+  backend checks `device_is_ready()` on the CDC UART exactly once, during its
+  own `POST_KERNEL` init, and never retries — `main()` runs after all of that,
+  so enabling USB there enumerates the port but leaves the shell dead. See the
+  comment on `usb_enable_early()` in `main.c` before moving it.
+- **Buttons run on their own work queue at priority -2.** The system and USB
+  work queues are both -1 and `CONFIG_TIMESLICE_SIZE` is 0, so USB activity
+  could occupy the system queue long enough for a whole press to fall between
+  two 15 ms samples and vanish. Don't move button sampling back onto the
+  system queue.
+
+## Current state
+
+Check `git status` in `C:\ewdev\every_watch_firmware` before assuming a clean
+tree — this checkout (if you're reading this from the non-`C:\ewdev` copy) is
+only current as far as the last push.

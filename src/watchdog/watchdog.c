@@ -23,10 +23,11 @@ static int wdt_channel = -1;
  * running happily, feeding a watchdog that would then never fire.
  *
  * So the ISR only feeds if something has called watchdog_alive() since the
- * last tick. main()'s button-poll loop calls it every 50 ms, which makes
- * that loop the liveness point: it is also the loop that services the 3 s
- * left-button hold into DFU, so if it stops running the watch has lost the
- * one on-device path back to a reflash — precisely when a reset is wanted.
+ * last tick. main()'s idle loop calls it every 500 ms, which makes that loop
+ * the liveness point — and it runs at the lowest priority in the system, so
+ * anything starving it has starved everything above it too. See watchdog.h
+ * for why the rate was relaxed from the 50 ms it used when that same loop
+ * still polled the buttons.
  */
 static atomic_t alive = ATOMIC_INIT(1);
 

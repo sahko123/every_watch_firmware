@@ -1,13 +1,38 @@
 # Vendored SDK patches
 
-Two small patches to the west workspace's own `zephyr` and `bootloader/mcuboot`
-checkouts (at `C:\ewdev`, *outside* this repo) — not tracked by git anywhere
-except here, so a `west update` or a fresh workspace checkout on another
-machine silently loses them unless reapplied.
+Three small patches to the west workspace's own `zephyr`, `bootloader/mcuboot`
+and `nrf` checkouts (at `C:\ewdev`, *outside* this repo) — not tracked by git
+anywhere except here, so a `west update` or a fresh workspace checkout on
+another machine silently loses them unless reapplied.
 
-## Why these exist
+**Without them the build either fails outright (the hash-only one) or silently
+loses a safety property (the two watchdog ones).**
 
-Both close the same gap: on this SoC, MCUboot's own watchdog support never
+## Hash-only images
+
+- **`nrf-imgtool-hash-only.patch`** (`nrf`) — makes `--key` conditional in
+  `modules/mcuboot/CMakeLists.txt` so `CONFIG_BOOT_SIGNATURE_TYPE_NONE=y`
+  actually builds.
+
+  NCS passes `--key ${mcuboot_key_file}` to imgtool unconditionally. With no
+  signature configured there is no key, so `mcuboot_key_file` falls through to a
+  "use the default key" branch that resolves to the mcuboot module *directory*
+  rather than a file, and imgtool dies with `PermissionError`. The patch skips
+  both that fallback and the `getpub` key validation when no key is configured,
+  and drops the two `--key` arguments from the imgtool command line.
+
+  This is what lets the project ask for integrity without authenticity: images
+  carry a SHA-256 TLV and no signature, `CONFIG_BOOT_VALIDATE_SLOT0` still
+  rejects a corrupt or half-written upload on every boot, and the bootloader
+  stops paying flash for signature-verification code and an embedded public key
+  that were checked against a test key MCUboot publishes to the world. Worth
+  ~4.6 KB of a 48 KB partition. See `child_image/mcuboot.conf`.
+
+  **Unapplied, the build fails** — loudly, unlike the two below.
+
+## Watchdog
+
+Both of these close the same gap: on this SoC, MCUboot's own watchdog support never
 actually arms anything. See `RECOVERY.md` and `child_image/mcuboot.conf`'s
 comments for the full story — short version, `CONFIG_WDT_NRFX` (the only nRF
 watchdog driver) unconditionally selects `CONFIG_NRFX_WDT0`, which itself
@@ -34,9 +59,11 @@ unreachable on this hardware no matter what's enabled via Kconfig.
   - In any other state, feed only while a download block has actually been
     written to flash within the last 5 minutes. Once nothing has, stop
     feeding on purpose so the 30 s hardware timeout catches up and resets —
-    turning "wedged forever, only SWD gets you out" (this board has no VBUS
-    sense, so unplugging the cable doesn't reset the chip) into "self-heals
-    within a few minutes."
+    turning "wedged forever, only SWD gets you out" into "self-heals within a
+    few minutes." Unplugging the cable is not an escape: the watch keeps
+    running off its own battery, and there is no reset pin. (The SoC *can*
+    sense VBUS, through the POWER peripheral — see `battery.c` — but sensing it
+    is not the same as being powered by it, and MCUboot does not look.)
 
   Progress is tracked with a dedicated `dfu_progress_ctr`, bumped in
   `dfu_flash_write()`. **Do not be tempted to use `dfu_data.block_nr` for

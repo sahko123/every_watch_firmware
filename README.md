@@ -5,8 +5,10 @@ matrix, a falling-sand simulation that reveals the time as particles clear, and
 a BLE proximity-encounter system.
 
 Open by design — build it, modify it, flash it. The BLE protocol is documented
-so anyone can write a companion app, and images are unsigned so you don't need
-our keys.
+so anyone can write a companion app, and images genuinely are unsigned — the
+bootloader verifies a SHA-256 hash and nothing else, so there are no keys to
+need. That is integrity without authenticity, chosen deliberately: see
+`child_image/mcuboot.conf`.
 
 See [FIRMWARE_PLAN.md](FIRMWARE_PLAN.md) for hardware detail and architecture.
 
@@ -113,31 +115,31 @@ sh /c/ewdev/rtt.sh                 # in one terminal, leave running
 python tools/channel_survey_plot.py  # in another
 ```
 
-Approximate sizes (slot is 450,048 B):
+Sizes — the app slot is 450,048 B and RAM is 128 KB:
 
 | Build | Flash | RAM |
 |---|---:|---:|
-| Production | 229 KB (51%) | 38 KB (29%) |
-| Bring-up, RTT | 353 KB (78%) | 52 KB (40%) |
-| Bring-up, USB CDC | 373 KB (83%) | 59 KB (45%) |
-| RSSI monitor | 278 KB (63%) | 49 KB (38%) |
-| Channel survey | 279 KB (63%) | 48 KB (38%) |
+| Production | 294,628 B (65%) | 64,028 B (49%) |
+| MCUboot (48 KB partition) | 45,172 B (92%) | 21,352 B (16%) |
+
+The console variants all land higher — RTT's buffers and the USB stack are the
+two expensive additions — but the figures previously tabulated here had drifted
+badly, so rather than quote numbers that are wrong again in a month, measure
+whichever you care about: every build prints its own report at the end of the
+link step, and
+
+```bash
+west build -d build_bringup 2>&1 | grep -E "FLASH:|RAM:"
+```
+
+reprints it. Note each build emits **two** reports, MCUboot first and the
+application second.
 
 > This app builds through the legacy child-image path
 > (`child_image/mcuboot.conf`), not sysbuild. The stale `sysbuild/` config
 > that used to disagree with it on single-slot/USB DFU settings has been
 > removed — there's no `--sysbuild` flag to avoid anymore, it just isn't
 > wired up.
-
-**Stage 0** — the minimal first-power-on image. No sensor drivers, no RTC
-driver, no SPI, no BLE, no LED matrix: nothing that can hang during driver init
-on an unproven board. Scans the I2C bus, reads the GPIOs, and drops you at a
-shell. Flash this first on a board that has never been powered:
-
-```bash
-west build -b every_watch/nrf52833 every_watch_firmware -p always -d build_stage0 \
-    -- -DCONF_FILE=stage0.conf -DEXTRA_DTC_OVERLAY_FILE=stage0.overlay
-```
 
 ## Flashing
 
@@ -146,12 +148,17 @@ MCUboot has to be on the chip before USB flashing can work at all. The same
 applies to any later change to MCUboot itself — a bootloader cannot replace
 itself over the update path it provides.
 
-**SWD is still required for recovery.** There is no reset pin and no
-user-accessible power cycle, so "hold the button and apply power" needs the
-battery disconnected. If the app is invalid, MCUboot hits `FIH_PANIC` and halts
-with no watchdog to restart it. Closing this needs MCUboot to start the
-watchdog before chainloading, which does not fit until the RSA-2048 test-key
-signature comes out — the bootloader is at 97% of its 48 KB partition.
+**A bad app image no longer needs SWD.** MCUboot arms a 30 s watchdog as the
+very first thing it does (`MCUBOOT_WATCHDOG_SETUP()` at the top of its `main()`,
+supplied by `patches/mcuboot-watchdog-setup.patch`), and `FIH_PANIC` on a failed
+image validation comes much later. So a corrupt app now produces a ~30 s reset
+loop rather than a permanent halt — and because the DFU button is sampled
+*before* validation, holding the left button through any cycle drops you into
+USB DFU. This follows from the code ordering; it has not been exercised by
+deliberately corrupting an image.
+
+SWD is still required for the first flash on a new board, for any MCUboot
+change, and if the bootloader itself is damaged.
 
 ### With a Raspberry Pi Pico (no commercial debugger needed)
 
@@ -213,10 +220,13 @@ west flash -r jlink
 west flash -r dfu-util
 ```
 
-**After that, updates go over USB.** Hold the **left button for 3 seconds** —
-the app reboots into MCUboot — and **keep holding through the reset**. MCUboot
-samples the button before booting the app and stays in USB DFU indefinitely, so
-there is no window to race. Release once it enumerates.
+**After that, updates go over USB.** Hold **both buttons for 2 seconds** — the
+app reboots into MCUboot — and **keep the left button held through the reset**.
+The two gestures are different on purpose: both buttons is the *application's*
+binding for "reboot me into the bootloader", while the **left** button is what
+*MCUboot itself* samples at boot to decide whether to stay in DFU. It then waits
+in USB DFU indefinitely, so there is no window to race. Release once it
+enumerates.
 
 ```bash
 dfu-util -d 2fe3:ffff -a 0 -D build/zephyr/app_update.bin
@@ -249,7 +259,39 @@ Target `2fe3:ffff` directly when the device is already in DFU mode. Passing
 `-d 2fe3:0100` makes dfu-util issue a detach and then lose the device across
 the re-enumeration, because it does not follow the PID change.
 
-## Watching the console
+## The shell
+
+### On the production image, over USB
+
+The normal image carries a **shell over USB CDC** — no special build, no
+debugger. Plug the watch in and open the virtual COM port with any terminal at
+any baud rate (CDC ignores it). This is the shell only: logging and `printk`
+still go nowhere on this image, so it is for issuing commands, not watching
+boot.
+
+```
+settime <unix-epoch-seconds>    set the RTC
+led show                        current brightness settings and the resulting duty
+led ambient <0-255>             force a brightness level
+led auto <0|1>                  hand the level back to the light sensor, or take it
+led gamma <1-3>                 perceptual curve on ambient; 2 is the default
+led max <0-255>                 per-pixel ceiling (255 = off)
+led budget <units>              total current budget
+sand fill [percent]             seed random coloured grains
+sand clear / sand count
+i2c read_byte i2c@40003000 <addr> <reg>
+```
+
+`led ambient` will not stick on its own — the light sensor rewrites it on every
+poll taken while the display is off. Use `led auto 0` first to hold a level
+still, which is the only way to compare two settings by eye.
+
+> USB is enabled from a `SYS_INIT` hook rather than `main()`, and it has to be:
+> the shell backend checks the CDC device exactly once during its own init and
+> never retries, so enabling USB from `main()` enumerates a port that never
+> responds. See `usb_enable_early()` in `src/main.c`.
+
+### On the bring-up images, over RTT
 
 Logs are on RTT buffer 0, the interactive shell on buffer 1.
 
@@ -269,16 +311,13 @@ With a J-Link:
 JLinkRTTViewer            # or: JLinkRTTClient
 ```
 
-USB CDC build: open the virtual COM port with any terminal at any baud rate
-(CDC ignores it).
-
 ## First bring-up
 
 Flash the RTT bring-up image over SWD and watch the console. `CONFIG_EW_SELFTEST`
 runs before any application thread starts and reports PASS/FAIL for:
 
 - **I2C** — full bus scan, then a targeted probe of all four expected devices
-  (0x23 BH1750, 0x32 FRTC8900, 0x55 BQ27441, 0x68 BMI270)
+  (0x23 BH1750, 0x32 FRTC8900, 0x55 BQ27441, 0x68 BMI260)
 - **RTC** — set a known time, read it back, confirm seconds advance. This is the
   riskiest part of the system: the FRTC8900 driver is custom, out-of-tree, and
   has never run on hardware
@@ -301,9 +340,6 @@ than bring-up.
 
 ### Known open items
 
-Things to check with a scope or meter on first hardware, all flagged in the
-source:
-
 - **~~WS2812B T1H marginally out of spec~~ — resolved.** The LED matrix moved
   from SPI to PWM0-3 + EasyDMA (see `led_matrix.c`); T1H is now 812.5 ns,
   comfortably mid-spec (datasheet 800 ns ±150). Left here as a record in case
@@ -311,27 +347,52 @@ source:
 - **~~Row 6 locks interrupts for ~585 µs per frame~~ — resolved.** Row 6 now
   runs on PWM3 (P0.03) alongside the other three lines, same as the item
   above — no more bit-banging, no more interrupt lock.
-- **BMI270 IMU fails its chip-ID check on the current bench unit.** Consistent
-  on repeated resets (reads chip ID 0x27, expects 0x24) — suspected signal
-  integrity issue given this board has no external I2C pull-ups, but not
-  confirmed. Wrist-tilt wake and sand-mode gravity are both non-functional
-  until this is resolved. Not caused by firmware — the fault happens at
-  driver-init time before any application code runs.
-- **LFXO not confirmed.** The DTS assumes the internal RC oscillator. If a
-  32.768 kHz crystal is populated, enable it (`&clock { lf-clk-src = <1>; }`)
-  for better BLE timing and lower power
-- **Fuel gauge capacity is a placeholder.** `design-capacity = <300>` in the DTS
-  must match the real cell or state-of-charge readings will be wrong
-- **IMU axis signs are unverified.** Tilting right should push sand right
-  (moot until the chip-ID fault above is resolved)
-- **No deep sleep yet.** `CONFIG_PM=y` is set but nothing drives it; BLE scans
-  and advertises continuously. The power figures in FIRMWARE_PLAN.md are targets,
-  not measurements
-- **Button UX is partial.** Left button: press wakes the display and starts
-  the time reveal; 3 s hold reboots into DFU. Right button: 3 s hold shows the
-  battery percentage (a no-op if the charging view is already up); a bare
-  press does nothing on its own. Short/long mapping beyond this does not exist
-  yet
+- **~~IMU fails its chip-ID check~~ — resolved.** The part is a BMI2**60**, not
+  the BMI270 the firmware originally assumed; chip ID 0x27 was the correct
+  answer to a question being asked of the wrong driver. An in-repo BMI260
+  driver module fixed it, and the accelerometer then needed explicitly powering
+  up (the driver leaves it off until a sampling frequency is set). Sand gravity
+  and the axis mapping both work.
+- **Wrist-tilt wake does not work and is disarmed.** The BMI260's any-motion
+  feature-register layout differs from the BMI270's and Bosch treat the map as
+  NDA material, so the trigger can be armed but never fires — verified over 50 s
+  of deliberate movement with the display off. The code is left compiled but
+  unbound behind `CONFIG_EW_IMU_ANYMOTION_WAKE`. Tap-to-wake is documented for
+  this part and is the most likely replacement; see the block comment above
+  `motion_trigger_handler()` in `src/imu/imu.c`.
+- **Fuel gauge capacity needs checking against the fitted cell.**
+  `design-capacity = <400>` (mAh) in the DTS — state-of-charge readings are
+  wrong if this does not match.
+- **Idle current is unmeasured.** The figures in FIRMWARE_PLAN.md are targets.
+  BLE scans and advertises continuously, and `CONFIG_PM` is deliberately not
+  set — see `prj.conf`, where the reasoning is written out: it silently did
+  nothing on this SoC in NCS 2.7 for a long time. `CONFIG_PM_DEVICE` is on but
+  buys nothing for the sensors, because none of their drivers implement PM
+  actions.
+- **Colour resolution runs out at the bottom of the brightness range.** At the
+  darkness floor a whole colour spans 2-3 of the WS2812B's 256 levels, so hue
+  degrades as it dims. Both ordered and temporal dithering were implemented and
+  removed — see `src/light/light.c`'s `lux_to_brightness()` comment for the
+  measurements and why raising the floor is the real lever.
+
+## Buttons
+
+Two buttons, all gestures recognised by `src/buttons/` and bound in one
+`switch` in `src/ui/ui.c`. A hold is 2 s.
+
+| Gesture | Effect |
+|---|---|
+| Left, press | Clock page — falling-sand time reveal. Pressing again restarts it |
+| Right, press | Toggles the sand toy on and off; dismisses the battery page if it is up |
+| Right, hold | Battery percentage |
+| Both, hold | Reboots into the MCUboot USB DFU bootloader |
+| Left hold, and either double-press | Recognised, deliberately unbound |
+
+Note that **both** buttons trigger DFU, not the left one. That is separate from
+MCUboot's own DFU entry, which is the *left* button held through a reset and is
+a bootloader feature the application has no part in — see Flashing above.
+
+The display sleeps 10 s after the last interaction.
 
 ## Layout
 
@@ -339,14 +400,21 @@ source:
 boards/arm/every_watch/   board definition, pinctrl, flash partitions
 child_image/mcuboot.conf  MCUboot config (single-slot + USB DFU) — the live one
 pm_static.yml             static flash layout
+patches/                  patches to the SDK itself, outside this repo — read this
+modules/bmi260/           in-repo IMU driver (nothing upstream supports this part)
+src/main.c                boot sequence, USB enable, watchdog liveness loop
+src/buttons/              debounce and gesture recognition, own work queue
+src/ui/                   page arbitration — every button binding lives here
+src/display/              on/off state, auto-off timer, thread suspend/resume
 src/led_matrix/           WS2812B encoding, compositor, parallel DMA commit
-src/sand/                 falling-sand cellular automaton, 30 Hz
+src/sand/                 falling-sand cellular automaton, 30 Hz; drives commits
 src/time_display/         3×5 digit font, HH:MM onto the digit layer
-src/display/              on/off state, button interrupts, auto-off timer
-src/imu/                  BMI270 → gravity vector
+src/imu/                  BMI260 → gravity vector
 src/identity/             watch identity hash, encounter counters in NVS
 src/ble/                  advertising, encounter scanning, GATT, notifications
 src/battery/ src/light/   fuel gauge and ambient light
+src/time_sync/            the settime shell command
+src/watchdog/             feeds the watchdog MCUboot armed
 src/selftest/             bring-up hardware self-test (CONFIG_EW_SELFTEST)
 ```
 

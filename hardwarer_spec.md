@@ -27,3 +27,18 @@ P0.05 for chrg indicator from an SGM41524
 P0.15 button right
 P0.17 button left
 P1.09 battery monitor gpout
+
+# Not on a pin
+USB VBUS is connected to the SoC's USB 5 V input and is sensed inside the
+nRF52833 by the POWER peripheral (USBREGSTATUS.VBUSDETECT, plus the
+USBDETECTED/USBREMOVED events). No GPIO is involved and nothing is needed in
+the devicetree to read it — see vbus_init() in src/battery/battery.c. Look here
+first before wiring up a pin for cable detection.
+
+There is no reset pin. This is why a bad image can only be recovered over SWD,
+and why unplugging USB does not restart anything (the watch runs from its own
+battery).
+
+The SGM41524 on P0.05 is a standalone charger, not an I2C part. That pin is its
+entire interface; charge current and termination are set by hardware. Its
+absence from an I2C scan is correct, not a fault.

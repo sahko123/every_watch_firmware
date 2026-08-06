@@ -213,11 +213,20 @@ static K_MUTEX_DEFINE(ui_mutex);
  * like a power cut. Page-to-page switches still cut, because there is new
  * content arriving immediately to look at.
  *
- * Runs on the system workqueue, which is also where buttons.c samples its
- * gesture state machine every 15 ms — so this stalls input for its duration.
+ * Blocks its caller for FADE_STEPS * FADE_STEP_MS, and where that lands is
+ * worth knowing: ui_goto() is reached both from the page timeout (system
+ * workqueue) and from ui_handle_button() (buttons.c's own queue). On the
+ * latter path this sleeps on the very queue that samples the gesture state
+ * machine every 15 ms, so a button-initiated dismiss stalls input for its own
+ * duration.
+ *
  * That is why it is this short: 100 ms is about six sample periods, and a
  * deliberate press lasts longer than that, so nothing a user actually means is
- * lost. Do not lengthen it without moving it off this queue.
+ * lost. Do not lengthen it without moving it off the caller's thread.
+ *
+ * (This used to say the stall was because both ran on the system workqueue.
+ * That stopped being true when buttons moved to a dedicated higher-priority
+ * queue — the conclusion survived the change, the reason did not.)
  *
  * If the sand thread happens to be running it commits its own frames in
  * between these, which is harmless — it reads the same led_fade.
