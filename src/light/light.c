@@ -73,25 +73,45 @@ static bool    br_filt_seeded;
  * led_max_brightness (32, ~12%), which compressed this whole 0-255 range into
  * a narrow output band and cost most of the colour resolution; that ceiling is
  * off by default now, so these values map to real drive levels and the current
- * budget handles the safety side. Anything tuned against the old behaviour is
- * worth revisiting — the top of this curve is roughly 8x brighter than it was.
+ * budget handles the safety side.
+ *
+ * THESE ARE PERCEPTUAL, NOT DUTY CYCLE. build_buffers() raises the value to
+ * led_gamma (default 2) before it reaches the LEDs, so the mapping is
+ * duty = (b/255)^2 — the floor of 24 is 0.88% duty, not 9.4%. Read anything
+ * here as "how bright should this look", and halving a number here really does
+ * roughly halve apparent brightness, which was not true before gamma existed.
+ *
+ * That correction is why the numbers below did not have to come down when the
+ * watch turned out to be far too bright in a dark room: gamma is anchored at
+ * both ends, so it left the sunlight end at full power (which the watch needs)
+ * and pulled the dark end down by more than 10x on its own.
  *
  * These breakpoints are a starting guess for a watch worn on a wrist and
  * looked at up close, not a measured calibration — this LED/diffuser
  * combination is custom, so there's no standard WS2812B brightness reference
- * to lean on. Expect to retune by eye on the actual hardware (`led ambient`
- * and `led max` in the shell force a level without waiting on the sensor).
+ * to lean on. Expect to retune by eye on the actual hardware (`led ambient`,
+ * `led gamma` and `led max` in the shell force a level without waiting on the
+ * sensor; `led show` prints the duty they work out to).
  *
  * The floor at 0 lux is deliberately not zero: full darkness should still
  * leave a dim, clearly-on glow, not a blackout — a watch that goes fully dark
  * when covered or face-down reads as broken, not power-saving.
  *
- * That floor was 16 and is now 24, because at 16 the densest part of the
- * waterfall tore holes in itself: 18% of the colour wheel's hues rounded to
- * black. 24 clears it, but only just — it is not the real fix, and should not
- * be treated as a value that can be lowered freely. build_buffers() now floors
- * any lit pixel to at least one channel, which is what actually makes this
- * robust; this bump is for headroom on top of it.
+ * The floor of 24 is now set by resolution rather than by taste, and that is
+ * the reason not to lower it. At gamma 2 a value of 24 scales sand amber
+ * (255,160,20) to (2,1,0) — dim, but the hue is already most of the way gone.
+ * By 18 it is (1,1,0) and by 16 every channel has rounded under half an LSB, so
+ * build_buffers()'s lit-pixel rescue clamps everything to a flat one-LSB white
+ * and the whole range below that is indistinguishable.
+ *
+ * There is no getting past that with cleverness — it was tried. Ordered and
+ * error-feedback dithering both reconstruct the colour correctly on average,
+ * and both were removed: at 2-3 LSB the error has to go somewhere, and it comes
+ * out as either visible static texture or visible flicker. Eight bits per
+ * channel at ~1% duty is simply not enough information, so the only real lever
+ * is to sit higher up the curve. If colours matter more than the last bit of
+ * dimness, raise this floor rather than reaching for a filter: 32 gives the
+ * peak channel 4 LSB and 40 gives it 6, where hue survives plain rounding.
  */
 static uint8_t lux_to_brightness(uint32_t lux)
 {
@@ -204,13 +224,18 @@ static void light_work_fn(struct k_work *work)
                 br_filt = (uint8_t)((br_filt * 3 + br) / 4);
             }
 
-            led_brightness = br_filt;
+            /* Keep filtering either way, so clearing the lock hands over a
+             * current value rather than one from whenever it was set. */
+            if (led_ambient_auto) {
+                led_brightness = br_filt;
+            }
             /* INFO, not DEBUG: this fires once per display-off and once a
              * minute while idle, so it is not noisy — and it is the only
              * outward sign the sensor is feeding anything at all. The bug
              * this replaced was invisible precisely because nothing logged. */
-            LOG_INF("Light: %u lux -> brightness %u (applied %u)",
-                    lux, br, br_filt);
+            LOG_INF("Light: %u lux -> brightness %u (applied %u)%s",
+                    lux, br, br_filt,
+                    led_ambient_auto ? "" : " [held, not applied]");
         }
     } else {
         LOG_WRN("BH1750 fetch failed: %d", err);

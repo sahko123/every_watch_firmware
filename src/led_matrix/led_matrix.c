@@ -95,6 +95,9 @@ struct led_rgb led_color[LED_ROWS][LED_COLS];
 struct led_rgb led_layer_color[LED_LAYER_COUNT]; /* zero = use led_color per cell */
 uint8_t        led_mask[LED_LAYER_COUNT][LED_ROWS][LED_COLS];
 uint8_t        led_brightness     = 255;  /* ambient scaling 0-255; set by light sensor */
+uint8_t        led_gamma          = 2;    /* perceptual curve on the above — see led_matrix.h */
+bool           led_ambient_auto   = true; /* false = light sensor stops writing led_brightness */
+
 uint8_t        led_max_brightness = 255;  /* per-pixel ceiling; 255 = off, see led_matrix.h */
 uint32_t       led_current_budget = 5128; /* ~400 mA driven — see the maths below */
 uint8_t        led_fade           = 255;  /* transition fade; 255 = none */
@@ -303,6 +306,33 @@ static void build_buffers(void)
 	 */
 	uint32_t k = ((uint32_t)led_brightness << 16) / 255;
 
+	/*
+	 * Gamma. Everything from here down is linear in PWM duty and the eye is
+	 * not, so without this the ambient level reads several times brighter
+	 * than its number suggests — see led_gamma's comment in led_matrix.h for
+	 * the numbers and why the correction belongs here rather than baked into
+	 * light.c's lux curve.
+	 *
+	 * Squaring in Q16 keeps full precision at the levels that matter: the
+	 * dark floor (led_brightness 24) lands on k = 580, i.e. 0.88% duty,
+	 * which still resolves distinctly from its neighbours. It only runs out
+	 * below about 16, where a full 255 channel scales under half an LSB and
+	 * the rescue clamp downstream takes over as the true floor.
+	 *
+	 * Ordered before the budget clamp deliberately. Gamma only ever reduces k
+	 * (x^g <= x for x <= 1), so the clamp below still bounds the final value
+	 * and the current limit holds regardless of what this is set to.
+	 */
+	if (led_gamma >= 2) {
+		k = (uint32_t)(((uint64_t)k * k) >> 16);
+
+		if (led_gamma >= 3) {
+			uint32_t k1 = ((uint32_t)led_brightness << 16) / 255;
+
+			k = (uint32_t)(((uint64_t)k * k1) >> 16);
+		}
+	}
+
 	if (led_max_brightness < 255) {
 		k = (k * led_max_brightness) / 255;
 	}
@@ -437,6 +467,7 @@ void led_matrix_init(void)
 
 	memset(led_color, 0, sizeof(led_color));
 	memset(led_mask,  0, sizeof(led_mask));
+
 	pwm_ready = true;
 
 	LOG_INF("LED matrix ready (4x PWM + EasyDMA, all lines parallel)");
@@ -467,7 +498,19 @@ void led_commit(void)
 	}
 
 	/* Wait for playback to finish before releasing the buffers to the next
-	 * frame. Bounded: a stuck instance costs one frame, not the display. */
+	 * frame. Bounded: a stuck instance costs one frame, not the display.
+	 *
+	 * Polled at 250 us, not the 1 ms this used to use. The transfer itself
+	 * is ~1.2 ms (40 LEDs x 24 bits x 1.25 us on the longest line), but at
+	 * millisecond granularity the first check lands early and the next sleep
+	 * overshoots the end by most of a millisecond — measured on hardware,
+	 * that put a commit at 3.06 ms against 2.26 ms once polled finely, so
+	 * roughly a third of every commit was spent asleep past the end of a
+	 * transfer that had already finished. This runs once per frame with the
+	 * display on, so it is a straight saving of CPU and wakeups.
+	 *
+	 * The kernel tick is 32768 Hz, so 250 us is about 8 ticks — fine enough
+	 * to stop overshooting, coarse enough not to spin. */
 	int64_t deadline = k_uptime_get() + COMMIT_TIMEOUT_MS;
 
 	for (int i = 0; i < 4; i++) {
@@ -477,7 +520,7 @@ void led_commit(void)
 					i, COMMIT_TIMEOUT_MS);
 				break;
 			}
-			k_msleep(1);
+			k_sleep(K_USEC(250));
 		}
 	}
 
@@ -489,18 +532,24 @@ void led_commit(void)
  * --------------------------------------------------------------------------
  *
  * Brightness is a thing you judge by looking at it, and reflashing this board
- * means reconnecting a debug probe. These let it be dialled in over RTT while
- * the watch is running, then written back into the defaults above once the
- * numbers are right.
+ * means holding a button through a reset at best and reconnecting a debug probe
+ * at worst. These let it be dialled in on a running watch and the results
+ * written back into the defaults above once the numbers are right.
  *
- * Note `led ambient` only sticks while the display is on: the light sensor
- * rewrites led_brightness every 2 s whenever the display is off.
+ * Reachable over the USB CDC shell in the normal image — no special build and
+ * no debugger — as well as over RTT on the bring-up variants.
+ *
+ * `led ambient` on its own will not hold: the light sensor owns that variable
+ * and rewrites it on every poll taken while the display is off (1 s for a
+ * minute after any interaction, then 10 s). `led auto 0` takes it away from the
+ * sensor, which is what makes comparing two levels by eye possible at all.
  * -------------------------------------------------------------------------- */
 
 #ifdef CONFIG_SHELL
 
 #include <zephyr/shell/shell.h>
 #include <stdlib.h>
+#include <errno.h>
 
 /* Sum-of-channels to milliamps: 107,100 sum ≈ 8.4 A, so ~0.078 mA per unit. */
 static unsigned int budget_to_ma(uint32_t budget)
@@ -536,8 +585,62 @@ static int cmd_led_ambient(const struct shell *sh, size_t argc, char **argv)
 		led_brightness = (uint8_t)strtoul(argv[1], NULL, 0);
 		led_commit();
 	}
-	shell_print(sh, "ambient = %u / 255  (overwritten by the light sensor "
-			"while the display is off)", led_brightness);
+	shell_print(sh, "ambient = %u / 255%s", led_brightness,
+		    led_ambient_auto ? "  (the light sensor will overwrite this "
+				       "next time the display blanks — `led auto 0` "
+				       "to hold it)"
+				     : "  (held; sensor not writing)");
+	return 0;
+}
+
+static int cmd_led_auto(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc == 2) {
+		led_ambient_auto = strtoul(argv[1], NULL, 0) != 0;
+	}
+	shell_print(sh, "auto = %u  (%s)", led_ambient_auto ? 1 : 0,
+		    led_ambient_auto ? "light sensor owns ambient"
+				     : "ambient held at whatever `led ambient` set");
+	return 0;
+}
+
+/* Duty the current settings produce, in hundredths of a percent — the number
+ * that actually reaches the LEDs, which is not obvious from the knobs once
+ * gamma is in the way (ambient 24 at gamma 2 is 0.88%, not 9.4%). Budget is
+ * left out: it depends on how many pixels the current frame lights, so it has
+ * its own line below. */
+static unsigned int duty_centipercent(void)
+{
+	uint32_t k = ((uint32_t)led_brightness << 16) / 255;
+
+	if (led_gamma >= 2) {
+		k = (uint32_t)(((uint64_t)k * k) >> 16);
+		if (led_gamma >= 3) {
+			uint32_t k1 = ((uint32_t)led_brightness << 16) / 255;
+
+			k = (uint32_t)(((uint64_t)k * k1) >> 16);
+		}
+	}
+	if (led_max_brightness < 255) {
+		k = (k * led_max_brightness) / 255;
+	}
+	return (unsigned int)((k * 10000u) >> 16);
+}
+
+static int cmd_led_gamma(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc == 2) {
+		unsigned long g = strtoul(argv[1], NULL, 0);
+
+		if (g < 1 || g > 3) {
+			shell_error(sh, "gamma must be 1-3 (1 = linear, 2 = default)");
+			return -EINVAL;
+		}
+		led_gamma = (uint8_t)g;
+		led_commit();
+	}
+	shell_print(sh, "gamma = %u%s", led_gamma,
+		    led_gamma == 1 ? "  (linear — pre-gamma behaviour)" : "");
 	return 0;
 }
 
@@ -545,12 +648,18 @@ static int cmd_led_show(const struct shell *sh, size_t argc, char **argv)
 {
 	ARG_UNUSED(argc); ARG_UNUSED(argv);
 
-	uint8_t eff = (uint8_t)(((uint16_t)led_brightness * led_max_brightness) / 255);
+	unsigned int cp = duty_centipercent();
 
-	shell_print(sh, "ambient        %u / 255", led_brightness);
+	shell_print(sh, "ambient        %u / 255%s", led_brightness,
+		    led_ambient_auto ? "" : "  (held)");
+	shell_print(sh, "gamma          %u", led_gamma);
 	shell_print(sh, "max_brightness %u / 255%s", led_max_brightness,
 		    led_max_brightness == 255 ? "  (off)" : "");
-	shell_print(sh, "perceptual     %u / 255  (%u%%)", eff, (eff * 100u) / 255u);
+	/* Digits split out by hand rather than "%u.%02u": CONFIG_CBPRINTF_NANO is
+	 * on, and it drops width/zero-pad flags silently — 0.08% printed as
+	 * "0.8%", a factor of ten wrong in the one direction that matters here. */
+	shell_print(sh, "drive duty     %u.%u%u%%",
+		    cp / 100u, (cp / 10u) % 10u, cp % 10u);
 	shell_print(sh, "current_budget %u  (~%u mA driven)",
 		    led_current_budget, budget_to_ma(led_current_budget));
 
@@ -570,6 +679,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(led_sub,
 	SHELL_CMD_ARG(max,     NULL, "Per-pixel ceiling, 0-255",            cmd_led_max,     1, 1),
 	SHELL_CMD_ARG(budget,  NULL, "Total current budget (sum units)",    cmd_led_budget,  1, 1),
 	SHELL_CMD_ARG(ambient, NULL, "Ambient level, 0-255",                cmd_led_ambient, 1, 1),
+	SHELL_CMD_ARG(gamma,   NULL, "Perceptual curve on ambient, 1-3",    cmd_led_gamma,   1, 1),
+	SHELL_CMD_ARG(auto,    NULL, "Light sensor owns ambient, 0 or 1",   cmd_led_auto,    1, 1),
 	SHELL_SUBCMD_SET_END
 );
 

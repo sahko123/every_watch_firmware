@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <zephyr/kernel.h>
 
@@ -71,6 +72,52 @@ extern struct k_mutex led_commit_mutex;
  * Only updated while the display is off, to avoid the LEDs feeding back into
  * the sensor and driving themselves brighter. */
 extern uint8_t led_brightness;
+
+/*
+ * Gamma exponent applied to led_brightness, 1-3. Default 2.
+ *
+ * Everything downstream of here is linear in PWM duty, but the eye is not:
+ * perceived brightness goes roughly as duty^(1/2.2). Without this, the ambient
+ * curve was linear in duty and so far brighter than its numbers suggested —
+ * led_brightness 24, the pitch-dark floor, is 9.4% duty and reads as about a
+ * THIRD of full brightness; 60 (indoor evening) is 23.5% duty and reads as
+ * about half. That is why the watch was uncomfortable in a dark room while the
+ * curve looked like it was already down at a tenth.
+ *
+ * Applied only to the ambient factor, and deliberately not to the current
+ * budget: that one is a physical limit in milliamps, and bending it through a
+ * perceptual curve would mean it no longer limits what it claims to.
+ *
+ * Because x^g is anchored at both ends (0 stays 0, 255 stays 255), raising this
+ * costs nothing at the top — direct sunlight is still full power — and only
+ * pulls the dark end down. That asymmetry is the whole point; a flat multiplier
+ * would have dimmed daylight too, where the watch already struggles.
+ *
+ * Integer exponents only, so this is two multiplies rather than a powf() and a
+ * 256-entry table. 2.0 vs the textbook 2.2 is a difference of a few percent in
+ * the middle of the range and nothing at either end — well inside what these
+ * (custom, unmeasured) LEDs and diffuser are worth tuning to. 1 restores the
+ * old linear behaviour for comparison; 3 is aggressive, and at 3 the useful
+ * ambient range compresses into roughly 40-255 because everything below that
+ * rounds to the same one-LSB floor.
+ *
+ * Note this changes what led_brightness *means*, so the lux breakpoints in
+ * light.c's lux_to_brightness() are calibrated against a particular value of
+ * this. Change one, re-check the other.
+ */
+extern uint8_t led_gamma;
+
+/*
+ * Whether the light sensor owns led_brightness. Default true.
+ *
+ * Set false and light.c keeps sampling and logging but stops writing, so a
+ * value forced with `led ambient` stays put. Purely a bench-tuning aid: the
+ * sensor only writes while the display is off, so a forced level survives the
+ * frame you are looking at and is then silently replaced the moment the watch
+ * blanks — which makes comparing two levels by eye almost impossible, since the
+ * second look is never at the value you set.
+ */
+extern bool led_ambient_auto;
 
 /* The brightest any single pixel is ever driven, 0-255.
  *

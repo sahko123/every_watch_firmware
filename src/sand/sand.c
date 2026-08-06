@@ -638,53 +638,78 @@ static void publish_mask(void)
 static K_THREAD_STACK_DEFINE(sand_stack, SAND_STACK_SIZE);
 static struct k_thread sand_thread_data;
 
+/* One physics step and mask publish. Split out of the thread loop only to keep
+ * that loop down to what it schedules; the body is unchanged. */
+static void physics_step(void)
+{
+	k_mutex_lock(&sand_mutex, K_FOREVER);
+	switch (mode) {
+	case SAND_CONSTRAINED:
+		tick_constrained();
+		break;
+	case SAND_RAIN:
+		tick_rain();
+		break;
+	default:
+		tick();
+		break;
+	}
+	publish_mask();
+
+	/* Latch the callbacks and fire them after the mutex is released:
+	 * they reach into the LED layers, and holding two locks across a
+	 * caller-supplied function is how deadlocks get written. */
+	bool peak = rain_peak_pending;
+	bool done = rain_done_pending;
+
+	rain_peak_pending = false;
+	rain_done_pending = false;
+	void (*cb_peak)(void) = rain_on_peak;
+	void (*cb_done)(void) = rain_on_done;
+
+	k_mutex_unlock(&sand_mutex);
+
+	if (peak && cb_peak) {
+		cb_peak();
+	}
+	if (done && cb_done) {
+		cb_done();
+	}
+}
+
+/*
+ * Step, commit, repeat, on an absolute TICK_MS schedule.
+ *
+ * The deadline is absolute rather than "sleep TICK_MS after finishing", so the
+ * ~2.3 ms a commit costs does not accumulate into the period — the old
+ * k_msleep(TICK_MS) form ran physics at ~28 Hz while claiming 30. It resyncs to
+ * now if a deadline is missed outright (a long preemption, or the thread
+ * resuming from suspend after the display was off for a while), so a late frame
+ * is dropped rather than chased with a burst of catch-up frames.
+ */
 static void sand_thread(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 
+	int64_t next_tick = k_uptime_get();
+
 	while (true) {
-		k_mutex_lock(&sand_mutex, K_FOREVER);
-		switch (mode) {
-		case SAND_CONSTRAINED:
-			tick_constrained();
-			break;
-		case SAND_RAIN:
-			tick_rain();
-			break;
-		default:
-			tick();
-			break;
-		}
-		publish_mask();
+		physics_step();
 
-		/* Latch the callbacks and fire them after the mutex is released:
-		 * they reach into the LED layers, and holding two locks across a
-		 * caller-supplied function is how deadlocks get written. */
-		bool peak = rain_peak_pending;
-		bool done = rain_done_pending;
-
-		rain_peak_pending = false;
-		rain_done_pending = false;
-		void (*cb_peak)(void) = rain_on_peak;
-		void (*cb_done)(void) = rain_on_done;
-
-		k_mutex_unlock(&sand_mutex);
-
-		if (peak && cb_peak) {
-			cb_peak();
-		}
-		if (done && cb_done) {
-			cb_done();
-		}
-
-		/* led_commit() blocks ~3 ms in DMA and is deliberately called
+		/* led_commit() blocks ~2.3 ms in DMA and is deliberately called
 		 * with sand_mutex released. display_off() suspends this thread,
 		 * and being suspended while holding sand_mutex would block every
 		 * caller of sand_set_gravity(), sand_count() and sand_clear()
 		 * until the display came back on. */
 		led_commit();
 
-		k_msleep(TICK_MS);
+		int64_t now = k_uptime_get();
+
+		next_tick += TICK_MS;
+		if (next_tick <= now) {
+			next_tick = now + TICK_MS;
+		}
+		k_sleep(K_TIMEOUT_ABS_MS(next_tick));
 	}
 }
 
