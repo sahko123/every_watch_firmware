@@ -1,0 +1,57 @@
+diff --git a/modules/mcuboot/CMakeLists.txt b/modules/mcuboot/CMakeLists.txt
+index 5ec2643d7c..cfa2318eee 100644
+--- a/modules/mcuboot/CMakeLists.txt
++++ b/modules/mcuboot/CMakeLists.txt
+@@ -376,9 +376,23 @@ if(CONFIG_BOOTLOADER_MCUBOOT)
+     endif()
+   endif()
+ 
++  # --- Every Watch: allow hash-only (unsigned) images ----------------------
++  # With CONFIG_BOOT_SIGNATURE_TYPE_NONE in the bootloader there is no key, and
++  # this file otherwise forces one anyway: mcuboot_key_file falls through to the
++  # "default key" branch below, resolves to the mcuboot module *directory*
++  # rather than a file, and imgtool dies with PermissionError. imgtool signs
++  # happily with no --key at all, emitting an image that carries its SHA-256 TLV
++  # and no signature -- integrity without the signature machinery, which is the
++  # point. See every_watch_firmware/patches/README.md.
++  if("${CONFIG_BOOT_SIGNATURE_KEY_FILE}" STREQUAL "")
++    set(ew_hash_only TRUE)
++  else()
++    set(ew_hash_only FALSE)
++  endif()
++
+   if(CONFIG_SIGN_IMAGES)
+     # Set default key
+-    if (NOT DEFINED mcuboot_key_file)
++    if (NOT DEFINED mcuboot_key_file AND NOT ew_hash_only)
+       message(WARNING "
+         ---------------------------------------------------------
+         --- WARNING: Using default MCUBoot key, it should not ---
+@@ -391,6 +405,9 @@ if(CONFIG_BOOTLOADER_MCUBOOT)
+ 
+     set(app_core_binary_name app_update.bin)
+ 
++    if(ew_hash_only)
++      set(ret_val 0)
++    else()
+     execute_process(COMMAND
+       ${PYTHON_EXECUTABLE}
+       ${ZEPHYR_MCUBOOT_MODULE_DIR}/scripts/imgtool.py
+@@ -399,6 +416,7 @@ if(CONFIG_BOOTLOADER_MCUBOOT)
+       ERROR_QUIET
+       RESULT_VARIABLE ret_val
+     )
++    endif()
+ 
+     if(${ret_val} EQUAL 2)
+       message(WARNING "Key file `${mcuboot_key_file}` does not contain a valid \
+@@ -423,7 +441,8 @@ if(CONFIG_BOOTLOADER_MCUBOOT)
+       ${PYTHON_EXECUTABLE}
+       ${ZEPHYR_MCUBOOT_MODULE_DIR}/scripts/imgtool.py
+       sign
+-      --key ${mcuboot_key_file}
++      $<$<NOT:$<BOOL:${ew_hash_only}>>:--key>
++      $<$<NOT:$<BOOL:${ew_hash_only}>>:${mcuboot_key_file}>
+       --header-size $<TARGET_PROPERTY:partition_manager,PM_MCUBOOT_PAD_SIZE>
+       --align       ${CONFIG_MCUBOOT_FLASH_WRITE_BLOCK_SIZE}
+       --version     ${CONFIG_MCUBOOT_IMGTOOL_SIGN_VERSION}

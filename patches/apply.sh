@@ -34,3 +34,4 @@ apply_one() {
 
 apply_one "$WORKSPACE/bootloader/mcuboot" "mcuboot-watchdog-setup.patch"
 apply_one "$WORKSPACE/zephyr"             "zephyr-usb_dfu-watchdog-feed.patch"
+apply_one "$WORKSPACE/nrf"                "nrf-imgtool-hash-only.patch"
